@@ -25,5 +25,3 @@ data
 tmp_models
 *.pdf
 csv
-
-baselines
