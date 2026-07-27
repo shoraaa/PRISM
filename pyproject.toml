@@ -1,0 +1,42 @@
+[project]
+name = "prism"
+version = "0.1.0"
+description = "Constraint-resolved dual fields for guided multi-constraint VRP search"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "matplotlib>=3.11.1",
+    "numpy>=2.4.4",
+    "openpyxl>=3.1.5",
+    "pandas>=3.0.5",
+    "psutil>=7.2.2",
+    "pybind11>=3.0.4",
+    "pytorch-triton-rocm>=3.5.1",
+    "pytz>=2026.3.post1",
+    "pyyaml>=6.0.3",
+    "scikit-learn>=1.9.0",
+    "scipy>=1.18.0",
+    "tensorboard-logger>=0.1.0",
+    "torch>=2.9.1",
+    "torch-geometric>=2.8.0.post1",
+    "torchaudio>=2.9.1",
+    "torchvision>=0.24.1",
+    "tqdm>=4.66.5",
+    "wandb>=0.28.1",
+]
+
+[build-system]
+requires = ["setuptools>=77", "pybind11>=3.0.4"]
+build-backend = "setuptools.build_meta"
+
+[[tool.uv.index]]
+url = "https://download.pytorch.org/whl/rocm6.3"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests/python"]
