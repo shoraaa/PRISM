@@ -98,6 +98,34 @@ TRAIN_VARIANTS = _sort_variants(
 )
 ALL_VARIANTS = _sort_variants(BENCHMARK_VARIANTS + ["vrptw"])
 
+# Fixed validation coverage across objective type, pickup-delivery, symmetry,
+# depot count, and one/two/three-resource VRP compositions.  The order is
+# deliberately interleaved so smaller --val-heldout slices remain diverse.
+VALIDATION_HELDOUT_VARIANTS = (
+    "aop",
+    "pdcvrp",
+    "ocvrpb",
+    "acvrpb",
+    "mdcvrp",
+    "amdcvrp",
+    "spctsp",
+    "apdcvrp",
+    "cvrpl",
+    "acvrpl",
+    "mdcvrpl",
+    "amdcvrpl",
+    "cvrpltw",
+    "acvrpltw",
+    "mdcvrpltw",
+    "amdcvrpltw",
+)
+assert len(set(VALIDATION_HELDOUT_VARIANTS)) == len(
+    VALIDATION_HELDOUT_VARIANTS
+)
+assert set(VALIDATION_HELDOUT_VARIANTS) <= (
+    set(BENCHMARK_VARIANTS) - set(TRAIN_VARIANTS)
+)
+
 
 def problem_variants(
     collection: str = "all",
@@ -395,10 +423,11 @@ def resource_count(name: str) -> int:
 class VariantCurriculum:
     variants: list[str]
     rng: random.Random
+    seed: int = 0
 
     @classmethod
     def default(cls, seed: int) -> "VariantCurriculum":
-        return cls(list(TRAIN_VARIANTS), random.Random(seed))
+        return cls(list(TRAIN_VARIANTS), random.Random(seed), seed)
 
     @property
     def held_out(self) -> list[str]:
@@ -413,6 +442,44 @@ class VariantCurriculum:
     def sample(self, epoch: int, epochs: int) -> str:
         eligible = self.eligible(epoch, epochs)
         return self.rng.choice(eligible or self.variants)
+
+    def schedule(
+        self,
+        epoch: int,
+        epochs: int,
+        steps: int,
+        group_size: int,
+    ) -> list[str]:
+        """Build a deterministic, balanced epoch schedule with distinct groups."""
+        if steps < 0:
+            raise ValueError("steps must be nonnegative")
+        if group_size < 1:
+            raise ValueError("group_size must be positive")
+        eligible = self.eligible(epoch, epochs) or self.variants
+        if not eligible and steps:
+            raise ValueError("cannot schedule variants from an empty curriculum")
+        if group_size > len(eligible):
+            raise ValueError(
+                "group_size cannot exceed the number of eligible variants"
+            )
+
+        # Epoch-local randomness makes resumes reproduce the same schedule
+        # without depending on how many RNG calls an earlier epoch consumed.
+        scheduler = random.Random(
+            (int(self.seed) << 32) ^ (int(epoch) << 16) ^ int(epochs)
+        )
+        counts = {variant: 0 for variant in eligible}
+        result = []
+        while len(result) < steps:
+            current_size = min(group_size, steps - len(result))
+            candidates = list(eligible)
+            scheduler.shuffle(candidates)
+            candidates.sort(key=counts.__getitem__)
+            selected = candidates[:current_size]
+            result.extend(selected)
+            for variant in selected:
+                counts[variant] += 1
+        return result
 
 
 _ORACLE_KEYWORDS = ("compass", "hgs", "ils", "lkh", "ortools", "pyvrp")

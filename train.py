@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import gc
 import random
 import sys
@@ -26,10 +27,15 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 import prism_decoder
-from net import ConstraintFieldNet, build_decoder_data
+from net import (
+    ConstraintFieldNet,
+    build_decoder_data,
+    load_constraint_field_state_dict,
+)
 from problem_data import (
     DEFAULT_DATASET_DIR,
     SavedProblems,
+    VALIDATION_HELDOUT_VARIANTS,
     VariantCurriculum,
     generated_problem,
 )
@@ -49,6 +55,11 @@ class OptionStep:
     decision_ants: Optional[torch.Tensor] = None
     field_enabled: bool = True
     risk_penalty: float = 0.0
+    search_progress: float = 0.0
+    transition_ant: Optional[int] = None
+    temporal_advantage: float = 0.0
+    old_value: float = 0.0
+    value_target: Optional[float] = None
 
 
 @dataclass
@@ -68,6 +79,10 @@ class OptionOutcome:
     steps: list[OptionStep]
     reward: torch.Tensor
     duration: int
+    transition_reward: float = 0.0
+    old_value: float = 0.0
+    transition_step: Optional[OptionStep] = None
+    winner_ant: Optional[int] = None
 
 
 def replay_decision_logp_from_cpp_batch_trace(
@@ -311,6 +326,56 @@ def _assign_smdp_returns(
         future = option_return.mean()
 
 
+def _assign_refresh_gae(
+    outcomes: list[OptionOutcome], gamma: float, gae_lambda: float
+) -> None:
+    """Assign winner-gated SMDP advantages and refresh-value targets.
+
+    The decoder transition is produced by exactly one ant.  Continuation
+    credit therefore belongs to that ant's transition step rather than being
+    broadcast as a constant that POMO centering would remove.
+    """
+    next_value = 0.0
+    next_advantage = 0.0
+    for outcome in reversed(outcomes):
+        discount = float(gamma) ** outcome.duration
+        delta = (
+            outcome.transition_reward
+            + discount * next_value
+            - outcome.old_value
+        )
+        advantage = delta + discount * float(gae_lambda) * next_advantage
+        if outcome.steps:
+            value_step = outcome.steps[0]
+            value_step.old_value = outcome.old_value
+            value_step.value_target = outcome.old_value + advantage
+        if (
+            outcome.transition_step is not None
+            and outcome.winner_ant is not None
+        ):
+            outcome.transition_step.transition_ant = outcome.winner_ant
+            outcome.transition_step.temporal_advantage = advantage
+        next_value = outcome.old_value
+        next_advantage = advantage
+
+
+def _winner_temporal_advantage(
+    ant_count: int,
+    winner_ant: int,
+    advantage: float,
+    scale: float,
+    device: torch.device,
+) -> torch.Tensor:
+    """Return a zero-mean POMO contrast that retains winner continuation."""
+    if ant_count < 1 or not 0 <= winner_ant < ant_count:
+        raise ValueError("winner_ant must index a non-empty ant batch")
+    contrast = torch.full(
+        (ant_count,), -1.0 / ant_count, dtype=torch.float32, device=device
+    )
+    contrast[winner_ant] += 1.0
+    return contrast * (float(advantage) / max(float(scale), 1e-8))
+
+
 def collect_instance_rollout(
     model: ConstraintFieldNet,
     problem: dict,
@@ -370,6 +435,14 @@ def collect_instance_rollout(
         option_incumbent = incumbent
         option_steps: list[OptionStep] = []
         option_duration = 0
+        option_progress = iteration / max(args.search_iterations, 1)
+        with torch.no_grad():
+            old_value = float(
+                model.value(old_output, option_progress).reshape(-1)[0]
+            )
+        transition_reward = 0.0
+        transition_step = None
+        winner_ant = None
         for _ in range(args.option_max_steps):
             if iteration >= args.search_iterations:
                 break
@@ -419,6 +492,7 @@ def collect_instance_rollout(
                 decision_ants=decision_ants.detach(),
                 field_enabled=field_enabled,
                 risk_penalty=risk_penalty,
+                search_progress=option_progress,
             )
             steps.append(step)
             option_steps.append(step)
@@ -426,9 +500,11 @@ def collect_instance_rollout(
             option_duration += 1
 
             iteration_best = option_incumbent
-            for solution in solutions:
+            iteration_winner = None
+            for ant, solution in enumerate(solutions):
                 if _better(solution, iteration_best):
                     iteration_best = solution
+                    iteration_winner = ant
             normalized_gain = max(
                 _gain(option_incumbent, iteration_best, 0.0), 0.0
             )
@@ -436,6 +512,9 @@ def collect_instance_rollout(
                 decoder.set_incumbent(iteration_best["route"])
                 incumbent = iteration_best
                 improvements += 1
+                transition_reward = normalized_gain
+                transition_step = step
+                winner_ant = iteration_winner
                 break
 
         terminal_reward = torch.tensor(
@@ -455,11 +534,25 @@ def collect_instance_rollout(
             )
         if emitted:
             terminal_reward -= args.neural_call_cost
+            transition_reward -= args.neural_call_cost
         outcomes.append(
-            OptionOutcome(option_steps, terminal_reward, option_duration)
+            OptionOutcome(
+                option_steps,
+                terminal_reward,
+                option_duration,
+                transition_reward=transition_reward,
+                old_value=old_value,
+                transition_step=transition_step,
+                winner_ant=winner_ant,
+            )
         )
 
     _assign_smdp_returns(outcomes, args.smdp_gamma, args.device)
+    _assign_refresh_gae(
+        outcomes,
+        args.smdp_gamma,
+        getattr(args, "gae_lambda", 1.0),
+    )
 
     costs = [_canonical_cost(solution) for solution in last_solutions]
     return InstanceRollout(
@@ -673,6 +766,7 @@ def _detached_output(
         "binding_logits",
         "coupler_weights",
         "coupler_bias",
+        "value_context",
     ):
         value = output[key]
         if value.requires_grad:
@@ -688,10 +782,16 @@ def _step_loss(
     output: dict,
     args: argparse.Namespace,
     rl_weight: float,
+    auxiliary_scale: float,
     class_weights: Optional[dict[str, torch.Tensor]] = None,
     adv_scale: Optional[torch.Tensor] = None,
+    temporal_adv_scale: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, dict[str, float | torch.Tensor]]:
     zero = output["residual"].sum() * 0.0
+    temporal_credit_weight = float(
+        getattr(args, "temporal_credit_weight", 0.0)
+    )
+    temporal_enabled = rl_weight != 0.0 and temporal_credit_weight != 0.0
     if rl_weight != 0.0:
         logp, decision_ants, decisions = (
             replay_decision_logp_from_cpp_batch_trace(
@@ -746,7 +846,25 @@ def _step_loss(
                 else ant_advantage.std(unbiased=False) + 1e-8
             )
             ant_advantage = ant_advantage / scale
+        temporal_ant_advantage = torch.zeros_like(ant_advantage)
+        if temporal_enabled and step.transition_ant is not None:
+            temporal_ant_advantage = _winner_temporal_advantage(
+                ant_advantage.numel(),
+                step.transition_ant,
+                step.temporal_advantage,
+                (
+                    float(temporal_adv_scale)
+                    if temporal_adv_scale is not None
+                    else 1.0
+                ),
+                ant_advantage.device,
+            )
+            ant_advantage = (
+                ant_advantage
+                + temporal_credit_weight * temporal_ant_advantage
+            )
         advantage = ant_advantage[decision_ants]
+        temporal_advantage = temporal_ant_advantage[decision_ants]
         # Each ant contributes total weight one, independent of trace length.
         decision_weight = decisions[decision_ants].float().reciprocal()
         normalizer = decision_weight.sum().clamp_min(1.0)
@@ -768,6 +886,10 @@ def _step_loss(
         policy_signal = (
             decision_weight * surrogate.abs()
         ).sum() / normalizer
+        temporal_policy_signal = (
+            decision_weight
+            * (temporal_credit_weight * temporal_advantage).abs()
+        ).sum() / normalizer
         entropy = -(decision_weight * logp).sum() / normalizer
         approx_kl = (
             decision_weight * (0.5 * log_ratio.square())
@@ -783,6 +905,9 @@ def _step_loss(
         advantage_abs = (
             decision_weight * advantage.abs()
         ).sum() / normalizer
+        temporal_advantage_abs = (
+            decision_weight * temporal_advantage.abs()
+        ).sum() / normalizer
     else:
         log_ratio = logp
         ratio = logp
@@ -796,6 +921,20 @@ def _step_loss(
         rl_score_proxy = zero
         reward_std = zero
         advantage_abs = zero
+        temporal_policy_signal = zero
+        temporal_advantage_abs = zero
+
+    critic_loss = zero
+    value_prediction = zero
+    value_target = zero
+    critic_sample = 0.0
+    if temporal_enabled and step.value_target is not None:
+        value_prediction = model.value(output, step.search_progress).reshape(-1)[
+            0
+        ]
+        value_target = value_prediction.new_tensor(step.value_target)
+        critic_loss = F.smooth_l1_loss(value_prediction, value_target)
+        critic_sample = 1.0
 
     dual = _dual_loss(step, output)
     feasibility = _feasibility_loss(
@@ -815,10 +954,10 @@ def _step_loss(
         + args.binding_weight * binding
         + args.price_weight * price
     )
-    auxiliary_scale = 1.0 if rl_weight == 0.0 else args.aux_rl_scale
     loss = (
         rl_weight * rl_loss
         + auxiliary_scale * auxiliary
+        + float(getattr(args, "value_loss_weight", 0.0)) * critic_loss
         - args.entropy_weight * entropy
     )
     with torch.no_grad():
@@ -838,8 +977,14 @@ def _step_loss(
             "ppo_surrogate_loss": rl_loss.detach(),
             "rl_score_proxy": rl_score_proxy.detach(),
             "policy_signal": policy_signal.detach(),
+            "temporal_policy_signal": temporal_policy_signal.detach(),
             "reward_std": reward_std.detach(),
             "advantage_abs": advantage_abs.detach(),
+            "temporal_advantage_abs": temporal_advantage_abs.detach(),
+            "critic_loss": critic_loss.detach(),
+            "critic_sample": critic_sample,
+            "value_prediction": value_prediction.detach(),
+            "value_target": value_target.detach(),
             "dual_loss": dual.detach(),
             "feasibility_loss": feasibility.detach(),
             "binding_loss": binding.detach(),
@@ -881,7 +1026,11 @@ def ppo_update(
             option_groups.append([])
         option_groups[-1].append(step)
     collector = MetricsCollector()
-    rl_weight = 0.0 if epoch < args.pretrain_epochs else args.rl_weight
+    pretraining = epoch < args.pretrain_epochs
+    rl_weight = 0.0 if pretraining else args.rl_weight
+    auxiliary_scale = (
+        args.pretrain_aux_scale if pretraining else args.aux_rl_scale
+    )
     class_weights = _rollout_class_weights(steps)
     # Batch-pooled advantage scale: centre each option, pool the residuals over
     # the whole mixed-variant PPO batch, and normalise by that single std. This
@@ -893,6 +1042,21 @@ def ppo_update(
             [step.rewards - step.rewards.mean() for step in steps]
         )
         adv_scale = (pooled.std(unbiased=False) + 1e-8).detach()
+    temporal_advantages = [
+        step.temporal_advantage
+        for step in steps
+        if step.transition_ant is not None
+    ]
+    temporal_adv_scale = None
+    if temporal_advantages and not args.no_adv_norm:
+        temporal_values = torch.as_tensor(
+            temporal_advantages,
+            dtype=torch.float32,
+            device=steps[0].binding_target.device,
+        )
+        temporal_adv_scale = (
+            temporal_values.square().mean().sqrt().clamp_min(1e-8)
+        )
     timing = {"forward": 0.0, "backward": 0.0, "optimizer": 0.0}
     gradient_norms = []
     update_started = time.perf_counter()
@@ -920,8 +1084,10 @@ def ppo_update(
                         output,
                         args,
                         rl_weight,
+                        auxiliary_scale,
                         class_weights,
                         adv_scale,
+                        temporal_adv_scale,
                     )
                     group_losses.append(loss)
                     collector.add_dict(metrics)
@@ -958,8 +1124,10 @@ def ppo_update(
                         output,
                         args,
                         rl_weight,
+                        auxiliary_scale,
                         class_weights,
                         adv_scale,
+                        temporal_adv_scale,
                     )
                     losses.append(loss)
                     collector.add_dict(metrics)
@@ -981,6 +1149,20 @@ def ppo_update(
         timing["optimizer"] += time.perf_counter() - phase_started
 
     result = collector.get_all_means()
+    value_steps = [step for step in steps if step.value_target is not None]
+    critic_explained_variance = 0.0
+    if len(value_steps) > 1:
+        targets = np.asarray(
+            [step.value_target for step in value_steps], dtype=np.float64
+        )
+        predictions = np.asarray(
+            [step.old_value for step in value_steps], dtype=np.float64
+        )
+        target_variance = float(np.var(targets))
+        if target_variance > 1e-12:
+            critic_explained_variance = 1.0 - float(
+                np.var(targets - predictions) / target_variance
+            )
     result.update(
         ppo_seconds=time.perf_counter() - update_started,
         ppo_forward_seconds=timing["forward"],
@@ -992,6 +1174,13 @@ def ppo_update(
         feasibility_pos_weight=float(class_weights["feasibility"]),
         gradient_norm=float(np.mean(gradient_norms)),
         advantage_scale=float(adv_scale) if adv_scale is not None else 0.0,
+        temporal_advantage_scale=(
+            float(temporal_adv_scale)
+            if temporal_adv_scale is not None
+            else 0.0
+        ),
+        temporal_transitions=float(len(temporal_advantages)),
+        critic_explained_variance=critic_explained_variance,
     )
     return result
 
@@ -1047,6 +1236,13 @@ def train_epoch(
     ppo_optimizer_seconds = 0.0
     started = time.perf_counter()
     completed = 0
+    variant_counts: dict[str, int] = {}
+    variant_schedule = curriculum.schedule(
+        epoch,
+        args.epochs,
+        args.steps_per_epoch,
+        args.grad_accum_variants,
+    )
     progress = tqdm(total=args.steps_per_epoch, desc="Epoch", leave=True)
     while completed < args.steps_per_epoch:
         group = min(args.grad_accum_variants, args.steps_per_epoch - completed)
@@ -1055,8 +1251,7 @@ def train_epoch(
         risk_penalty = (
             args.feasibility_risk_penalty if field_enabled else 0.0
         )
-        for _ in range(group):
-            variant = curriculum.sample(epoch, args.epochs)
+        for variant in variant_schedule[completed : completed + group]:
             phase_started = time.perf_counter()
             problem = generated_problem(variant, args.n_node, args.capacity)
             generation_seconds += time.perf_counter() - phase_started
@@ -1079,21 +1274,53 @@ def train_epoch(
         ppo_forward_seconds += metrics.get("ppo_forward_seconds", 0.0)
         ppo_backward_seconds += metrics.get("ppo_backward_seconds", 0.0)
         ppo_optimizer_seconds += metrics.get("ppo_optimizer_seconds", 0.0)
+        # These metrics describe the complete mixed-variant optimizer update.
+        # Log them once rather than falsely attributing the same values to each
+        # rollout in the group.
+        logger.log_metrics(
+            {
+                name: value
+                for name, value in metrics.items()
+                if name
+                not in {
+                    "auxiliary_scale",
+                    "ppo_reuse_passes",
+                    "ppo_clipping_active",
+                }
+            },
+            prefix="train/update/",
+            step=global_step,
+        )
         for rollout in rollouts:
             logger.set_step(global_step)
-            row = dict(metrics)
-            row.update(
+            row = dict(
                 emissions=rollout.emissions,
                 improvements=rollout.improvements,
             )
             logger.debug(f"training variant={rollout.variant}")
             logger.log_train_step(
-                rollout.average_cost, rollout.best_cost, epoch, row, global_step
+                rollout.variant,
+                rollout.average_cost,
+                rollout.best_cost,
+                epoch,
+                row,
+                global_step,
+            )
+            variant_counts[rollout.variant] = (
+                variant_counts.get(rollout.variant, 0) + 1
             )
             global_step += 1
             completed += 1
             progress.update(1)
     progress.close()
+    logger.log_metrics(
+        {
+            f"variants/{variant}/count": count
+            for variant, count in sorted(variant_counts.items())
+        },
+        prefix="train_epoch/",
+        step=global_step,
+    )
     epoch_seconds = time.perf_counter() - started
     rollout_other_seconds = max(
         rollout_seconds - neural_seconds - decoder_seconds, 0.0
@@ -1223,33 +1450,208 @@ def _gap(solution: dict, reference: float) -> float:
     return (solution["objective"] - reference) / max(abs(reference), 1e-9) * 100
 
 
+def _validation_rank(
+    metrics: dict[str, float], macro_gap: float
+) -> tuple[float, float, float, float, float]:
+    """Lower-is-better feasibility, coverage, then variant-macro quality."""
+    return (
+        1.0 - float(metrics["worst_variant_feasibility_rate"]),
+        1.0 - float(metrics["feasibility_rate"]),
+        1.0 - float(metrics["baseline_improvement_coverage"]),
+        -float(metrics["macro_score"]),
+        float(macro_gap),
+    )
+
+
 def validation(
     model: Optional[ConstraintFieldNet],
     dataset: list[dict],
     args: argparse.Namespace,
+    *,
+    capture_classical_baseline: bool = False,
 ) -> tuple[float, float, float, dict[str, float]]:
     collector = MetricsCollector()
     average_costs = []
     best_costs = []
     gaps = []
     split_gaps: dict[str, list[float]] = {"seen": [], "heldout": []}
+    variant_gaps: dict[str, list[float]] = {}
+    baseline_improvements = []
+    split_baseline_improvements: dict[str, list[float]] = {
+        "seen": [],
+        "heldout": [],
+    }
+    variant_baseline_improvements: dict[str, list[float]] = {}
+    split_totals: dict[str, int] = {"seen": 0, "heldout": 0}
+    split_feasible: dict[str, int] = {"seen": 0, "heldout": 0}
+    variant_totals: dict[str, int] = {}
+    variant_feasible: dict[str, int] = {}
+    variant_objectives: dict[str, list[float]] = {}
+    variant_best_costs: dict[str, list[float]] = {}
     for item in tqdm(dataset, desc="Validating", leave=False):
         average, best, metrics = infer_instance(model, item["problem"], args)
-        average_costs.append(average)
-        best_costs.append(_canonical_cost(best))
         collector.add_dict(metrics)
+        split = item["split"]
+        variant = item["variant"]
+        split_totals[split] = split_totals.get(split, 0) + 1
+        variant_totals[variant] = variant_totals.get(variant, 0) + 1
+
+        best_cost = _canonical_cost(best)
+        feasible = bool(best["feasible"]) and np.isfinite(best_cost)
+        if capture_classical_baseline:
+            item["classical_baseline"] = {
+                "objective": float(best["objective"]),
+                "direction": best["direction"],
+                "feasible": feasible,
+            }
+            if item.get("reference_source") == "classical" and feasible:
+                item["reference"] = float(best["objective"])
+        if not feasible:
+            continue
+
+        average_costs.append(average)
+        best_costs.append(best_cost)
+        split_feasible[split] = split_feasible.get(split, 0) + 1
+        variant_feasible[variant] = variant_feasible.get(variant, 0) + 1
+        variant_objectives.setdefault(variant, []).append(
+            float(best["objective"])
+        )
+        variant_best_costs.setdefault(variant, []).append(best_cost)
+        baseline = item.get("classical_baseline")
+        if baseline is not None and baseline.get("feasible", False):
+            baseline_objective = float(baseline["objective"])
+            if np.isfinite(baseline_objective):
+                improvement = -_gap(best, baseline_objective)
+                baseline_improvements.append(improvement)
+                split_baseline_improvements[split].append(improvement)
+                variant_baseline_improvements.setdefault(variant, []).append(
+                    improvement
+                )
         if item["reference"] is not None:
             gap = _gap(best, item["reference"])
             gaps.append(gap)
-            split_gaps[item["split"]].append(gap)
+            split_gaps[split].append(gap)
+            variant_gaps.setdefault(variant, []).append(gap)
     result = collector.get_all_means()
-    for split, values in split_gaps.items():
+    total = len(dataset)
+    feasible_total = len(best_costs)
+    result.update(
+        instances=float(total),
+        variants=float(len(variant_totals)),
+        feasible_instances=float(feasible_total),
+        feasibility_rate=(feasible_total / total if total else 0.0),
+        gap_instances=float(len(gaps)),
+        gap_coverage=(len(gaps) / total if total else 0.0),
+    )
+    for split, split_total in split_totals.items():
+        feasible_count = split_feasible.get(split, 0)
+        result[f"{split}_instances"] = float(split_total)
+        result[f"{split}_feasible_instances"] = float(feasible_count)
+        result[f"{split}_feasibility_rate"] = (
+            feasible_count / split_total if split_total else 0.0
+        )
+        values = split_gaps[split]
+        result[f"{split}_gap_instances"] = float(len(values))
+        result[f"{split}_gap_coverage"] = (
+            len(values) / split_total if split_total else 0.0
+        )
         if values:
             result[f"{split}_gap"] = float(np.mean(values))
+        baseline_values = split_baseline_improvements[split]
+        result[f"{split}_baseline_improvement_instances"] = float(
+            len(baseline_values)
+        )
+        result[f"{split}_baseline_improvement_coverage"] = (
+            len(baseline_values) / split_total if split_total else 0.0
+        )
+        if baseline_values:
+            result[f"{split}_baseline_improvement_percent"] = float(
+                np.mean(baseline_values)
+            )
+    for variant, variant_total in variant_totals.items():
+        feasible_count = variant_feasible.get(variant, 0)
+        prefix = f"variants/{variant}"
+        result[f"{prefix}/instances"] = float(variant_total)
+        result[f"{prefix}/feasible_instances"] = float(feasible_count)
+        result[f"{prefix}/feasibility_rate"] = feasible_count / variant_total
+        if variant in variant_objectives:
+            result[f"{prefix}/objective"] = float(
+                np.mean(variant_objectives[variant])
+            )
+            result[f"{prefix}/best_cost"] = float(
+                np.mean(variant_best_costs[variant])
+            )
+        if variant in variant_gaps:
+            result[f"{prefix}/gap_instances"] = float(
+                len(variant_gaps[variant])
+            )
+            result[f"{prefix}/gap"] = float(np.mean(variant_gaps[variant]))
+        if variant in variant_baseline_improvements:
+            values = variant_baseline_improvements[variant]
+            result[f"{prefix}/baseline_improvement_instances"] = float(
+                len(values)
+            )
+            result[f"{prefix}/baseline_improvement_percent"] = float(
+                np.mean(values)
+            )
+
+    variant_gap_means = [
+        float(np.mean(values)) for values in variant_gaps.values()
+    ]
+    baseline_variant_means = [
+        float(np.mean(values))
+        for values in variant_baseline_improvements.values()
+    ]
+    macro_gap = (
+        float(np.mean(variant_gap_means))
+        if variant_gap_means
+        else float("inf")
+    )
+    result.update(
+        instance_weighted_gap=(
+            float(np.mean(gaps)) if gaps else float("inf")
+        ),
+        macro_gap=macro_gap,
+        worst_variant_gap=(
+            max(variant_gap_means) if variant_gap_means else float("inf")
+        ),
+        worst_variant_feasibility_rate=(
+            min(
+                variant_feasible.get(variant, 0) / variant_total
+                for variant, variant_total in variant_totals.items()
+            )
+            if variant_totals
+            else 0.0
+        ),
+        baseline_improvement_instances=float(len(baseline_improvements)),
+        baseline_improvement_coverage=(
+            len(baseline_improvements) / total if total else 0.0
+        ),
+        instance_weighted_baseline_improvement_percent=(
+            float(np.mean(baseline_improvements))
+            if baseline_improvements
+            else float("-inf")
+        ),
+        macro_baseline_improvement_percent=(
+            float(np.mean(baseline_variant_means))
+            if baseline_variant_means
+            else float("-inf")
+        ),
+        worst_variant_baseline_improvement_percent=(
+            min(baseline_variant_means)
+            if baseline_variant_means
+            else float("-inf")
+        ),
+    )
+    # Checkpoint quality is a true variant macro; feasibility and paired
+    # baseline coverage are separate lexicographically prior gates.
+    result["macro_score"] = result[
+        "macro_baseline_improvement_percent"
+    ]
     return (
-        float(np.mean(average_costs)),
-        float(np.mean(best_costs)),
-        float(np.mean(gaps)) if gaps else 0.0,
+        float(np.mean(average_costs)) if average_costs else float("inf"),
+        float(np.mean(best_costs)) if best_costs else float("inf"),
+        macro_gap,
         result,
     )
 
@@ -1259,21 +1661,40 @@ def build_validation_data(
 ) -> list[dict]:
     if args.val_size < 1:
         raise ValueError("val_size must be at least one instance per problem")
+    if args.val_seen is not None and args.val_seen < 0:
+        raise ValueError("val_seen must be nonnegative or None")
+    if args.val_heldout < 0:
+        raise ValueError("val_heldout must be nonnegative")
     saved = SavedProblems(args.n_node, args.dataset_dir)
-    seen = curriculum.variants[: args.val_seen]
-    heldout = curriculum.held_out[: args.val_heldout]
+    seen = (
+        curriculum.variants
+        if args.val_seen is None
+        else curriculum.variants[: args.val_seen]
+    )
+    heldout_set = set(curriculum.held_out)
+    heldout_candidates = [
+        variant
+        for variant in VALIDATION_HELDOUT_VARIANTS
+        if variant in heldout_set
+    ]
+    heldout_candidates.extend(
+        variant
+        for variant in curriculum.held_out
+        if variant not in set(heldout_candidates)
+    )
+    heldout = heldout_candidates[: args.val_heldout]
     dataset = []
     logger = get_logger()
+    missing = []
     for split, variants in (("seen", seen), ("heldout", heldout)):
         for variant in variants:
             for index in range(args.val_size):
                 try:
                     problem, reference = saved.load(variant, index=index)
                 except Exception as exc:  # missing data dir/file for this variant
-                    logger.warning(
-                        f"skipping validation variant {variant} [{index}]: {exc}"
-                    )
+                    missing.append((variant, index, str(exc)))
                     continue
+                reference_source = "saved" if reference is not None else "classical"
                 dataset.append(
                     {
                         "variant": variant,
@@ -1281,8 +1702,21 @@ def build_validation_data(
                         "split": split,
                         "problem": problem,
                         "reference": reference,
+                        "reference_source": reference_source,
                     }
                 )
+    if missing:
+        details = "; ".join(
+            f"{variant}[{index}]: {error}"
+            for variant, index, error in missing[:5]
+        )
+        message = (
+            f"missing {len(missing)} validation instances from the fixed "
+            f"manifest ({details})"
+        )
+        if not getattr(args, "allow_missing_validation", False):
+            raise RuntimeError(message)
+        logger.warning(message)
     return dataset
 
 
@@ -1293,16 +1727,56 @@ def save_checkpoint(
     args: argparse.Namespace,
     path: Path,
     val_gap: Optional[float] = None,
+    *,
+    validation_rank: Optional[tuple[float, ...]] = None,
+    best_validation_rank: Optional[tuple[float, ...]] = None,
+    global_step: int = 0,
+    validation_manifest: Optional[tuple[tuple[str, int, str], ...]] = None,
 ) -> None:
     payload = {
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "epoch": epoch,
         "config": vars(args),
+        "global_step": int(global_step),
     }
     if val_gap is not None:
         payload["val_gap"] = val_gap
+    if validation_rank is not None:
+        payload["validation_rank"] = tuple(validation_rank)
+    if best_validation_rank is not None:
+        payload["best_validation_rank"] = tuple(best_validation_rank)
+        payload["checkpoint_rank_metric"] = "variant_macro_score"
+    if validation_manifest is not None:
+        payload["validation_manifest"] = validation_manifest
     torch.save(payload, path)
+
+
+def _load_optimizer_state_compat(
+    optimizer: torch.optim.Optimizer, state_dict: dict
+) -> int:
+    """Load optimizer state while initializing newly appended parameters.
+
+    The refresh value head is appended after all legacy model parameters, so
+    their optimizer slots retain the same order.  Returns the number of new
+    parameters initialized without saved optimizer state.
+    """
+    current = optimizer.state_dict()
+    saved = copy.deepcopy(state_dict)
+    if len(saved["param_groups"]) != len(current["param_groups"]):
+        raise ValueError("optimizer checkpoint has a different group count")
+    added = 0
+    for saved_group, current_group in zip(
+        saved["param_groups"], current["param_groups"]
+    ):
+        saved_count = len(saved_group["params"])
+        current_count = len(current_group["params"])
+        if saved_count > current_count:
+            raise ValueError("optimizer checkpoint has more parameters")
+        added += current_count - saved_count
+        saved_group["params"] = current_group["params"]
+    optimizer.load_state_dict(saved)
+    return added
 
 
 def parse_args() -> argparse.Namespace:
@@ -1343,6 +1817,33 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--option-max-steps", type=int, default=4)
     parser.add_argument("--improvement-epsilon", type=float, default=0.0)
     parser.add_argument("--smdp-gamma", type=float, default=0.99)
+    parser.add_argument(
+        "--gae-lambda",
+        type=float,
+        default=1.0,
+        help=(
+            "SMDP trace parameter for refresh-level temporal credit; the "
+            "default 1 uses the complete Monte Carlo reward-to-go"
+        ),
+    )
+    parser.add_argument(
+        "--temporal-credit-weight",
+        type=float,
+        default=0.1,
+        help=(
+            "Weight of winner-gated refresh continuation in the PPO advantage; "
+            "0 restores local POMO credit only"
+        ),
+    )
+    parser.add_argument(
+        "--value-loss-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Weight of the optional refresh-state critic loss; the default 0 "
+            "keeps temporal credit critic-free"
+        ),
+    )
     parser.add_argument("--neural-call-cost", type=float, default=0.0)
     parser.add_argument("--infeasible-penalty", type=float, default=10.0)
     parser.add_argument(
@@ -1354,8 +1855,33 @@ def parse_args() -> argparse.Namespace:
             "rare infeasible ants cannot dominate the pooled scale; 0 disables"
         ),
     )
-    parser.add_argument("--pretrain-epochs", type=int, default=3)
-    parser.add_argument("--pretrain-lr", type=float, default=1e-4)
+    parser.add_argument(
+        "--pretrain-epochs",
+        "--pretraining-epochs",
+        dest="pretrain_epochs",
+        type=int,
+        default=3,
+        help=(
+            "Number of auxiliary-only epochs before PPO starts; use 0 to "
+            "disable the pretraining phase (default: 3)"
+        ),
+    )
+    parser.add_argument(
+        "--pretrain-lr",
+        "--pretraining-lr",
+        dest="pretrain_lr",
+        type=float,
+        default=1e-4,
+        help="Optimizer learning rate during auxiliary pretraining",
+    )
+    parser.add_argument(
+        "--pretrain-aux-scale",
+        "--pretraining-aux-scale",
+        dest="pretrain_aux_scale",
+        type=float,
+        default=1.0,
+        help="Scale applied to auxiliary losses during pretraining",
+    )
     parser.add_argument("--rl-weight", type=float, default=1.0)
     parser.add_argument(
         "--aux-rl-scale",
@@ -1423,8 +1949,23 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--threads", type=int, default=None)
     parser.add_argument("--seed", type=int, default=1234)
-    parser.add_argument("--val-seen", type=int, default=8)
-    parser.add_argument("--val-heldout", type=int, default=16)
+    parser.add_argument(
+        "--val-seen",
+        type=int,
+        default=None,
+        help="Number of training variants to validate (default: all)",
+    )
+    parser.add_argument(
+        "--val-heldout",
+        type=int,
+        default=16,
+        help="Number of variants from the fixed stratified held-out manifest",
+    )
+    parser.add_argument(
+        "--allow-missing-validation",
+        action="store_true",
+        help="Warn and continue instead of requiring the complete manifest",
+    )
     parser.add_argument("--skip-validation", action="store_true")
     parser.add_argument("--save-dir", type=Path, default=Path("pretrained"))
     parser.add_argument("--resume", type=Path)
@@ -1445,6 +1986,14 @@ def setup_seeds(seed: int) -> None:
 
 def main() -> None:
     args = parse_args()
+    if not 0.0 <= args.smdp_gamma <= 1.0:
+        raise ValueError("smdp_gamma must lie in [0, 1]")
+    if not 0.0 <= args.gae_lambda <= 1.0:
+        raise ValueError("gae_lambda must lie in [0, 1]")
+    if args.temporal_credit_weight < 0.0:
+        raise ValueError("temporal_credit_weight must be nonnegative")
+    if args.value_loss_weight < 0.0:
+        raise ValueError("value_loss_weight must be nonnegative")
     if args.smallvram is None:
         args.smallvram = (
             torch.version.hip is not None
@@ -1474,20 +2023,74 @@ def main() -> None:
     ).to(args.device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
     start_epoch = 0
+    global_step = 0
+    checkpoint = None
     if args.resume:
         checkpoint = torch.load(
             args.resume, map_location=args.device, weights_only=False
         )
-        model.load_state_dict(checkpoint["model_state_dict"])
-        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        upgraded = load_constraint_field_state_dict(
+            model, checkpoint["model_state_dict"]
+        )
+        added_optimizer_parameters = _load_optimizer_state_compat(
+            optimizer, checkpoint["optimizer_state_dict"]
+        )
+        if upgraded:
+            logger.warning(
+                "resumed a pre-critic checkpoint; initialized the refresh "
+                "value head at zero"
+            )
+        if added_optimizer_parameters:
+            logger.warning(
+                "initialized optimizer state for "
+                f"{added_optimizer_parameters} new critic parameters"
+            )
         start_epoch = int(checkpoint["epoch"]) + 1
+        global_step = int(
+            checkpoint.get("global_step", start_epoch * args.steps_per_epoch)
+        )
 
     args.save_dir.mkdir(parents=True, exist_ok=True)
     validation_data = (
         [] if args.skip_validation else build_validation_data(args, curriculum)
     )
-    best_gap = float("inf")
-    global_step = 0
+    validation_manifest = tuple(
+        (
+            item["variant"],
+            int(item["instance_index"]),
+            item["split"],
+        )
+        for item in validation_data
+    )
+    best_validation_rank = (float("inf"),) * 5
+    if checkpoint is not None:
+        stored_rank = checkpoint.get("best_validation_rank")
+        if (
+            checkpoint.get("checkpoint_rank_metric")
+            == "variant_macro_score"
+            and checkpoint.get("validation_manifest") == validation_manifest
+            and stored_rank is not None
+            and len(stored_rank) == 5
+        ):
+            best_validation_rank = tuple(float(value) for value in stored_rank)
+        elif stored_rank is not None:
+            logger.warning(
+                "resetting best validation rank because the checkpoint used "
+                "a different metric or validation manifest"
+            )
+    if validation_data:
+        (
+            _baseline_average,
+            _baseline_best,
+            baseline_gap,
+            _baseline_metrics,
+        ) = validation(
+            None,
+            validation_data,
+            args,
+            capture_classical_baseline=True,
+        )
+        logger.log_baseline(baseline_gap)
     for epoch in range(start_epoch, args.epochs):
         phase_lr = args.pretrain_lr if epoch < args.pretrain_epochs else args.lr
         for group in optimizer.param_groups:
@@ -1501,8 +2104,9 @@ def main() -> None:
             epoch_timing,
         ) = train_epoch(model, optimizer, global_step, epoch, args, curriculum)
         val_best = 0.0
-        val_gap = 0.0
+        val_gap = None
         val_metrics = {}
+        validation_rank = None
         if validation_data:
             val_average, val_best, val_gap, val_metrics = validation(
                 model, validation_data, args
@@ -1516,12 +2120,28 @@ def main() -> None:
                 timing=epoch_timing,
                 step=global_step,
             )
-            if val_gap < best_gap:
-                best_gap = val_gap
+            validation_rank = _validation_rank(val_metrics, val_gap)
+            if validation_rank < best_validation_rank:
+                best_validation_rank = validation_rank
                 save_checkpoint(
-                    model, optimizer, epoch, args, args.save_dir / "best.pt", val_gap
+                    model,
+                    optimizer,
+                    epoch,
+                    args,
+                    args.save_dir / "best.pt",
+                    val_gap,
+                    validation_rank=validation_rank,
+                    best_validation_rank=best_validation_rank,
+                    global_step=global_step,
+                    validation_manifest=validation_manifest,
                 )
-        logger.log_epoch_summary(epoch, train_cost, val_best, val_gap)
+        logger.log_epoch_summary(
+            epoch,
+            train_cost,
+            val_best,
+            val_gap,
+            val_metrics.get("feasibility_rate") if validation_data else None,
+        )
         epoch_timing["epoch_seconds"] = epoch_time
         if args.profile_timing:
             logger.info(
@@ -1533,7 +2153,16 @@ def main() -> None:
             )
         logger.log_metrics(epoch_timing, prefix="time/", step=global_step)
         save_checkpoint(
-            model, optimizer, epoch, args, args.save_dir / "last.pt", val_gap
+            model,
+            optimizer,
+            epoch,
+            args,
+            args.save_dir / "last.pt",
+            val_gap,
+            validation_rank=validation_rank,
+            best_validation_rank=best_validation_rank,
+            global_step=global_step,
+            validation_manifest=validation_manifest,
         )
         gc.collect()
         if torch.cuda.is_available():

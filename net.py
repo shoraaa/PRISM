@@ -214,6 +214,7 @@ class ConstraintFieldNet(nn.Module):
         self.binding_head = nn.Linear(units, 1)
         self.coupler_head = nn.Linear(units, LIVE_STATE_FEATURE_COUNT)
         self.coupler_bias_head = nn.Linear(units, 1)
+        self.value_head = nn.Linear(units + 1, 1)
         nn.init.zeros_(self.field_head.weight)
         nn.init.zeros_(self.field_head.bias)
         nn.init.zeros_(self.additive_head.weight)
@@ -224,6 +225,10 @@ class ConstraintFieldNet(nn.Module):
         nn.init.zeros_(self.coupler_head.bias)
         nn.init.zeros_(self.coupler_bias_head.weight)
         nn.init.zeros_(self.coupler_bias_head.bias)
+        # A zero value is the neutral bootstrap for old checkpoints and makes
+        # enabling temporal credit leave the field policy unchanged initially.
+        nn.init.zeros_(self.value_head.weight)
+        nn.init.zeros_(self.value_head.bias)
         self.register_buffer(
             "resource_types", torch.eye(FIELD_CHANNEL_COUNT)
         )
@@ -363,9 +368,9 @@ class ConstraintFieldNet(nn.Module):
         residual = residual * edge_active + (1.0 - edge_active)
         additive = additive * edge_active
 
-        state = torch.tanh(
-            self.graph_projection(graph_embedding).unsqueeze(1) + tokens
-        )
+        projected_graph = self.graph_projection(graph_embedding)
+        state = torch.tanh(projected_graph.unsqueeze(1) + tokens)
+        graph_state = torch.tanh(projected_graph)
         binding_logits = self.binding_head(state).squeeze(-1)
         multipliers = (
             F.softplus(self.multiplier_head(state).squeeze(-1))
@@ -384,6 +389,7 @@ class ConstraintFieldNet(nn.Module):
             "raw_residual": raw_residual,
             "coupler_weights": coupler_weights,
             "coupler_bias": coupler_bias,
+            "value_context": graph_state,
             "active_channels": active,
         }
 
@@ -424,3 +430,37 @@ class ConstraintFieldNet(nn.Module):
         logit = torch.einsum("ncs,ns->nc", selected_weights, live_state)
         logit = logit + selected_bias
         return selected_base * (2.0 * torch.sigmoid(logit))
+
+    def value(self, output, search_progress):
+        """Estimate remaining normalized improvement from a refresh state."""
+        context = output["value_context"]
+        progress = torch.as_tensor(
+            search_progress, dtype=context.dtype, device=context.device
+        )
+        if progress.ndim == 0:
+            progress = progress.expand(context.shape[0])
+        progress = progress.reshape(-1, 1)
+        if progress.shape[0] != context.shape[0]:
+            raise ValueError("search_progress must have one value per graph")
+        _require_unit_interval("search_progress", progress)
+        return self.value_head(torch.cat((context, progress), dim=-1)).squeeze(-1)
+
+
+def load_constraint_field_state_dict(
+    model: ConstraintFieldNet, state_dict: dict
+) -> bool:
+    """Load current or pre-value-head checkpoints without hiding other drift.
+
+    Returns ``True`` when a legacy checkpoint was upgraded by retaining the
+    value head's zero initialization.
+    """
+    incompatible = model.load_state_dict(state_dict, strict=False)
+    allowed_missing = {"value_head.weight", "value_head.bias"}
+    missing = set(incompatible.missing_keys)
+    unexpected = set(incompatible.unexpected_keys)
+    if unexpected or missing - allowed_missing:
+        raise RuntimeError(
+            "incompatible ConstraintFieldNet checkpoint: "
+            f"missing={sorted(missing)} unexpected={sorted(unexpected)}"
+        )
+    return bool(missing)

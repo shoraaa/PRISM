@@ -71,6 +71,22 @@ uv run python generate_validation_data.py --n-node 100
 
 Later runs load the saved artifact from the configured dataset directory.
 
+Training uses an epoch-local balanced schedule: every eligible variant appears
+before any variant receives an extra rollout, and variants within each PPO
+accumulation group are distinct. Validation defaults to all 12 training
+variants plus a fixed 16-variant held-out manifest stratified across objective,
+pickup-delivery, symmetry, depot count, and constraint count. With the default
+`--val-size 8`, this is 224 fixed instances. Missing manifest entries are an
+error unless `--allow-missing-validation` is explicitly supplied.
+
+Before epoch 0, the same-budget non-neural decoder is evaluated once on the
+validation manifest. W&B then reports per-variant objective, feasibility, gap,
+and paired baseline improvement, plus `val_summary/macro_gap`,
+`val_summary/macro_improvement`, and `val_summary/macro_score`. Checkpoint
+selection is lexicographic: worst-variant feasibility, overall feasibility,
+paired-baseline coverage, variant-macro improvement, then variant-macro gap.
+Raw costs from different objectives are retained only as diagnostic values.
+
 Run the end-to-end size-100 URS feasibility gates with:
 
 ```bash
@@ -101,8 +117,23 @@ run. The report and CSV include the field mode and neural evaluation count.
 Train the resource-token field and event-driven decoder with:
 
 ```bash
-uv run python train.py --n-node 1000 --no-wandb
+uv run python train.py --n-node 1000 --pretrain-epochs 3 \
+  --pretrain-lr 1e-4 --pretrain-aux-scale 1.0 --no-wandb
 ```
+
+Set `--pretrain-epochs 0` to start PPO immediately. The equivalent long-form
+aliases are `--pretraining-epochs`, `--pretraining-lr`, and
+`--pretraining-aux-scale`; all values are saved in the checkpoint and W&B
+configuration.
+
+After pretraining, winner-gated Monte Carlo temporal credit is enabled by
+default. The complete sampled reward-to-go is assigned only to the ant that
+installed the next incumbent. Tune it with `--temporal-credit-weight` (default
+`0.1`), or set that weight to `0` for the local-POMO-only ablation. The optional
+progress-conditioned GAE critic remains available with, for example,
+`--gae-lambda 0.95 --value-loss-weight 0.5`; the defaults are `1.0` and `0.0`.
+Checkpoints from before the critic are accepted with its value head initialized
+at zero.
 
 Run the large-scale inference gate, optionally with a trained checkpoint:
 
