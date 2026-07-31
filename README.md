@@ -91,9 +91,12 @@ PYTHONPATH=src uv run --no-sync python tests/compare_decoders.py \
   --csv results/checkpoint_vs_non_neural.csv
 ```
 
-Both sides use the same seed, candidate budget, post-bootstrap iteration count,
-and available oracle reference. Use `--variants tsp,cvrp,cvrptw` for a quick
-subset before the complete run.
+The checkpoint path uses dynamic refinement by default: its sparse field is
+recomputed whenever an incumbent change installs a new candidate graph. Both
+sides use the same seed, candidate budget, post-bootstrap iteration count, and
+available oracle reference. Use `--static-field` for the frozen one-field
+ablation, or `--variants tsp,cvrp,cvrptw` for a quick subset before the complete
+run. The report and CSV include the field mode and neural evaluation count.
 
 Train the resource-token field and event-driven decoder with:
 

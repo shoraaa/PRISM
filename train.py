@@ -1134,6 +1134,8 @@ def infer_instance(
     # handful of iterations and ~2-10x worse than solve -- so it made the field
     # look untrainable (no field can move a stalled greedy descent). solve is
     # near-optimal (~0-3%) and the field's contribution is visible there.
+    if args.search_iterations < 1:
+        raise ValueError("search_iterations must be positive")
     if model is None:
         decoder = prism_decoder.Decoder(
             problem,
@@ -1162,23 +1164,55 @@ def infer_instance(
     )
     decoder.seed(args.seed)
     model.eval()
+    dynamic = not getattr(args, "static_field", False)
+    risk_penalty = args.feasibility_risk_penalty
+
+    def _refresh_guidance() -> dict:
+        graph = build_decoder_data(decoder, args.device)
+        output = model(graph)
+        return _guidance_numpy(output, graph, risk_penalty=risk_penalty)
+
+    neural_seconds = 0.0
+    decoder_seconds = 0.0
+    net_evals = 0
+
     start = time.perf_counter()
-    graph = build_decoder_data(decoder, args.device)
-    output = model(graph)
-    guidance = _guidance_numpy(
-        output, graph, risk_penalty=args.feasibility_risk_penalty
-    )
-    neural_seconds = time.perf_counter() - start
-    start = time.perf_counter()
-    best = decoder.solve(args.search_iterations, **guidance)
-    decoder_seconds = time.perf_counter() - start
+    guidance = _refresh_guidance()
+    net_evals += 1
+    neural_seconds += time.perf_counter() - start
+
+    if not dynamic:
+        # Frozen-field ablation and compatibility path: preserve the original
+        # one-shot solve exactly, including its random-number consumption.
+        start = time.perf_counter()
+        best = decoder.solve(args.search_iterations, **guidance)
+        decoder_seconds += time.perf_counter() - start
+    else:
+        # An incumbent improvement rebuilds the candidate graph and bumps its
+        # version. Advance one search iteration at a time so newly introduced
+        # edges receive guidance before the next construction/refinement pass.
+        version = int(decoder.graph_version)
+        start = time.perf_counter()
+        best = decoder.solve(1, **guidance)
+        decoder_seconds += time.perf_counter() - start
+        for _ in range(max(args.search_iterations - 1, 0)):
+            if int(decoder.graph_version) != version:
+                start = time.perf_counter()
+                guidance = _refresh_guidance()
+                net_evals += 1
+                neural_seconds += time.perf_counter() - start
+                version = int(decoder.graph_version)
+            start = time.perf_counter()
+            best = decoder.solve(1, **guidance)
+            decoder_seconds += time.perf_counter() - start
     return (
         _canonical_cost(best),
         best,
         {
-            "emissions": 1.0,
+            "emissions": float(net_evals),
             "time_neural": neural_seconds,
             "time_decoder": decoder_seconds,
+            "net_evals": float(net_evals),
         },
     )
 
@@ -1298,6 +1332,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--steps-per-epoch", type=int, default=32)
     parser.add_argument("--grad-accum-variants", type=int, default=4)
     parser.add_argument("--search-iterations", type=int, default=16)
+    parser.add_argument(
+        "--static-field",
+        action="store_true",
+        help=(
+            "Disable inference-time field refinement and keep one frozen "
+            "field for the complete search budget"
+        ),
+    )
     parser.add_argument("--option-max-steps", type=int, default=4)
     parser.add_argument("--improvement-epsilon", type=float, default=0.0)
     parser.add_argument("--smdp-gamma", type=float, default=0.99)

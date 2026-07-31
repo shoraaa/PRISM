@@ -49,6 +49,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ants", type=int, default=32)
     parser.add_argument("--candidates", type=int, default=64)
     parser.add_argument(
+        "--static-field",
+        action="store_true",
+        help=(
+            "evaluate one frozen neural field per instance; by default the "
+            "field is recomputed whenever the decoder graph changes"
+        ),
+    )
+    parser.add_argument(
         "--threads", type=int, default=prism_decoder.get_available_threads()
     )
     parser.add_argument("--seed", type=int, default=20260727)
@@ -117,13 +125,16 @@ def main() -> int:
                 feasibility_lookahead_depth=2,
                 feasibility_risk_penalty=10.0,
                 device=args.device,
+                static_field=args.static_field,
             )
 
             baseline_started = time.perf_counter()
             _, baseline, _ = infer_instance(None, problem, decoder_args)
             baseline_seconds = time.perf_counter() - baseline_started
             neural_started = time.perf_counter()
-            _, neural, _ = infer_instance(model, problem, decoder_args)
+            _, neural, neural_metrics = infer_instance(
+                model, problem, decoder_args
+            )
             neural_seconds = time.perf_counter() - neural_started
             if not baseline["feasible"] or not neural["feasible"]:
                 raise RuntimeError("a decoder returned an infeasible solution")
@@ -141,6 +152,7 @@ def main() -> int:
             rows.append(
                 {
                     "variant": name,
+                    "field_mode": "static" if args.static_field else "dynamic",
                     "direction": neural["direction"],
                     "reference": reference if has_reference else "",
                     "baseline_objective": baseline["objective"],
@@ -156,6 +168,9 @@ def main() -> int:
                     "winner": outcome,
                     "baseline_seconds": baseline_seconds,
                     "neural_seconds": neural_seconds,
+                    "neural_net_evals": int(neural_metrics["net_evals"]),
+                    "neural_model_seconds": neural_metrics["time_neural"],
+                    "neural_decoder_seconds": neural_metrics["time_decoder"],
                 }
             )
             baseline_gap = rows[-1]["baseline_gap_pct"]
@@ -165,6 +180,7 @@ def main() -> int:
                 f"{index + 1}/{len(variants)}",
                 f"variant={name}",
                 "status=PASS",
+                f"field_mode={rows[-1]['field_mode']}",
                 f"winner={outcome}",
                 f"baseline={baseline['objective']:.6g}",
                 f"neural={neural['objective']:.6g}",
@@ -176,6 +192,7 @@ def main() -> int:
                 ),
                 "neural_gap="
                 + (f"{neural_gap:.3f}%" if neural_gap != "" else "n/a"),
+                f"net_evals={rows[-1]['neural_net_evals']}",
                 f"seconds={time.perf_counter() - test_started:.3f}",
                 flush=True,
             )
@@ -197,6 +214,7 @@ def main() -> int:
         "DECODER_COMPARE",
         f"checkpoint={args.checkpoint}",
         f"checkpoint_epoch={checkpoint.get('epoch', 'unknown')}",
+        f"field_mode={'static' if args.static_field else 'dynamic'}",
         f"variants={len(variants)}",
         f"passed={len(rows)}",
         f"failed={len(failures)}",

@@ -36,6 +36,7 @@ def _args() -> Namespace:
         search_iterations=2,
         option_max_steps=2,
         infeasible_penalty=10.0,
+        reward_clip=1.0,
         smdp_gamma=0.99,
         neural_call_cost=0.0,
         improvement_epsilon=0.0,
@@ -360,6 +361,15 @@ def test_inference_is_deterministic() -> None:
     assert first[0] == second[0]
     assert np.array_equal(first[1]["route"], second[1]["route"])
     assert first[1]["objective"] == second[1]["objective"]
+    assert first[2]["net_evals"] >= 2.0
+    assert first[2]["emissions"] == first[2]["net_evals"]
+    assert second[2]["emissions"] == second[2]["net_evals"]
+
+    args.static_field = True
+    static = infer_instance(model, problem, args)
+
+    assert static[2]["net_evals"] == 1.0
+    assert static[2]["emissions"] == 1.0
 
 
 def test_validation_size_loads_each_requested_instance(monkeypatch) -> None:
@@ -403,7 +413,10 @@ def test_validation_size_loads_each_requested_instance(monkeypatch) -> None:
     ]
 
 
-def test_validation_size_defaults_to_one_instance(monkeypatch) -> None:
+def test_validation_size_defaults_to_eight_instances(monkeypatch) -> None:
     monkeypatch.setattr(sys, "argv", ["train.py"])
 
-    assert parse_args().val_size == 1
+    args = parse_args()
+
+    assert args.val_size == 8
+    assert args.static_field is False
