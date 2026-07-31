@@ -11,7 +11,7 @@ namespace prism {
 
 static constexpr int32_t FIELD_CHANNEL_COUNT = 7;
 static constexpr int32_t LIVE_STATE_FEATURE_COUNT = FIELD_CHANNEL_COUNT;
-static constexpr int32_t NODE_FEATURE_COUNT = 24;
+static constexpr int32_t NODE_FEATURE_COUNT = 25;
 static constexpr int32_t EDGE_FEATURE_COUNT = 10;
 
 enum class FieldChannel : uint8_t {
@@ -104,6 +104,12 @@ struct SearchConfig {
   int32_t max_perturb_attempts = 64;
   int32_t or_opt_max_segment = 3;
   int32_t feasibility_lookahead_depth = 2;
+  // Cap on how many customer candidates SRR screens per anchor, in learned
+  // rank order (ranked_local_edges is sorted by the guided edge energy). 0 means
+  // screen every candidate (default, unchanged behavior). A small value turns the
+  // exhaustive descent into a learned "propose the top-k moves" step, cutting the
+  // dominant K x moves screening cost.
+  int32_t srr_candidate_limit = 0;
   bool use_srr = true;
   bool classical_behavior = true;
   bool use_pheromone = true;
@@ -291,6 +297,12 @@ private:
   float prize_scale_ = 1.0f;
   float penalty_scale_ = 1.0f;
   int32_t pair_count_ = 0;
+  // Which field channels the problem's constraints activate.  Constant for the
+  // lifetime of the decoder, so it is precomputed once: field_channel_active is
+  // otherwise called hundreds of millions of times during SRR.  active_channels_
+  // lists only the active indices so hot guidance loops skip inactive channels.
+  std::array<uint8_t, FIELD_CHANNEL_COUNT> channel_active_{};
+  std::vector<int32_t> active_channels_;
 
   std::vector<float> pheromone_;
   std::vector<float> heuristic_;

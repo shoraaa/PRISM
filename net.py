@@ -113,9 +113,13 @@ class GNNLayer(nn.Module):
         self.v_lin2 = nn.Linear(units, units)
         self.v_lin3 = nn.Linear(units, units)
         self.v_lin4 = nn.Linear(units, units)
-        self.v_bn = gnn.BatchNorm(units)
+        # Each decoder graph is one heterogeneous routing instance. Running
+        # statistics therefore track the recent curriculum mix rather than a
+        # stable population and make eval-mode policy outputs jump between
+        # epochs. Always use the current graph statistics in train and eval.
+        self.v_bn = gnn.BatchNorm(units, track_running_stats=False)
         self.e_lin0 = nn.Linear(units, units)
-        self.e_bn = gnn.BatchNorm(units)
+        self.e_bn = gnn.BatchNorm(units, track_running_stats=False)
 
     def forward(self, x, w, edge_index):
         x0 = x

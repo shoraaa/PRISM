@@ -1,3 +1,4 @@
+import copy
 import sys
 from argparse import Namespace
 from types import SimpleNamespace
@@ -16,13 +17,16 @@ from train import (
     _feasibility_loss,
     _positive_class_weight,
     _rollout_class_weights,
+    _validation_rank,
     build_validation_data,
     collect_instance_rollout,
     infer_instance,
     parse_args,
     ppo_update,
     replay_decision_logp_from_cpp_batch_trace,
+    validation,
 )
+from problem_data import VariantCurriculum, generated_problem
 
 
 def _args() -> Namespace:
@@ -36,6 +40,7 @@ def _args() -> Namespace:
         search_iterations=2,
         option_max_steps=2,
         infeasible_penalty=10.0,
+        reward_clip=1.0,
         smdp_gamma=0.99,
         neural_call_cost=0.0,
         improvement_epsilon=0.0,
@@ -85,8 +90,8 @@ def test_event_driven_option_rollout_and_pretrain_update(
     rollout = collect_instance_rollout(model, problem, "cvrp", args)
     metrics = ppo_update(model, optimizer, [rollout], args, epoch=0)
 
-    assert 1 <= rollout.emissions <= args.search_iterations
-    assert len(rollout.steps) == args.search_iterations
+    assert 1 <= rollout.emissions <= args.search_iterations - 1
+    assert len(rollout.steps) == args.search_iterations - 1
     assert all(
         1 <= step.duration <= args.option_max_steps for step in rollout.steps
     )
@@ -186,6 +191,49 @@ def test_decision_level_ppo_moves_policy_without_auxiliary_losses(
     assert metrics["auxiliary_scale"] == pytest.approx(args.aux_rl_scale)
 
 
+def test_streamed_smallvram_update_matches_full_gradient() -> None:
+    rng = np.random.default_rng(411)
+    coordinates = rng.random((24, 2), dtype=np.float32)
+    problem = {
+        "name": "cvrp",
+        "coordinates": coordinates,
+        "distance": np.linalg.norm(
+            coordinates[:, None] - coordinates[None, :], axis=-1
+        ).astype(np.float32),
+        "demand": np.r_[0.0, rng.uniform(0.01, 0.07, 23)].astype(np.float32),
+        "capacity": 0.5,
+    }
+    args = _args()
+    args.pretrain_epochs = 0
+    args.ppo_epochs = 1
+    args.search_iterations = 3
+    args.option_max_steps = 3
+    args.improvement_epsilon = float("inf")
+    full_model = ConstraintFieldNet(depth=1, units=8)
+    rollout = collect_instance_rollout(full_model, problem, "cvrp", args)
+    streamed_model = copy.deepcopy(full_model)
+    assert len({id(step.graph) for step in rollout.steps}) == 1
+
+    args.smallvram = False
+    full_optimizer = torch.optim.SGD(full_model.parameters(), lr=1e-3)
+    full_metrics = ppo_update(
+        full_model, full_optimizer, [rollout], args, epoch=0
+    )
+    args.smallvram = True
+    streamed_optimizer = torch.optim.SGD(streamed_model.parameters(), lr=1e-3)
+    streamed_metrics = ppo_update(
+        streamed_model, streamed_optimizer, [rollout], args, epoch=0
+    )
+
+    assert streamed_metrics["loss"] == pytest.approx(
+        full_metrics["loss"], rel=1e-6, abs=1e-7
+    )
+    for full, streamed in zip(
+        full_model.parameters(), streamed_model.parameters(), strict=True
+    ):
+        torch.testing.assert_close(streamed, full, rtol=1e-5, atol=1e-7)
+
+
 def test_binding_weight_is_computed_across_rollout_steps() -> None:
     channels = prism_decoder.FIELD_CHANNEL_COUNT
     graph = SimpleNamespace(
@@ -221,8 +269,16 @@ def test_smdp_returns_discount_across_variable_duration_options() -> None:
     first_steps = [SimpleNamespace(), SimpleNamespace()]
     second_steps = [SimpleNamespace()]
     outcomes = [
-        OptionOutcome(first_steps, torch.tensor([1.0, 2.0]), 2),
-        OptionOutcome(second_steps, torch.tensor([3.0, 5.0]), 1),
+        OptionOutcome(
+            first_steps,
+            torch.tensor([1.0, 2.0]),
+            2,
+        ),
+        OptionOutcome(
+            second_steps,
+            torch.tensor([3.0, 5.0]),
+            1,
+        ),
     ]
 
     _assign_smdp_returns(outcomes, gamma=0.5, device="cpu")
@@ -334,6 +390,7 @@ def test_stagnant_options_reuse_field_and_skip_fallback_labels() -> None:
     )
 
     assert rollout.emissions == 1
+    assert len(rollout.steps) == args.search_iterations - 1
     assert len({id(step.graph) for step in rollout.steps}) == 1
     assert all(step.trace["screened_edges"].size > 0 for step in rollout.steps)
     assert all(step.resource_delta is None for step in rollout.steps)
@@ -360,14 +417,23 @@ def test_inference_is_deterministic() -> None:
     assert first[0] == second[0]
     assert np.array_equal(first[1]["route"], second[1]["route"])
     assert first[1]["objective"] == second[1]["objective"]
+    assert first[2]["net_evals"] >= 1.0
+    assert first[2]["emissions"] == first[2]["net_evals"]
+    assert second[2]["emissions"] == second[2]["net_evals"]
+
+    args.static_field = True
+    static = infer_instance(model, problem, args)
+
+    assert static[2]["net_evals"] == 1.0
+    assert static[2]["emissions"] == 1.0
 
 
 def test_validation_size_loads_each_requested_instance(monkeypatch) -> None:
     loaded_sizes = []
     loaded_instances = []
 
-    class FakeSavedURS:
-        def __init__(self, size: int) -> None:
+    class FakeSavedProblems:
+        def __init__(self, size: int, data_dir=None) -> None:
             loaded_sizes.append(size)
 
         def load(self, variant: str, index: int = 0) -> tuple[dict, float]:
@@ -380,7 +446,7 @@ def test_validation_size_loads_each_requested_instance(monkeypatch) -> None:
     args.val_seen = 1
     args.val_heldout = 1
     curriculum = SimpleNamespace(variants=["tsp"], held_out=["cvrp"])
-    monkeypatch.setattr("train.SavedURS", FakeSavedURS)
+    monkeypatch.setattr("train.SavedProblems", FakeSavedProblems)
 
     data = build_validation_data(args, curriculum)
 
@@ -402,7 +468,262 @@ def test_validation_size_loads_each_requested_instance(monkeypatch) -> None:
     ]
 
 
-def test_validation_size_defaults_to_one_instance(monkeypatch) -> None:
+def test_validation_size_defaults_to_eight_instances(monkeypatch) -> None:
     monkeypatch.setattr(sys, "argv", ["train.py"])
 
-    assert parse_args().val_size == 1
+    args = parse_args()
+
+    assert args.val_size == 8
+    assert args.val_seen is None
+    assert args.pretrain_epochs == 0
+
+
+@pytest.mark.parametrize("variant", ["cvrptw", "ocvrptw"])
+def test_generated_vrptw_uses_closed_route_depot_horizon(variant: str) -> None:
+    problem = generated_problem(variant, 20, 20)
+
+    assert problem["tw_start"][0] == 0.0
+    assert problem["tw_end"][0] == 3.0
+    assert np.all(problem["tw_end"][1:] <= 3.0)
+
+
+def test_curriculum_exposes_tw_only_task_during_pretraining() -> None:
+    curriculum = VariantCurriculum.default(seed=1234)
+
+    early = curriculum.eligible(epoch=0, epochs=100)
+    middle = curriculum.eligible(epoch=33, epochs=100)
+
+    assert [name for name in early if "tw" in name] == ["vrptw"]
+    assert {name for name in middle if "tw" in name} == {
+        "vrptw",
+        "cvrptw",
+        "ocvrptw",
+    }
+
+
+def test_default_validation_covers_every_training_variant(monkeypatch) -> None:
+    monkeypatch.setattr(sys, "argv", ["train.py"])
+    args = parse_args()
+    curriculum = VariantCurriculum.default(seed=args.seed)
+
+    assert curriculum.variants[: args.val_seen] == curriculum.variants
+    assert {"vrptw", "cvrptw", "ocvrptw"} <= set(
+        curriculum.variants[: args.val_seen]
+    )
+
+
+def test_generated_vrptw_is_time_window_only_and_replay_feasible() -> None:
+    problem = generated_problem("vrptw", 20)
+    decoder = prism_decoder.Decoder(problem, n_ants=2)
+    solution = decoder.solve(2)
+
+    assert problem["constraints"] == ["visit_all", "time_windows"]
+    assert problem["depot_count"] == 1
+    assert problem["multi_route"] is True
+    assert "demand" not in problem
+    assert solution["feasible"]
+    assert decoder.evaluate(solution["route"])["feasible"]
+
+
+def test_validation_reports_per_variant_gaps(monkeypatch) -> None:
+    dataset = [
+        {
+            "variant": "cvrptw",
+            "split": "seen",
+            "problem": {"name": "cvrptw"},
+            "reference": 10.0,
+        },
+        {
+            "variant": "ocvrptw",
+            "split": "seen",
+            "problem": {"name": "ocvrptw"},
+            "reference": 20.0,
+        },
+    ]
+    solutions = iter(
+        [
+            (
+                11.0,
+                {"objective": 11.0, "direction": "minimize", "feasible": True},
+                {},
+            ),
+            (
+                18.0,
+                {"objective": 18.0, "direction": "minimize", "feasible": True},
+                {},
+            ),
+        ]
+    )
+    monkeypatch.setattr("train.infer_instance", lambda *_: next(solutions))
+
+    _, _, _, metrics = validation(None, dataset, _args())
+
+    assert metrics["variants/cvrptw/gap"] == pytest.approx(10.0)
+    assert metrics["variants/ocvrptw/gap"] == pytest.approx(-10.0)
+    assert metrics["gap_instances"] == 2.0
+    assert metrics["gap_coverage"] == 1.0
+    assert metrics["worst_variant_gap"] == pytest.approx(10.0)
+
+
+def test_validation_captures_and_compares_paired_classical_baselines(
+    monkeypatch,
+) -> None:
+    dataset = [
+        {
+            "variant": "cvrp",
+            "split": "seen",
+            "problem": {"name": "cvrp"},
+            "reference": None,
+            "reference_source": "classical",
+        },
+        {
+            "variant": "op",
+            "split": "heldout",
+            "problem": {"name": "op"},
+            "reference": 120.0,
+        },
+    ]
+    baseline_solutions = iter(
+        [
+            (
+                10.0,
+                {"objective": 10.0, "direction": "minimize", "feasible": True},
+                {},
+            ),
+            (
+                -100.0,
+                {"objective": 100.0, "direction": "maximize", "feasible": True},
+                {},
+            ),
+        ]
+    )
+    monkeypatch.setattr(
+        "train.infer_instance", lambda *_: next(baseline_solutions)
+    )
+
+    _, _, _, baseline_metrics = validation(
+        None, dataset, _args(), capture_classical_baseline=True
+    )
+
+    assert baseline_metrics["baseline_improvement_coverage"] == 1.0
+    assert baseline_metrics["macro_baseline_improvement_percent"] == 0.0
+    assert [item["classical_baseline"]["objective"] for item in dataset] == [
+        10.0,
+        100.0,
+    ]
+    assert dataset[0]["reference"] == 10.0
+
+    neural_solutions = iter(
+        [
+            (
+                9.0,
+                {"objective": 9.0, "direction": "minimize", "feasible": True},
+                {},
+            ),
+            (
+                -110.0,
+                {"objective": 110.0, "direction": "maximize", "feasible": True},
+                {},
+            ),
+        ]
+    )
+    monkeypatch.setattr(
+        "train.infer_instance", lambda *_: next(neural_solutions)
+    )
+
+    _, _, _, metrics = validation(object(), dataset, _args())
+
+    assert metrics["baseline_improvement_instances"] == 2.0
+    assert metrics[
+        "average_baseline_improvement_percent"
+    ] == pytest.approx(10.0)
+    assert metrics["macro_score"] == pytest.approx(10.0)
+    assert metrics["macro_baseline_improvement_percent"] == pytest.approx(10.0)
+    assert metrics[
+        "worst_variant_baseline_improvement_percent"
+    ] == pytest.approx(10.0)
+    assert metrics[
+        "variants/cvrp/baseline_improvement_percent"
+    ] == pytest.approx(10.0)
+    assert metrics[
+        "variants/op/baseline_improvement_percent"
+    ] == pytest.approx(10.0)
+
+
+def test_validation_rank_maximizes_average_baseline_improvement() -> None:
+    weaker = {
+        "feasibility_rate": 1.0,
+        "macro_score": 2.0,
+    }
+    stronger = {
+        "feasibility_rate": 1.0,
+        "macro_score": 3.0,
+    }
+
+    assert _validation_rank(stronger, 5.0) < _validation_rank(weaker, 4.0)
+    assert _validation_rank(
+        {**stronger, "feasibility_rate": 0.99}, -100.0
+    ) > _validation_rank(weaker, 100.0)
+
+
+def test_validation_excludes_infeasible_objectives_and_gaps(monkeypatch) -> None:
+    dataset = [
+        {
+            "variant": "vrptw",
+            "split": "seen",
+            "problem": {"name": "vrptw", "index": 0},
+            "reference": 10.0,
+        },
+        {
+            "variant": "vrptw",
+            "split": "seen",
+            "problem": {"name": "vrptw", "index": 1},
+            "reference": 10.0,
+        },
+        {
+            "variant": "cvrp",
+            "split": "heldout",
+            "problem": {"name": "cvrp"},
+            "reference": 20.0,
+        },
+    ]
+    solutions = iter(
+        [
+            (
+                12.0,
+                {"objective": 12.0, "direction": "minimize", "feasible": True},
+                {},
+            ),
+            (
+                float("inf"),
+                {
+                    "objective": float("inf"),
+                    "direction": "minimize",
+                    "feasible": False,
+                },
+                {},
+            ),
+            (
+                18.0,
+                {"objective": 18.0, "direction": "minimize", "feasible": True},
+                {},
+            ),
+        ]
+    )
+    monkeypatch.setattr("train.infer_instance", lambda *_: next(solutions))
+
+    average, best, gap, metrics = validation(None, dataset, _args())
+
+    assert average == pytest.approx(15.0)
+    assert best == pytest.approx(15.0)
+    assert gap == pytest.approx(5.0)
+    assert metrics["feasibility_rate"] == pytest.approx(2 / 3)
+    assert metrics["seen_feasibility_rate"] == pytest.approx(0.5)
+    assert metrics["heldout_feasibility_rate"] == pytest.approx(1.0)
+    assert metrics["variants/vrptw/feasibility_rate"] == pytest.approx(0.5)
+    assert metrics["variants/vrptw/objective"] == pytest.approx(12.0)
+    assert metrics["variants/vrptw/gap"] == pytest.approx(20.0)
+    assert metrics["variants/cvrp/feasibility_rate"] == pytest.approx(1.0)
+    assert metrics["gap_instances"] == 2.0
+    assert metrics["gap_coverage"] == pytest.approx(2 / 3)
+    assert metrics["worst_variant_gap"] == pytest.approx(20.0)

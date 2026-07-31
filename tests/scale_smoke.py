@@ -19,7 +19,7 @@ sys.path.insert(0, str(ROOT))
 
 from net import ConstraintFieldNet  # noqa: E402
 from train import infer_instance, setup_seeds  # noqa: E402
-from urs_data import generated_problem  # noqa: E402
+from problem_data import generated_problem  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:

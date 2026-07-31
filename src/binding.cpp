@@ -341,6 +341,8 @@ SearchConfig parse_search_config(const py::dict &data) {
   config.feasibility_lookahead_depth = value_or<int32_t>(
       data, "feasibility_lookahead_depth",
       config.feasibility_lookahead_depth);
+  config.srr_candidate_limit = value_or<int32_t>(
+      data, "srr_candidate_limit", config.srr_candidate_limit);
   config.use_srr = value_or<bool>(data, "use_srr", config.use_srr);
   config.classical_behavior =
       value_or<bool>(data, "classical_behavior", config.classical_behavior);

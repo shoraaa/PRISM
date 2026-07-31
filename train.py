@@ -27,7 +27,7 @@ if str(SRC) not in sys.path:
 
 import prism_decoder
 from net import ConstraintFieldNet, build_decoder_data
-from urs_data import SavedURS, VariantCurriculum, generated_problem
+from problem_data import SavedProblems, VariantCurriculum, generated_problem
 from utils import MetricsCollector, get_logger, init_logger
 
 
@@ -73,7 +73,8 @@ def replay_decision_logp_from_cpp_batch_trace(
     beta: float,
     field_enabled: bool = True,
     risk_penalty: float = 0.0,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return_entropy: bool = False,
+):
     """Replay one log-probability per stochastic Decoder decision."""
     device = output["residual"].device
     current = torch.as_tensor(trace["current_nodes"], device=device).long()
@@ -95,6 +96,8 @@ def replay_decision_logp_from_cpp_batch_trace(
     if current.numel() == 0 or not selected.any():
         empty_logp = output["residual"].new_empty(0)
         empty_ant = torch.empty(0, dtype=torch.long, device=device)
+        if return_entropy:
+            return empty_logp, empty_ant, decisions, empty_logp
         return empty_logp, empty_ant, decisions
 
     lengths = valid_offsets[1:] - valid_offsets[:-1]
@@ -147,10 +150,18 @@ def replay_decision_logp_from_cpp_batch_trace(
         chosen_energy
         + float(risk_penalty) * feasibility_risk[chosen_edge]
     )
-    step_logp = (
-        -float(beta) * chosen_energy
-        - torch.logsumexp(logits[selected], dim=1)
+    selected_logits = logits[selected]
+    selected_valid = valid[selected]
+    selected_log_probs = torch.log_softmax(selected_logits, dim=1)
+    step_logp = -float(beta) * chosen_energy - torch.logsumexp(
+        selected_logits, dim=1
     )
+    if return_entropy:
+        probabilities = torch.softmax(selected_logits, dim=1)
+        safe_log_probs = selected_log_probs.masked_fill(~selected_valid, 0.0)
+        entropy_terms = probabilities * safe_log_probs
+        decision_entropy = -entropy_terms.sum(dim=1)
+        return step_logp, ant_index[selected], decisions, decision_entropy
     return step_logp, ant_index[selected], decisions
 
 
@@ -260,6 +271,7 @@ def setup_decoder(
             "feasibility_lookahead_depth": getattr(
                 args, "feasibility_lookahead_depth", 2
             ),
+            "srr_candidate_limit": getattr(args, "srr_candidate_limit", 0),
         },
         n_ants=args.n_ants,
         beta=args.beta,
@@ -329,8 +341,12 @@ def collect_instance_rollout(
     cached_guidance = None
     cached_binding = None
     iteration = 0
+    # The neutral bootstrap in setup_decoder consumes the first primitive
+    # search iteration. Keep --search-iterations as one total budget shared by
+    # training, validation, and the classical reference path.
+    learned_iterations = max(args.search_iterations - 1, 0)
 
-    while iteration < args.search_iterations:
+    while iteration < learned_iterations:
         version = int(decoder.graph_version)
         emitted = version != cached_version
         if emitted:
@@ -365,8 +381,9 @@ def collect_instance_rollout(
         option_incumbent = incumbent
         option_steps: list[OptionStep] = []
         option_duration = 0
+        normalized_gain = 0.0
         for _ in range(args.option_max_steps):
-            if iteration >= args.search_iterations:
+            if iteration >= learned_iterations:
                 break
             decoder_start = time.perf_counter()
             batch = decoder.sample_traced(**guidance)
@@ -688,7 +705,7 @@ def _step_loss(
 ) -> tuple[torch.Tensor, dict[str, float | torch.Tensor]]:
     zero = output["residual"].sum() * 0.0
     if rl_weight != 0.0:
-        logp, decision_ants, decisions = (
+        logp, decision_ants, decisions, decision_entropy = (
             replay_decision_logp_from_cpp_batch_trace(
                 step.trace,
                 step.graph,
@@ -697,6 +714,7 @@ def _step_loss(
                 args.beta,
                 field_enabled=step.field_enabled,
                 risk_penalty=step.risk_penalty,
+                return_entropy=True,
             )
         )
         old_logp = step.old_logp.to(logp.device)
@@ -719,6 +737,7 @@ def _step_loss(
         decisions = torch.zeros(
             step.rewards.shape[0], dtype=torch.long, device=logp.device
         )
+        decision_entropy = logp
 
     if rl_weight != 0.0 and logp.numel():
         log_ratio = logp - old_logp
@@ -763,7 +782,7 @@ def _step_loss(
         policy_signal = (
             decision_weight * surrogate.abs()
         ).sum() / normalizer
-        entropy = -(decision_weight * logp).sum() / normalizer
+        entropy = (decision_weight * decision_entropy).sum() / normalizer
         approx_kl = (
             decision_weight * (0.5 * log_ratio.square())
         ).sum() / normalizer
@@ -907,8 +926,19 @@ def ppo_update(
                 phase_started = time.perf_counter()
                 base = model(group[0].graph)
                 output, links = _detached_output(base)
-                group_losses = []
+                synchronize()
+                timing["forward"] += time.perf_counter() - phase_started
+
+                # A graph version can remain unchanged for the entire search,
+                # so `group` is not bounded by option_max_steps.  Retaining all
+                # decision-replay losses until one backward makes peak memory
+                # grow with search_iterations * n_ants.  Backpropagate through
+                # the detached output leaves one step at a time instead.  The
+                # proxy gradients still sum exactly to the gradient of the
+                # original mean loss, and are sent through the GNN once below.
                 for step in group:
+                    synchronize()
+                    phase_started = time.perf_counter()
                     loss, metrics = _step_loss(
                         model,
                         step,
@@ -918,13 +948,16 @@ def ppo_update(
                         class_weights,
                         adv_scale,
                     )
-                    group_losses.append(loss)
                     collector.add_dict(metrics)
-                synchronize()
-                timing["forward"] += time.perf_counter() - phase_started
+                    synchronize()
+                    timing["forward"] += time.perf_counter() - phase_started
 
-                phase_started = time.perf_counter()
-                (torch.stack(group_losses).sum() / len(steps)).backward()
+                    phase_started = time.perf_counter()
+                    (loss / len(steps)).backward()
+                    synchronize()
+                    timing["backward"] += time.perf_counter() - phase_started
+                    del loss
+
                 originals = [
                     original
                     for original, proxy in links
@@ -936,10 +969,14 @@ def ppo_update(
                     if proxy.grad is not None
                 ]
                 if originals:
+                    synchronize()
+                    phase_started = time.perf_counter()
                     torch.autograd.backward(originals, gradients)
-                synchronize()
-                timing["backward"] += time.perf_counter() - phase_started
-                del base, output, links, group_losses
+                    synchronize()
+                    timing["backward"] += (
+                        time.perf_counter() - phase_started
+                    )
+                del base, output, links, originals, gradients
         else:
             synchronize()
             phase_started = time.perf_counter()
@@ -1042,6 +1079,7 @@ def train_epoch(
     ppo_optimizer_seconds = 0.0
     started = time.perf_counter()
     completed = 0
+    improved_count = 0
     progress = tqdm(total=args.steps_per_epoch, desc="Epoch", leave=True)
     while completed < args.steps_per_epoch:
         group = min(args.grad_accum_variants, args.steps_per_epoch - completed)
@@ -1074,19 +1112,44 @@ def train_epoch(
         ppo_forward_seconds += metrics.get("ppo_forward_seconds", 0.0)
         ppo_backward_seconds += metrics.get("ppo_backward_seconds", 0.0)
         ppo_optimizer_seconds += metrics.get("ppo_optimizer_seconds", 0.0)
+        # PPO metrics describe this optimizer update over the whole mixed
+        # rollout group. Log them once; repeating them on every variant creates
+        # a false per-variant attribution in W&B.
+        logger.log_metrics(
+            {
+                name: value
+                for name, value in metrics.items()
+                if name
+                not in {
+                    "auxiliary_scale",
+                    "ppo_reuse_passes",
+                    "ppo_clipping_active",
+                }
+            },
+            prefix="train/update/",
+            step=global_step,
+        )
         for rollout in rollouts:
             logger.set_step(global_step)
-            row = dict(metrics)
-            row.update(
+            row = dict(
                 emissions=rollout.emissions,
                 improvements=rollout.improvements,
             )
             logger.debug(f"training variant={rollout.variant}")
             logger.log_train_step(
-                rollout.average_cost, rollout.best_cost, epoch, row, global_step
+                rollout.variant,
+                rollout.average_cost,
+                rollout.best_cost,
+                epoch,
+                row,
+                global_step,
             )
             global_step += 1
             completed += 1
+            improved_count += rollout.improvements
+            progress.set_postfix(
+                improved_count=improved_count, refresh=False
+            )
             progress.update(1)
     progress.close()
     epoch_seconds = time.perf_counter() - started
@@ -1151,29 +1214,80 @@ def infer_instance(
             "feasibility_lookahead_depth": getattr(
                 args, "feasibility_lookahead_depth", 2
             ),
+            "srr_candidate_limit": getattr(args, "srr_candidate_limit", 0),
         },
         n_ants=args.n_ants,
         beta=args.beta,
     )
     decoder.seed(args.seed)
+    bootstrap = decoder.solve(1, **_neutral_guidance(decoder))
+    if not bootstrap["feasible"]:
+        raise RuntimeError(f"validation bootstrap failed: {bootstrap['error']}")
     model.eval()
+    dynamic = not getattr(args, "static_field", False)
+    risk_penalty = args.feasibility_risk_penalty
+
+    def _refresh_guidance() -> dict:
+        graph = build_decoder_data(decoder, args.device)
+        output = model(graph)
+        return _guidance_numpy(output, graph, risk_penalty=risk_penalty)
+
+    neural_seconds = 0.0
+    decoder_seconds = 0.0
+    net_evals = 0
+    learned_iterations = max(args.search_iterations - 1, 0)
+    best = bootstrap
+    if learned_iterations == 0:
+        return (
+            _canonical_cost(best),
+            best,
+            {
+                "emissions": 0.0,
+                "time_neural": 0.0,
+                "time_decoder": 0.0,
+                "net_evals": 0.0,
+            },
+        )
+
     start = time.perf_counter()
-    graph = build_decoder_data(decoder, args.device)
-    output = model(graph)
-    guidance = _guidance_numpy(
-        output, graph, risk_penalty=args.feasibility_risk_penalty
-    )
-    neural_seconds = time.perf_counter() - start
-    start = time.perf_counter()
-    best = decoder.solve(args.search_iterations, **guidance)
-    decoder_seconds = time.perf_counter() - start
+    guidance = _refresh_guidance()
+    net_evals += 1
+    neural_seconds += time.perf_counter() - start
+
+    if not dynamic:
+        start = time.perf_counter()
+        best = decoder.solve(learned_iterations, **guidance)
+        decoder_seconds += time.perf_counter() - start
+    else:
+        # Dynamic heatmap: every incumbent improvement rebuilds the candidate
+        # graph (graph_version bumps) and leaves newly introduced edges with an
+        # inert default field. Drive the search one iteration at a time and
+        # re-run the net on the fresh graph whenever the incumbent moved, so the
+        # heatmap always covers the edges the next construction/refinement pass
+        # will actually consume.
+        version = decoder.graph_version
+        start = time.perf_counter()
+        best = decoder.solve(1, **guidance)
+        decoder_seconds += time.perf_counter() - start
+        for _ in range(max(learned_iterations - 1, 0)):
+            if decoder.graph_version != version:
+                start = time.perf_counter()
+                guidance = _refresh_guidance()
+                net_evals += 1
+                neural_seconds += time.perf_counter() - start
+                version = decoder.graph_version
+            start = time.perf_counter()
+            best = decoder.solve(1, **guidance)
+            decoder_seconds += time.perf_counter() - start
+
     return (
         _canonical_cost(best),
         best,
         {
-            "emissions": 1.0,
+            "emissions": float(net_evals),
             "time_neural": neural_seconds,
             "time_decoder": decoder_seconds,
+            "net_evals": float(net_evals),
         },
     )
 
@@ -1184,33 +1298,211 @@ def _gap(solution: dict, reference: float) -> float:
     return (solution["objective"] - reference) / max(abs(reference), 1e-9) * 100
 
 
+def _validation_rank(
+    metrics: dict[str, float], macro_gap: float
+) -> tuple[float, float, float]:
+    """Lower-is-better rank, led by feasibility then mean baseline gain."""
+    return (
+        1.0 - float(metrics["feasibility_rate"]),
+        -float(metrics["macro_score"]),
+        float(macro_gap),
+    )
+
+
 def validation(
     model: Optional[ConstraintFieldNet],
     dataset: list[dict],
     args: argparse.Namespace,
+    *,
+    capture_classical_baseline: bool = False,
 ) -> tuple[float, float, float, dict[str, float]]:
     collector = MetricsCollector()
     average_costs = []
     best_costs = []
     gaps = []
     split_gaps: dict[str, list[float]] = {"seen": [], "heldout": []}
+    variant_gaps: dict[str, list[float]] = {}
+    baseline_improvements = []
+    split_baseline_improvements: dict[str, list[float]] = {
+        "seen": [],
+        "heldout": [],
+    }
+    variant_baseline_improvements: dict[str, list[float]] = {}
+    split_totals: dict[str, int] = {"seen": 0, "heldout": 0}
+    split_feasible: dict[str, int] = {"seen": 0, "heldout": 0}
+    variant_totals: dict[str, int] = {}
+    variant_feasible: dict[str, int] = {}
+    variant_objectives: dict[str, list[float]] = {}
+    variant_best_costs: dict[str, list[float]] = {}
     for item in tqdm(dataset, desc="Validating", leave=False):
         average, best, metrics = infer_instance(model, item["problem"], args)
-        average_costs.append(average)
-        best_costs.append(_canonical_cost(best))
         collector.add_dict(metrics)
+        split = item["split"]
+        variant = item["variant"]
+        split_totals[split] = split_totals.get(split, 0) + 1
+        variant_totals[variant] = variant_totals.get(variant, 0) + 1
+
+        best_cost = _canonical_cost(best)
+        feasible = bool(best["feasible"]) and np.isfinite(best_cost)
+        if not feasible:
+            continue
+
+        average_costs.append(average)
+        best_costs.append(best_cost)
+        split_feasible[split] = split_feasible.get(split, 0) + 1
+        variant_feasible[variant] = variant_feasible.get(variant, 0) + 1
+        variant_objectives.setdefault(variant, []).append(
+            float(best["objective"])
+        )
+        variant_best_costs.setdefault(variant, []).append(best_cost)
+        if capture_classical_baseline:
+            item["classical_baseline"] = {
+                "objective": float(best["objective"]),
+                "direction": best["direction"],
+                "feasible": True,
+            }
+            if (
+                item.get("reference_source") == "classical"
+                and item["reference"] is None
+            ):
+                # Generated variants without an external oracle reuse the
+                # baseline-pass result instead of executing the decoder twice.
+                item["reference"] = float(best["objective"])
+        baseline = item.get("classical_baseline")
+        if baseline is not None and baseline.get("feasible", False):
+            baseline_objective = float(baseline["objective"])
+            if np.isfinite(baseline_objective):
+                improvement = -_gap(best, baseline_objective)
+                baseline_improvements.append(improvement)
+                split_baseline_improvements[split].append(improvement)
+                variant_baseline_improvements.setdefault(variant, []).append(
+                    improvement
+                )
         if item["reference"] is not None:
             gap = _gap(best, item["reference"])
             gaps.append(gap)
-            split_gaps[item["split"]].append(gap)
+            split_gaps[split].append(gap)
+            variant_gaps.setdefault(variant, []).append(gap)
     result = collector.get_all_means()
-    for split, values in split_gaps.items():
+    total = len(dataset)
+    feasible_total = len(best_costs)
+    result.update(
+        instances=float(total),
+        feasible_instances=float(feasible_total),
+        feasibility_rate=(feasible_total / total if total else 0.0),
+        gap_instances=float(len(gaps)),
+        gap_coverage=(len(gaps) / total if total else 0.0),
+    )
+    for split, split_total in split_totals.items():
+        feasible_count = split_feasible.get(split, 0)
+        result[f"{split}_instances"] = float(split_total)
+        result[f"{split}_feasible_instances"] = float(feasible_count)
+        result[f"{split}_feasibility_rate"] = (
+            feasible_count / split_total if split_total else 0.0
+        )
+        values = split_gaps[split]
+        result[f"{split}_gap_instances"] = float(len(values))
+        result[f"{split}_gap_coverage"] = (
+            len(values) / split_total if split_total else 0.0
+        )
         if values:
             result[f"{split}_gap"] = float(np.mean(values))
+        baseline_values = split_baseline_improvements[split]
+        result[f"{split}_baseline_improvement_instances"] = float(
+            len(baseline_values)
+        )
+        result[f"{split}_baseline_improvement_coverage"] = (
+            len(baseline_values) / split_total if split_total else 0.0
+        )
+        if baseline_values:
+            result[f"{split}_baseline_improvement_percent"] = float(
+                np.mean(baseline_values)
+            )
+    for variant, variant_total in variant_totals.items():
+        feasible_count = variant_feasible.get(variant, 0)
+        prefix = f"variants/{variant}"
+        result[f"{prefix}/instances"] = float(variant_total)
+        result[f"{prefix}/feasible_instances"] = float(feasible_count)
+        result[f"{prefix}/feasibility_rate"] = feasible_count / variant_total
+        if variant in variant_objectives:
+            result[f"{prefix}/objective"] = float(
+                np.mean(variant_objectives[variant])
+            )
+            result[f"{prefix}/best_cost"] = float(
+                np.mean(variant_best_costs[variant])
+            )
+        if variant in variant_gaps:
+            result[f"{prefix}/gap_instances"] = float(
+                len(variant_gaps[variant])
+            )
+            result[f"{prefix}/gap"] = float(np.mean(variant_gaps[variant]))
+        if variant in variant_baseline_improvements:
+            values = variant_baseline_improvements[variant]
+            result[f"{prefix}/baseline_improvement_instances"] = float(
+                len(values)
+            )
+            result[f"{prefix}/baseline_improvement_percent"] = float(
+                np.mean(values)
+            )
+    macro_gap = (
+        float(np.mean([np.mean(values) for values in variant_gaps.values()]))
+        if variant_gaps
+        else float("inf")
+    )
+    result["instance_weighted_gap"] = (
+        float(np.mean(gaps)) if gaps else float("inf")
+    )
+    result["macro_gap"] = macro_gap
+    result["worst_variant_gap"] = (
+        max(float(np.mean(values)) for values in variant_gaps.values())
+        if variant_gaps
+        else float("inf")
+    )
+    result["worst_variant_feasibility_rate"] = (
+        min(
+            variant_feasible.get(variant, 0) / variant_total
+            for variant, variant_total in variant_totals.items()
+        )
+        if variant_totals
+        else 0.0
+    )
+    baseline_variant_means = [
+        float(np.mean(values))
+        for values in variant_baseline_improvements.values()
+    ]
+    result["baseline_improvement_instances"] = float(
+        len(baseline_improvements)
+    )
+    result["baseline_improvement_coverage"] = (
+        len(baseline_improvements) / total if total else 0.0
+    )
+    result["instance_weighted_baseline_improvement_percent"] = (
+        float(np.mean(baseline_improvements))
+        if baseline_improvements
+        else float("-inf")
+    )
+    result["average_baseline_improvement_percent"] = result[
+        "instance_weighted_baseline_improvement_percent"
+    ]
+    result["macro_baseline_improvement_percent"] = (
+        float(np.mean(baseline_variant_means))
+        if baseline_variant_means
+        else float("-inf")
+    )
+    # Scalar checkpoint score: mean paired improvement over validation
+    # instances. Feasibility remains a separate, lexicographically prior gate.
+    result["macro_score"] = result[
+        "average_baseline_improvement_percent"
+    ]
+    result["worst_variant_baseline_improvement_percent"] = (
+        min(baseline_variant_means)
+        if baseline_variant_means
+        else float("-inf")
+    )
     return (
-        float(np.mean(average_costs)),
-        float(np.mean(best_costs)),
-        float(np.mean(gaps)) if gaps else 0.0,
+        float(np.mean(average_costs)) if average_costs else float("inf"),
+        float(np.mean(best_costs)) if best_costs else float("inf"),
+        macro_gap,
         result,
     )
 
@@ -1220,7 +1512,7 @@ def build_validation_data(
 ) -> list[dict]:
     if args.val_size < 1:
         raise ValueError("val_size must be at least one instance per problem")
-    saved = SavedURS(args.n_node)
+    saved = SavedProblems(args.n_node, getattr(args, "dataset_dir", None) or None)
     seen = curriculum.variants[: args.val_seen]
     heldout = curriculum.held_out[: args.val_heldout]
     dataset = []
@@ -1235,6 +1527,13 @@ def build_validation_data(
                         f"skipping validation variant {variant} [{index}]: {exc}"
                     )
                     continue
+                reference_source = "saved" if reference is not None else "none"
+                if variant == "vrptw" and reference is None:
+                    # Capacity-free VRPTW is generated deterministically because
+                    # the legacy benchmark set has no TW-only multi-route task.
+                    # Anchor its validation gap to the same-budget non-neural
+                    # decoder captured by the baseline pass.
+                    reference_source = "classical"
                 dataset.append(
                     {
                         "variant": variant,
@@ -1242,6 +1541,7 @@ def build_validation_data(
                         "split": split,
                         "problem": problem,
                         "reference": reference,
+                        "reference_source": reference_source,
                     }
                 )
     return dataset
@@ -1254,16 +1554,74 @@ def save_checkpoint(
     args: argparse.Namespace,
     path: Path,
     val_gap: Optional[float] = None,
+    *,
+    validation_rank: Optional[tuple[float, ...]] = None,
+    best_validation_rank: Optional[tuple[float, ...]] = None,
+    global_step: int = 0,
+    curriculum: Optional[VariantCurriculum] = None,
 ) -> None:
     payload = {
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "epoch": epoch,
         "config": vars(args),
+        "global_step": int(global_step),
+        "python_rng_state": random.getstate(),
+        "numpy_rng_state": np.random.get_state(),
+        "torch_rng_state": torch.get_rng_state(),
     }
+    if torch.cuda.is_available():
+        payload["cuda_rng_state"] = torch.cuda.get_rng_state_all()
+    if curriculum is not None:
+        payload["curriculum_rng_state"] = curriculum.rng.getstate()
     if val_gap is not None:
         payload["val_gap"] = val_gap
+    if validation_rank is not None:
+        payload["validation_rank"] = tuple(validation_rank)
+    if best_validation_rank is not None:
+        payload["best_validation_rank"] = tuple(best_validation_rank)
+        payload["checkpoint_rank_metric"] = "macro_score"
     torch.save(payload, path)
+
+
+def restore_training_state(
+    checkpoint: dict, curriculum: VariantCurriculum
+) -> None:
+    """Restore stochastic streams so resume matches uninterrupted training."""
+    if "python_rng_state" in checkpoint:
+        random.setstate(checkpoint["python_rng_state"])
+    if "numpy_rng_state" in checkpoint:
+        np.random.set_state(checkpoint["numpy_rng_state"])
+    if "torch_rng_state" in checkpoint:
+        torch.set_rng_state(checkpoint["torch_rng_state"].cpu())
+    if torch.cuda.is_available() and "cuda_rng_state" in checkpoint:
+        torch.cuda.set_rng_state_all(checkpoint["cuda_rng_state"])
+    if "curriculum_rng_state" in checkpoint:
+        curriculum.rng.setstate(checkpoint["curriculum_rng_state"])
+
+
+def load_model_checkpoint_state(
+    model: ConstraintFieldNet, state_dict: dict[str, torch.Tensor]
+) -> None:
+    """Load checkpoints written before stateless graph BatchNorm.
+
+    Only obsolete running-statistic buffers may be discarded; parameter or
+    architecture mismatches remain hard errors.
+    """
+    filtered = {
+        name: value
+        for name, value in state_dict.items()
+        if not name.endswith(
+            ("running_mean", "running_var", "num_batches_tracked")
+        )
+    }
+    incompatible = model.load_state_dict(filtered, strict=False)
+    if incompatible.missing_keys or incompatible.unexpected_keys:
+        raise RuntimeError(
+            "checkpoint architecture mismatch: "
+            f"missing={incompatible.missing_keys}, "
+            f"unexpected={incompatible.unexpected_keys}"
+        )
 
 
 def parse_args() -> argparse.Namespace:
@@ -1284,6 +1642,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--steps-per-epoch", type=int, default=32)
     parser.add_argument("--grad-accum-variants", type=int, default=4)
     parser.add_argument("--search-iterations", type=int, default=16)
+    parser.add_argument(
+        "--srr-candidate-limit",
+        type=int,
+        default=0,
+        help=(
+            "Cap on customer candidates SRR screens per anchor, in learned rank "
+            "order (0 = screen all). Small values (e.g. 16-32) trade a little "
+            "quality for a large, N-scaling speedup by trusting the field's "
+            "ranking to propose the best moves."
+        ),
+    )
+    parser.add_argument(
+        "--static-field",
+        action="store_true",
+        help=(
+            "Disable dynamic heatmap recomputation at inference; keep the "
+            "single-shot field for the whole search budget."
+        ),
+    )
     parser.add_argument("--option-max-steps", type=int, default=4)
     parser.add_argument("--improvement-epsilon", type=float, default=0.0)
     parser.add_argument("--smdp-gamma", type=float, default=0.99)
@@ -1298,7 +1675,15 @@ def parse_args() -> argparse.Namespace:
             "rare infeasible ants cannot dominate the pooled scale; 0 disables"
         ),
     )
-    parser.add_argument("--pretrain-epochs", type=int, default=3)
+    parser.add_argument(
+        "--pretrain-epochs",
+        type=int,
+        default=0,
+        help=(
+            "Auxiliary-only warm-up epochs before learned guidance and RL are "
+            "enabled (default: 0, disabled)."
+        ),
+    )
     parser.add_argument("--pretrain-lr", type=float, default=1e-4)
     parser.add_argument("--rl-weight", type=float, default=1.0)
     parser.add_argument(
@@ -1366,8 +1751,22 @@ def parse_args() -> argparse.Namespace:
         default="cuda:0" if torch.cuda.is_available() else "cpu",
     )
     parser.add_argument("--threads", type=int, default=None)
+    parser.add_argument(
+        "--dataset-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Benchmark dataset root. Defaults to PRISM_DATASET_DIR, then the "
+            "currently bundled benchmark artifact."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=1234)
-    parser.add_argument("--val-seen", type=int, default=8)
+    parser.add_argument(
+        "--val-seen",
+        type=int,
+        default=None,
+        help="Number of training variants to validate (default: all)",
+    )
     parser.add_argument("--val-heldout", type=int, default=16)
     parser.add_argument("--skip-validation", action="store_true")
     parser.add_argument("--save-dir", type=Path, default=Path("pretrained"))
@@ -1412,26 +1811,53 @@ def main() -> None:
             config=vars(args),
         )
 
-    curriculum = VariantCurriculum.urs_seen(args.seed)
+    curriculum = VariantCurriculum.default(args.seed)
     model = ConstraintFieldNet(
         grad_checkpointing=args.grad_checkpointing
     ).to(args.device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
     start_epoch = 0
+    global_step = 0
+    best_validation_rank = (float("inf"),) * 3
     if args.resume:
         checkpoint = torch.load(
             args.resume, map_location=args.device, weights_only=False
         )
-        model.load_state_dict(checkpoint["model_state_dict"])
+        load_model_checkpoint_state(model, checkpoint["model_state_dict"])
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         start_epoch = int(checkpoint["epoch"]) + 1
+        global_step = int(
+            checkpoint.get("global_step", start_epoch * args.steps_per_epoch)
+        )
+        stored_rank = checkpoint.get("best_validation_rank")
+        if (
+            checkpoint.get("checkpoint_rank_metric")
+            in {"average_baseline_improvement_percent", "macro_score"}
+            and stored_rank is not None
+            and len(stored_rank) == 3
+        ):
+            best_validation_rank = tuple(
+                float(value) for value in stored_rank
+            )
+        restore_training_state(checkpoint, curriculum)
 
     args.save_dir.mkdir(parents=True, exist_ok=True)
     validation_data = (
         [] if args.skip_validation else build_validation_data(args, curriculum)
     )
-    best_gap = float("inf")
-    global_step = 0
+    if validation_data:
+        (
+            _baseline_average,
+            _baseline_best,
+            baseline_gap,
+            _baseline_metrics,
+        ) = validation(
+            None,
+            validation_data,
+            args,
+            capture_classical_baseline=True,
+        )
+        logger.log_baseline(baseline_gap)
     for epoch in range(start_epoch, args.epochs):
         phase_lr = args.pretrain_lr if epoch < args.pretrain_epochs else args.lr
         for group in optimizer.param_groups:
@@ -1445,8 +1871,9 @@ def main() -> None:
             epoch_timing,
         ) = train_epoch(model, optimizer, global_step, epoch, args, curriculum)
         val_best = 0.0
-        val_gap = 0.0
+        val_gap = None
         val_metrics = {}
+        validation_rank = None
         if validation_data:
             val_average, val_best, val_gap, val_metrics = validation(
                 model, validation_data, args
@@ -1460,12 +1887,28 @@ def main() -> None:
                 timing=epoch_timing,
                 step=global_step,
             )
-            if val_gap < best_gap:
-                best_gap = val_gap
+            validation_rank = _validation_rank(val_metrics, val_gap)
+            if validation_rank < best_validation_rank:
+                best_validation_rank = validation_rank
                 save_checkpoint(
-                    model, optimizer, epoch, args, args.save_dir / "best.pt", val_gap
+                    model,
+                    optimizer,
+                    epoch,
+                    args,
+                    args.save_dir / "best.pt",
+                    val_gap,
+                    validation_rank=validation_rank,
+                    best_validation_rank=best_validation_rank,
+                    global_step=global_step,
+                    curriculum=curriculum,
                 )
-        logger.log_epoch_summary(epoch, train_cost, val_best, val_gap)
+        logger.log_epoch_summary(
+            epoch,
+            train_cost,
+            val_best,
+            val_gap,
+            val_metrics.get("feasibility_rate") if validation_data else None,
+        )
         epoch_timing["epoch_seconds"] = epoch_time
         if args.profile_timing:
             logger.info(
@@ -1477,7 +1920,16 @@ def main() -> None:
             )
         logger.log_metrics(epoch_timing, prefix="time/", step=global_step)
         save_checkpoint(
-            model, optimizer, epoch, args, args.save_dir / "last.pt", val_gap
+            model,
+            optimizer,
+            epoch,
+            args,
+            args.save_dir / "last.pt",
+            val_gap,
+            validation_rank=validation_rank,
+            best_validation_rank=best_validation_rank,
+            global_step=global_step,
+            curriculum=curriculum,
         )
         gc.collect()
         if torch.cuda.is_available():

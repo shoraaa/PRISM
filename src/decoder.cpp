@@ -407,6 +407,9 @@ void SearchConfig::validate() const {
     throw std::invalid_argument(
         "feasibility_lookahead_depth must be in [0, 4]");
   }
+  if (srr_candidate_limit < 0) {
+    throw std::invalid_argument("srr_candidate_limit must be non-negative");
+  }
 }
 
 const char *objective_name(Objective objective) {
@@ -472,7 +475,8 @@ std::vector<std::string> node_feature_names() {
           "backward_load",
           "backward_time",
           "backward_slack",
-          "backward_open_pickups"};
+          "backward_open_pickups",
+          "is_open_route"};
 }
 
 std::vector<std::string> field_channel_names() {
@@ -502,6 +506,15 @@ RoutingDecoder::RoutingDecoder(Problem problem, CandidateConfig candidate_config
   }
   if (!(p_best_ > 0.0f && p_best_ < 1.0f)) {
     throw std::invalid_argument("p_best must be in (0, 1)");
+  }
+  static constexpr std::array<Constraint, FIELD_CHANNEL_COUNT> kChannelConstraint{
+      CAPACITY,       TIME_WINDOWS,    ROUTE_LIMIT, TOUR_LIMIT,
+      BACKHAUL_ORDER, PICKUP_DELIVERY, PRIZE_QUOTA};
+  for (int32_t channel = 0; channel < FIELD_CHANNEL_COUNT; ++channel) {
+    if (problem_.has(kChannelConstraint[channel])) {
+      channel_active_[channel] = 1;
+      active_channels_.push_back(channel);
+    }
   }
   for (float value : problem_.distance) {
     if (std::isfinite(value))
@@ -677,23 +690,8 @@ float RoutingDecoder::classical_proximity(int32_t from, int32_t to) const {
 }
 
 bool RoutingDecoder::field_channel_active(int32_t channel) const {
-  switch (static_cast<FieldChannel>(channel)) {
-  case FieldChannel::CAPACITY:
-    return problem_.has(CAPACITY);
-  case FieldChannel::TIME_WINDOW:
-    return problem_.has(TIME_WINDOWS);
-  case FieldChannel::ROUTE_LIMIT:
-    return problem_.has(ROUTE_LIMIT);
-  case FieldChannel::TOUR_LIMIT:
-    return problem_.has(TOUR_LIMIT);
-  case FieldChannel::BACKHAUL_ORDER:
-    return problem_.has(BACKHAUL_ORDER);
-  case FieldChannel::PICKUP_DELIVERY:
-    return problem_.has(PICKUP_DELIVERY);
-  case FieldChannel::PRIZE_QUOTA:
-    return problem_.has(PRIZE_QUOTA);
-  }
-  return false;
+  return channel >= 0 && channel < FIELD_CHANNEL_COUNT &&
+         channel_active_[channel] != 0;
 }
 
 float RoutingDecoder::objective_edge_cost(int32_t from, int32_t to) const {
@@ -1472,6 +1470,11 @@ void RoutingDecoder::build_model_features() {
     features[9] = unit(problem_.service_time[node] / time_scale_);
     features[10] = problem_.delivery_of_pickup[node] >= 0 ? 1.0f : 0.0f;
     features[11] = problem_.pickup_of_delivery[node] >= 0 ? 1.0f : 0.0f;
+    // Global open-route indicator, broadcast to every node. The incumbent scan
+    // below only writes features[12..23], so this survives. Without it the model
+    // cannot distinguish an open-route instance from an otherwise identical
+    // closed one, and cannot learn that the depot-return leg is free.
+    features[24] = problem_.open_route ? 1.0f : 0.0f;
   }
 
   double cumulative_prize = 0.0;
@@ -2302,8 +2305,28 @@ Solution RoutingDecoder::scope_restricted_refine(
     return solution;
   }
 
-  const auto position_of = [](const std::vector<int32_t> &route,
-                              int32_t node) -> int32_t {
+  // Absolute position of every node inside solution.route, kept in sync with
+  // solution so position lookups on the incumbent are O(1) instead of a linear
+  // std::find.  Move generators are invoked K x moves times per anchor, each
+  // scanning solution.route several times, so this scan dominated SRR runtime.
+  std::vector<int32_t> route_position(problem_.node_count, -1);
+  const auto sync_route_position = [&]() {
+    std::fill(route_position.begin(), route_position.end(), -1);
+    for (int32_t index = 0;
+         index < static_cast<int32_t>(solution.route.size()); ++index) {
+      const int32_t node = solution.route[index];
+      if (node >= 0 && node < problem_.node_count)
+        route_position[node] = index;
+    }
+  };
+  const auto position_of = [&](const std::vector<int32_t> &route,
+                               int32_t node) -> int32_t {
+    // Fast path: callers pass solution.route by reference into the move
+    // generators, so an address match means the maintained index is valid.
+    // Trial routes built during a move are distinct objects and fall through.
+    if (&route == &solution.route)
+      return (node >= 0 && node < problem_.node_count) ? route_position[node]
+                                                       : -1;
     const auto found = std::find(route.begin(), route.end(), node);
     return found == route.end() ? -1
                                 : static_cast<int32_t>(found - route.begin());
@@ -2571,30 +2594,31 @@ Solution RoutingDecoder::scope_restricted_refine(
     int32_t first = -1;
     int32_t last = -1;
   };
-  const auto add_guidance = [](GuidanceValue lhs, const GuidanceValue &rhs) {
+  // Inactive channels stay zero for the whole refinement (edge_guidance only
+  // ever writes active channels), so every guidance loop below iterates the
+  // precomputed active-channel list instead of all FIELD_CHANNEL_COUNT slots.
+  const auto add_guidance = [&](GuidanceValue lhs, const GuidanceValue &rhs) {
     lhs.objective += rhs.objective;
     lhs.feasibility_risk += rhs.feasibility_risk;
-    for (int32_t channel = 0; channel < FIELD_CHANNEL_COUNT; ++channel)
+    for (int32_t channel : active_channels_)
       lhs.resource[channel] += rhs.resource[channel];
     return lhs;
   };
-  const auto subtract_guidance = [](GuidanceValue lhs,
-                                    const GuidanceValue &rhs) {
+  const auto subtract_guidance = [&](GuidanceValue lhs,
+                                     const GuidanceValue &rhs) {
     lhs.objective -= rhs.objective;
     lhs.feasibility_risk -= rhs.feasibility_risk;
-    for (int32_t channel = 0; channel < FIELD_CHANNEL_COUNT; ++channel)
+    for (int32_t channel : active_channels_)
       lhs.resource[channel] -= rhs.resource[channel];
     return lhs;
   };
-  const auto edge_guidance = [&](int32_t from, int32_t to) {
+  const auto compute_edge_guidance = [&](int32_t from, int32_t to,
+                                         int32_t edge) {
     GuidanceValue value;
     value.objective = objective_edge_cost(from, to);
-    const int32_t edge = find_edge(from, to);
     value.feasibility_risk =
         edge >= 0 && edge_risk != nullptr ? edge_risk[edge] : 0.0;
-    for (int32_t channel = 0; channel < FIELD_CHANNEL_COUNT; ++channel) {
-      if (!field_channel_active(channel))
-        continue;
+    for (int32_t channel : active_channels_) {
       const double residual =
           edge >= 0 && edge_field != nullptr
               ? edge_field[static_cast<size_t>(edge) * FIELD_CHANNEL_COUNT +
@@ -2617,16 +2641,32 @@ Solution RoutingDecoder::scope_restricted_refine(
     }
     return value;
   };
+  // Guidance for a graph edge is fixed for the whole refinement (edge_field,
+  // edge_additive, edge_risk and resource_pressure_ do not change here), yet the
+  // same edges are re-scored on every candidate move.  Memoize graph-edge
+  // guidance lazily so each edge pays the per-channel computation once.  The
+  // cache is a local (SRR runs in parallel across ants, so member state would
+  // race) and lazily filled so scope-restricted passes never touch every edge.
+  std::vector<GuidanceValue> edge_guidance_cache(edge_count());
+  std::vector<uint8_t> edge_guidance_ready(edge_count(), 0);
+  const auto edge_guidance = [&](int32_t from, int32_t to) -> GuidanceValue {
+    const int32_t edge = find_edge(from, to);
+    if (edge < 0)
+      return compute_edge_guidance(from, to, -1);
+    if (!edge_guidance_ready[edge]) {
+      edge_guidance_cache[edge] = compute_edge_guidance(from, to, edge);
+      edge_guidance_ready[edge] = 1;
+    }
+    return edge_guidance_cache[edge];
+  };
   const auto guidance_energy = [&](const GuidanceValue &value,
                                    const float *live_state) {
     double result = value.objective;
     result += risk_penalty * value.feasibility_risk;
-    for (int32_t channel = 0; channel < FIELD_CHANNEL_COUNT; ++channel) {
-      if (field_channel_active(channel)) {
-        result += coupled_multiplier(channel, multipliers, coupler_weights,
-                                     coupler_bias, live_state) *
-                  value.resource[channel];
-      }
+    for (int32_t channel : active_channels_) {
+      result += coupled_multiplier(channel, multipliers, coupler_weights,
+                                   coupler_bias, live_state) *
+                value.resource[channel];
     }
     return result;
   };
@@ -3940,6 +3980,7 @@ Solution RoutingDecoder::scope_restricted_refine(
   int32_t incremental_rebuilds = 0;
   int32_t full_rebuilds = 0;
   int64_t rebuilt_nodes = 0;
+  sync_route_position();
   while (!checklist.empty()) {
     const int32_t anchor = checklist.front();
     checklist.pop_front();
@@ -3958,6 +3999,16 @@ Solution RoutingDecoder::scope_restricted_refine(
     double best_guided_energy = std::numeric_limits<double>::infinity();
     const auto consider = [&](const std::vector<int32_t> &trial,
                               StructuralMove structural) {
+      // Splitting a route by inserting a depot preserves the visited set (so
+      // prize and missed-penalty are unchanged) and, on a closed route, can only
+      // add distance: dist(a,depot)+dist(depot,b) >= dist(a,b) by the triangle
+      // inequality. Such a move is therefore never strictly better than the
+      // current feasible incumbent, so its O(route) evaluate is pure waste. Skip
+      // it for closed routes; open routes keep the free return leg, where the
+      // bound does not hold, so they are left untouched.
+      if (structural.kind == StructuralMoveKind::SPLIT_ROUTE &&
+          !problem_.open_route)
+        return;
       ++full_evaluations;
       const Solution candidate = evaluate(trial);
       record_screening(candidate);
@@ -4542,11 +4593,11 @@ Solution RoutingDecoder::scope_restricted_refine(
       const auto find_anchor_position = [&]() {
         if (anchor_position >= 0)
           return anchor_position;
-        const auto found =
-            std::find(solution.route.begin(), solution.route.end(), anchor);
-        if (found != solution.route.end())
-          anchor_position =
-              static_cast<int32_t>(found - solution.route.begin());
+        // route_position mirrors solution.route (kept in sync on every accepted
+        // move), so this is O(1) instead of an O(route) std::find per anchor.
+        anchor_position = anchor >= 0 && anchor < problem_.node_count
+                              ? route_position[anchor]
+                              : -1;
         return anchor_position;
       };
       if (problem_.multi_route) {
@@ -4558,8 +4609,40 @@ Solution RoutingDecoder::scope_restricted_refine(
             cached_routes[route_slot].sequence.nodes.size());
         const int32_t previous_slot = cached_routes[route_slot].previous;
         const int32_t next_slot = cached_routes[route_slot].next;
+        // A merge concatenates two capacity/time-bounded routes into one, which
+        // almost always violates a resource limit.  The composed summary lets us
+        // reject those in O(1) using exactly the feasibility checks consider_plans
+        // trusts, skipping the O(route) evaluate for the common infeasible case.
+        // Only certain infeasibility is used to skip, so accepted moves are
+        // unchanged; feasible merges still take the authoritative path.
+        const auto merge_infeasible = [&](int32_t depot,
+                                          const SequenceSummary &seq) {
+          if (seq.empty)
+            return true;
+          if (problem_.has(BACKHAUL_ORDER) && seq.backhaul_violation)
+            return true;
+          if (problem_.has(ROUTE_LIMIT) &&
+              route_distance(depot, seq) > problem_.route_limit + FEASIBILITY_EPS)
+            return true;
+          if (problem_.has(TOUR_LIMIT) &&
+              route_distance(depot, seq, true) >
+                  problem_.tour_limit + FEASIBILITY_EPS)
+            return true;
+          if (depot >= 0 && !time_feasible(depot, seq))
+            return true;
+          if (problem_.has(CAPACITY) && !seq.has_backhaul &&
+              (problem_.capacity + seq.min_load_delta < -FEASIBILITY_EPS ||
+               problem_.capacity + seq.max_load_delta >
+                   problem_.capacity + FEASIBILITY_EPS))
+            return true;
+          return false;
+        };
         if (route_local == 0 && previous_slot >= 0 &&
-            find_anchor_position() > 1) {
+            find_anchor_position() > 1 &&
+            !merge_infeasible(
+                cached_routes[previous_slot].depot,
+                concatenate(problem_, cached_routes[previous_slot].summary,
+                            cached_routes[route_slot].summary))) {
           std::vector<int32_t> trial = solution.route;
           trial.erase(trial.begin() + anchor_position - 1);
           consider(trial,
@@ -4569,7 +4652,11 @@ Solution RoutingDecoder::scope_restricted_refine(
         if (route_local + 1 == route_size &&
             next_slot >= 0 &&
             find_anchor_position() >= 0 &&
-            anchor_position + 2 < static_cast<int32_t>(solution.route.size())) {
+            anchor_position + 2 < static_cast<int32_t>(solution.route.size()) &&
+            !merge_infeasible(
+                cached_routes[route_slot].depot,
+                concatenate(problem_, cached_routes[route_slot].summary,
+                            cached_routes[next_slot].summary))) {
           std::vector<int32_t> trial = solution.route;
           trial.erase(trial.begin() + anchor_position + 1);
           consider(trial,
@@ -4617,6 +4704,13 @@ Solution RoutingDecoder::scope_restricted_refine(
           continue;
         }
         ++candidate_rank;
+        // Learned candidate pruning: ranked_local_edges is ordered by the guided
+        // edge energy, so the first candidates are the net's most promising
+        // moves. Screening only the top few replaces the exhaustive K x moves
+        // sweep with a lightweight learned proposal step.
+        if (search_config_.srr_candidate_limit > 0 &&
+            candidate_rank > search_config_.srr_candidate_limit)
+          break;
 
         const bool candidate_served = node_route[candidate_node] >= 0;
         if (!candidate_served) {
@@ -4683,6 +4777,7 @@ Solution RoutingDecoder::scope_restricted_refine(
         ++full_rebuilds;
         rebuilt_nodes += static_cast<int64_t>(solution.route.size());
       }
+      sync_route_position();
       if (trace != nullptr &&
           trace->screened_edges.size() < MAX_SCREENING_LABELS) {
         current_resource = best_plan.resources.has_value()

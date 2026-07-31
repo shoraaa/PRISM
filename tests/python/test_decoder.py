@@ -8,7 +8,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
 import prism_decoder  # noqa: E402
-from urs_data import generated_problem  # noqa: E402
+from problem_data import generated_problem  # noqa: E402
 
 
 def euclidean_problem(size: int, seed: int) -> tuple[np.ndarray, np.ndarray]:
@@ -447,7 +447,10 @@ def test_lookahead_risk_labels_and_avoids_time_window_dead_end() -> None:
         dtype=np.float32,
     )
     problem = {
-        "name": "tsptw",
+        "name": "time_window_tour",
+        "constraints": ["visit_all", "time_windows"],
+        "depot_count": 1,
+        "multi_route": False,
         "distance": distance,
         "tw_start": np.zeros(3, dtype=np.float32),
         "tw_end": np.array([100.0, 5.0, 5.0], dtype=np.float32),
