@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import pickle
 from pathlib import Path
 
 import numpy as np
+import pytest
 import torch
 
 import problem_data
@@ -13,6 +15,7 @@ from problem_data import (
     DatasetFinder,
     SavedProblems,
     generated_problem,
+    load_saved_data,
 )
 
 
@@ -72,6 +75,40 @@ def test_saved_problems_loads_without_baseline_source(tmp_path: Path) -> None:
     assert reference == 5.0
     assert np.array_equal(problem["coordinates"], xy[1].numpy())
     assert problem["name"] == "tsp"
+
+
+def test_pickle_reference_uses_count_relative_to_nonzero_start(
+    tmp_path: Path,
+) -> None:
+    data_path = tmp_path / "cvrp2.pkl"
+    solution_path = tmp_path / "cvrp2_hgs.pkl"
+    rows = [
+        ([0.0, 0.0], [[0.1, 0.1], [0.2, 0.2]], [1, 2], 10),
+        ([0.0, 0.0], [[0.3, 0.3], [0.4, 0.4]], [2, 1], 10),
+        ([0.0, 0.0], [[0.5, 0.5], [0.6, 0.6]], [1, 1], 10),
+    ]
+    with data_path.open("wb") as target:
+        pickle.dump(rows, target)
+    with solution_path.open("wb") as target:
+        pickle.dump([(11.0, []), (22.0, [])], target)
+
+    _, reference = load_saved_data(
+        data_path,
+        "cvrp",
+        1,
+        start=1,
+        solution_path=solution_path,
+    )
+
+    assert reference == 22.0
+    with pytest.raises(ValueError, match="requested 1 references"):
+        load_saved_data(
+            data_path,
+            "cvrp",
+            1,
+            start=2,
+            solution_path=solution_path,
+        )
 
 
 def test_owned_generators_cover_the_existing_training_curriculum() -> None:

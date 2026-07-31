@@ -444,17 +444,32 @@ def _reference(
         # reported as the full saved-set mean.
         if name in {"aop", "apctsp", "aspctsp"}:
             values = values[start : start + count]
-        return float(values.float().mean())
+            if values.numel() != count:
+                raise ValueError(
+                    f"requested {count} references from index {start}, "
+                    f"but {solution_path} contains only {values.numel()}"
+                )
+        reference = float(values.float().mean())
+        if not np.isfinite(reference):
+            raise ValueError(f"non-finite reference in {solution_path}")
+        return reference
     if solution_path.suffix == ".pkl":
         with solution_path.open("rb") as source:
             saved = pickle.load(source)
-        # The legacy CVRP-family loader used total_episodes as the stop index,
-        # while TSP/PDTSP used a count relative to start. Keep that behavior so
-        # this source decoupling does not also change validation semantics.
-        stop = start + count if name in {"tsp", "pdtsp"} else count
-        values = saved[start:stop]
-        costs = [value[0] if isinstance(value, (tuple, list)) else value for value in values]
-        return float(torch.tensor(costs, dtype=torch.float32).mean())
+        values = saved[start : start + count]
+        if len(values) != count:
+            raise ValueError(
+                f"requested {count} references from index {start}, "
+                f"but {solution_path} contains only {len(values)}"
+            )
+        costs = [
+            value[0] if isinstance(value, (tuple, list)) else value
+            for value in values
+        ]
+        reference = float(torch.tensor(costs, dtype=torch.float32).mean())
+        if not np.isfinite(reference):
+            raise ValueError(f"non-finite reference in {solution_path}")
+        return reference
     raise ValueError(f"unsupported reference file: {solution_path}")
 
 
@@ -637,7 +652,10 @@ def load_saved_data(
     )
     if reference is None and embedded is None:
         reference = _default_reference(name)
-    return data, reference if reference is not None else embedded
+    selected_reference = reference if reference is not None else embedded
+    if selected_reference is not None and not np.isfinite(selected_reference):
+        raise ValueError(f"non-finite embedded reference in {path}")
+    return data, selected_reference
 
 
 class SavedProblems:
