@@ -35,6 +35,11 @@ def build_decoder_data(decoder, device="cpu"):
         dtype=torch.float32,
         device=device,
     ).view(1, FIELD_CHANNEL_COUNT)
+    open_route = torch.tensor(
+        [[float(bool(decoder.metadata["open_route"]))]],
+        dtype=torch.float32,
+        device=device,
+    )
     raw_resource_pressure = torch.as_tensor(
         decoder.resource_pressure, dtype=torch.float32, device=device
     )
@@ -73,6 +78,7 @@ def build_decoder_data(decoder, device="cpu"):
         edge_index=edge_index,
         edge_attr=edge_attr,
         active_channels=active_channels,
+        open_route=open_route,
         raw_resource_pressure=raw_resource_pressure,
         objective_edge_costs=objective_edge_costs,
         resource_scales=resource_scales,
@@ -194,7 +200,8 @@ class ConstraintFieldNet(nn.Module):
             agg_fn=agg_fn,
             grad_checkpointing=grad_checkpointing,
         )
-        descriptor_size = FIELD_CHANNEL_COUNT + 3
+        # resource-type one-hot + active flag + mean/max pressure + open_route
+        descriptor_size = FIELD_CHANNEL_COUNT + 4
         self.resource_encoder = nn.Sequential(
             nn.Linear(descriptor_size, units),
             nn.SiLU(),
@@ -292,6 +299,19 @@ class ConstraintFieldNet(nn.Module):
         if active.shape[0] != graph_embedding.shape[0]:
             raise ValueError("active_channels must have one row per graph")
 
+        open_route = getattr(pyg, "open_route", None)
+        if open_route is None:
+            open_route = active.new_zeros(graph_embedding.shape[0], 1)
+        else:
+            open_route = open_route.to(active.dtype)
+            if open_route.ndim == 1:
+                open_route = open_route.unsqueeze(-1)
+            if open_route.shape[0] == 1 and graph_embedding.shape[0] != 1:
+                open_route = open_route.expand(graph_embedding.shape[0], -1)
+            if open_route.shape != (graph_embedding.shape[0], 1):
+                raise ValueError("open_route must have one scalar per graph")
+        _require_unit_interval("open_route", open_route)
+
         normalized_resources = pyg.edge_attr[:, 1 : 1 + FIELD_CHANNEL_COUNT]
         if batched:
             resource_mean = gnn.global_mean_pool(
@@ -306,12 +326,16 @@ class ConstraintFieldNet(nn.Module):
         resource_type = self.resource_types.unsqueeze(0).expand(
             graph_embedding.shape[0], -1, -1
         )
+        open_route_column = open_route.unsqueeze(1).expand(
+            -1, FIELD_CHANNEL_COUNT, -1
+        )
         descriptor = torch.cat(
             (
                 resource_type,
                 active.unsqueeze(-1),
                 resource_mean.unsqueeze(-1),
                 resource_max.unsqueeze(-1),
+                open_route_column,
             ),
             dim=-1,
         )

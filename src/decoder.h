@@ -12,7 +12,7 @@ namespace prism {
 static constexpr int32_t FIELD_CHANNEL_COUNT = 7;
 static constexpr int32_t LIVE_STATE_FEATURE_COUNT = FIELD_CHANNEL_COUNT;
 static constexpr int32_t NODE_FEATURE_COUNT = 24;
-static constexpr int32_t EDGE_FEATURE_COUNT = 10;
+static constexpr int32_t EDGE_FEATURE_COUNT = 11;
 
 enum class FieldChannel : uint8_t {
   CAPACITY = 0,

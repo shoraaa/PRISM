@@ -445,7 +445,7 @@ std::vector<std::string> candidate_feature_names() {
   return {"distance",          "capacity",       "time_window",
           "route_limit",       "tour_limit",     "backhaul_order",
           "pickup_delivery",   "prize_quota",    "incumbent_forward",
-          "incumbent_backward"};
+          "incumbent_backward", "open_return"};
 }
 
 std::vector<std::string> node_feature_names() {
@@ -1629,6 +1629,16 @@ void RoutingDecoder::build_model_features() {
       std::copy_n(resources, FIELD_CHANNEL_COUNT, features + 1);
       features[8] = incumbent_edges[edge] ? 1.0f : 0.0f;
       features[9] = reverse_incumbent_edges[edge] ? 1.0f : 0.0f;
+      // Structural openness lever: on an open route the arrival-at-depot leg is
+      // genuinely free in the true objective, yet objective_edge_cost still
+      // charges its travel (to avoid greedy fragmenting the route into one
+      // customer per trip). Expose exactly that waived return distance on the
+      // depot-incident edges so the field can learn to discount them. This is
+      // problem-geometric (independent of any incumbent) and stays zero for
+      // closed routes, where the return leg is legitimately charged.
+      features[10] = problem_.open_route && to < problem_.depot_count
+                         ? features[0]
+                         : 0.0f;
     }
   }
 }
