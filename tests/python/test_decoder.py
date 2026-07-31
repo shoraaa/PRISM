@@ -69,6 +69,20 @@ def test_cvrp_uses_same_perturbation_backend() -> None:
     assert refined["srr_moves"] > 0
 
 
+def test_capacity_free_vrptw_uses_closed_multi_route_semantics() -> None:
+    problem = generated_problem("vrptw", 20)
+    solver = prism_decoder.Decoder(problem, n_ants=2)
+    solver.seed(20260731)
+
+    solution = solver.solve(2)
+
+    assert solver.metadata["constraints"] == ["visit_all", "time_windows"]
+    assert solver.metadata["multi_route"] is True
+    assert solver.metadata["open_route"] is False
+    assert solution["feasible"]
+    assert solver.evaluate(solution["route"])["feasible"]
+
+
 def test_search_configuration_is_exposed() -> None:
     coordinates, distance = euclidean_problem(20, 10)
     solver = prism_decoder.Decoder(

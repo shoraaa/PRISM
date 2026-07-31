@@ -77,11 +77,15 @@ BENCHMARK_VARIANTS = _sort_variants(
 )
 assert len(BENCHMARK_VARIANTS) == 110
 
+# VRPTW activates only the time-window resource while allowing depot-separated
+# routes. CVRPTW and OCVRPTW then teach capacity/TW and open-route/TW
+# interactions in later curriculum phases.
 TRAIN_VARIANTS = _sort_variants(
     (
         "atsp",
         "acvrp",
         "tsp",
+        "vrptw",
         "op",
         "pctsp",
         "cvrp",
@@ -92,7 +96,7 @@ TRAIN_VARIANTS = _sort_variants(
         "pdtsp",
     )
 )
-ALL_VARIANTS = list(BENCHMARK_VARIANTS)
+ALL_VARIANTS = _sort_variants(BENCHMARK_VARIANTS + ["vrptw"])
 
 
 def problem_variants(
@@ -132,7 +136,7 @@ def problem_schema(name: str) -> dict:
     is_pctsp = "pctsp" in name
     is_op = name in {"op", "aop"}
     has_capacity = "cvrp" in name
-    is_vrp = has_capacity
+    is_vrp = has_capacity or name == "vrptw"
     constraints = []
     if not is_pctsp and not is_op:
         constraints.append("visit_all")
@@ -228,6 +232,37 @@ def _metric_distance(node_count: int) -> torch.Tensor:
     return values.float() / 1_000_000
 
 
+def _generated_vrptw(size: int) -> dict:
+    """Generate capacity-free VRPTW with individually serviceable customers."""
+    if size < 1:
+        raise ValueError("vrptw requires at least one customer")
+    node_count = size + 1
+    xy = torch.rand(1, node_count, 2)
+    travel = torch.linalg.vector_norm(xy[:, 1:] - xy[:, :1], dim=-1)
+    service = torch.full((1, size), 0.2)
+    # 3.2 exceeds the worst unit-square out-and-back distance plus service.
+    # Every customer can therefore be served alone, while sampled windows still
+    # determine which customers can profitably share a route.
+    horizon = 3.2
+    earliest = travel
+    latest = horizon - travel - service
+    center = earliest + (latest - earliest) * torch.rand(1, size)
+    half_width = 0.1 + (horizon / 3 - 0.1) * torch.rand(1, size)
+    start = torch.clamp(center - half_width, min=0.0)
+    end = torch.minimum(center + half_width, latest)
+    return decoder_problem(
+        "vrptw",
+        {
+            "xy": xy,
+            "service_time": torch.cat((torch.zeros(1, 1), service), dim=1),
+            "tw_start": torch.cat((torch.zeros(1, 1), start), dim=1),
+            "tw_end": torch.cat(
+                (torch.full((1, 1), horizon), end), dim=1
+            ),
+        },
+    )
+
+
 def generated_problem(name: str, size: int, capacity: int = 50) -> dict:
     """Generate one training problem using PRISM-owned distributions."""
     name = name.lower()
@@ -238,6 +273,9 @@ def generated_problem(name: str, size: int, capacity: int = 50) -> dict:
     }
     if name not in supported:
         raise NotImplementedError(f"no random generator for {name}")
+    if name == "vrptw":
+        return _generated_vrptw(size)
+
     if name in {"pdtsp", "apdtsp"} and size % 2:
         size += 1
 
@@ -304,6 +342,39 @@ def generated_problem(name: str, size: int, capacity: int = 50) -> dict:
         )
         data.update(prize=prize, penalty=penalty)
     return decoder_problem(name, data)
+
+
+def generate_vrptw_validation_data(
+    size: int, count: int, seed: int = 0x54570000
+) -> dict[str, torch.Tensor | int | str]:
+    """Materialize a fixed batch from the current training distribution."""
+    if count < 1:
+        raise ValueError("VRPTW validation count must be positive")
+    state = torch.random.get_rng_state()
+    torch.manual_seed(seed)
+    try:
+        problems = [generated_problem("vrptw", size) for _ in range(count)]
+    finally:
+        torch.random.set_rng_state(state)
+    return {
+        "xy": torch.from_numpy(
+            np.stack([problem["coordinates"] for problem in problems])
+        ).float(),
+        "service_time": torch.from_numpy(
+            np.stack([problem["service_time"] for problem in problems])
+        ).float(),
+        "tw_start": torch.from_numpy(
+            np.stack([problem["tw_start"] for problem in problems])
+        ).float(),
+        "tw_end": torch.from_numpy(
+            np.stack([problem["tw_end"] for problem in problems])
+        ).float(),
+        "variant": "vrptw",
+        "size": int(size),
+        "count": int(count),
+        "seed": int(seed),
+        "distribution": "generated_problem:vrptw",
+    }
 
 
 def resource_count(name: str) -> int:

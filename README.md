@@ -61,6 +61,16 @@ Python code from a baseline repository. The existing 110-task benchmark files
 remain input artifacts; point to a relocated copy with `PRISM_DATASET_DIR` or
 `--dataset-dir`.
 
+The training registry also includes `vrptw`, a closed multi-route problem with
+time windows but no demand or capacity constraint. Generate its fixed validation
+artifact with:
+
+```bash
+uv run python generate_validation_data.py --n-node 100
+```
+
+Later runs load the saved artifact from the configured dataset directory.
+
 Run the end-to-end size-100 URS feasibility gates with:
 
 ```bash

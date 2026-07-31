@@ -14,19 +14,25 @@ from problem_data import (
     TRAIN_VARIANTS,
     DatasetFinder,
     SavedProblems,
+    VariantCurriculum,
+    generate_vrptw_validation_data,
     generated_problem,
     load_saved_data,
 )
 
 
-def test_registry_preserves_the_existing_urs_problem_sets() -> None:
+def test_registry_includes_capacity_free_vrptw_training_problem() -> None:
     assert len(BENCHMARK_VARIANTS) == 110
-    assert ALL_VARIANTS == BENCHMARK_VARIANTS
+    assert len(ALL_VARIANTS) == 111
+    assert "vrptw" in TRAIN_VARIANTS
+    assert "vrptw" not in BENCHMARK_VARIANTS
+    assert "tsptw" not in ALL_VARIANTS
     assert TRAIN_VARIANTS == sorted(
         [
             "atsp",
             "acvrp",
             "tsp",
+            "vrptw",
             "op",
             "pctsp",
             "cvrp",
@@ -77,6 +83,24 @@ def test_saved_problems_loads_without_baseline_source(tmp_path: Path) -> None:
     assert problem["name"] == "tsp"
 
 
+def test_materialized_vrptw_is_reused_for_validation(tmp_path: Path) -> None:
+    directory = tmp_path / "vrptw"
+    directory.mkdir()
+    path = directory / "vrptw20_n4_seed123.pt"
+    torch.save(generate_vrptw_validation_data(20, 4, seed=123), path)
+    saved = SavedProblems(20, tmp_path)
+
+    first, first_reference = saved.load("vrptw", 3)
+    torch.rand(100)
+    second, second_reference = saved.load("vrptw", 3)
+
+    assert first_reference is None
+    assert second_reference is None
+    assert np.array_equal(first["coordinates"], second["coordinates"])
+    assert np.array_equal(first["tw_start"], second["tw_start"])
+    assert np.array_equal(first["tw_end"], second["tw_end"])
+
+
 def test_pickle_reference_uses_count_relative_to_nonzero_start(
     tmp_path: Path,
 ) -> None:
@@ -116,3 +140,27 @@ def test_owned_generators_cover_the_existing_training_curriculum() -> None:
         problem = generated_problem(variant, 20)
         assert problem["name"] == variant
         assert "coordinates" in problem or "distance" in problem
+
+
+def test_generated_vrptw_is_capacity_free_and_multi_route() -> None:
+    problem = generated_problem("vrptw", 20)
+
+    assert problem["constraints"] == ["visit_all", "time_windows"]
+    assert problem["depot_count"] == 1
+    assert problem["multi_route"] is True
+    assert problem["open_route"] is False
+    assert "demand" not in problem
+
+
+def test_curriculum_exposes_tw_only_task_in_the_first_phase() -> None:
+    curriculum = VariantCurriculum.default(seed=1234)
+
+    early = curriculum.eligible(epoch=0, epochs=100)
+    middle = curriculum.eligible(epoch=33, epochs=100)
+
+    assert [name for name in early if "tw" in name] == ["vrptw"]
+    assert {name for name in middle if "tw" in name} == {
+        "vrptw",
+        "cvrptw",
+        "ocvrptw",
+    }
