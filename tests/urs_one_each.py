@@ -13,49 +13,19 @@ import torch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
-sys.path.insert(0, str(ROOT / "baselines" / "URS"))
+sys.path.insert(0, str(ROOT))
 
 import prism_decoder  # noqa: E402
-from data.DataFinder import DataFinder  # noqa: E402
-from data.DataReader import get_saved_data  # noqa: E402
-from problem.ProblemSet import ProblemSet  # noqa: E402
+from problem_data import (  # noqa: E402
+    BENCHMARK_VARIANTS,
+    DEFAULT_DATASET_DIR,
+    DatasetFinder,
+    decoder_problem,
+    load_saved_data,
+)
 
 
-def first(value):
-    if torch.is_tensor(value):
-        array = value[0].detach().cpu().numpy()
-        return array.astype(np.float32) if array.dtype.kind == "f" else array
-    return value
-
-
-def solver_problem(name: str, data: dict) -> dict:
-    problem = {"name": name, "capacity": 1.0, "prize_quota": 1.0}
-    if "xy" in data:
-        coordinates = first(data["xy"])
-        problem["coordinates"] = coordinates
-        problem["distance"] = np.linalg.norm(
-            coordinates[:, None] - coordinates[None, :], axis=-1
-        ).astype(np.float32)
-    else:
-        problem["distance"] = first(data["dist"])
-
-    for field in (
-        "demand",
-        "prize",
-        "penalty",
-        "tw_start",
-        "tw_end",
-        "service_time",
-    ):
-        if field in data:
-            problem[field] = first(data[field])
-    if "route_limit" in data:
-        problem["route_limit"] = float(first(data["route_limit"]))
-    if name == "op":
-        problem["tour_limit"] = 4.0
-    elif name == "aop":
-        problem["tour_limit"] = 1.0
-    return problem
+solver_problem = decoder_problem
 
 
 def assert_normalized_model_inputs(solver) -> None:
@@ -85,12 +55,13 @@ def main() -> int:
     )
     parser.add_argument("--no-pheromone", action="store_true")
     parser.add_argument("--verify-incremental-srr", action="store_true")
+    parser.add_argument("--dataset-dir", type=Path, default=DEFAULT_DATASET_DIR)
     args = parser.parse_args()
     if args.iterations < 2:
         parser.error("--iterations must be at least 2 to exercise perturbation")
 
     logging.disable(logging.CRITICAL)
-    finder = DataFinder(ROOT / "baselines" / "URS" / "dataset")
+    finder = DatasetFinder(args.dataset_dir)
     prism_decoder.set_num_threads(args.threads)
     ants = args.ants if args.ants is not None else args.threads
     failures = []
@@ -109,16 +80,16 @@ def main() -> int:
     srr_rebuilt_nodes = 0
     started = time.perf_counter()
 
-    for index, name in enumerate(ProblemSet.get()):
+    variants = list(BENCHMARK_VARIANTS)
+    for index, name in enumerate(variants):
         test_started = time.perf_counter()
         try:
             paths = finder.get(name, 100)
-            data, _ = get_saved_data(
+            data, _ = load_saved_data(
                 paths["data_path"],
                 name,
                 1,
-                "cpu",
-                solution_name=paths["solution_path"],
+                solution_path=paths["solution_path"],
             )
             solver = prism_decoder.Decoder(
                 solver_problem(name, data),
@@ -185,7 +156,7 @@ def main() -> int:
                 unimproved_names.append(name)
             print(
                 "TEST",
-                f"{index + 1}/{len(ProblemSet.get())}",
+                f"{index + 1}/{len(variants)}",
                 f"variant={name}",
                 "status=PASS",
                 f"bootstrap={bootstrap['objective']:.6g}",
@@ -204,7 +175,7 @@ def main() -> int:
             failures.append(detail)
             print(
                 "TEST",
-                f"{index + 1}/{len(ProblemSet.get())}",
+                f"{index + 1}/{len(variants)}",
                 f"variant={name}",
                 "status=FAIL",
                 f"error={detail[1]}: {detail[2]}",
@@ -217,7 +188,7 @@ def main() -> int:
         "URS_ONE_EACH",
         f"guidance={args.guidance}",
         f"pheromone={'off' if args.no_pheromone else 'on'}",
-        f"passed={len(ProblemSet.get()) - len(failures)}",
+        f"passed={len(variants) - len(failures)}",
         f"failed={len(failures)}",
         f"perturbed={perturbed}",
         f"improved={improved}",

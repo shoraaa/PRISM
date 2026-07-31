@@ -366,8 +366,8 @@ def test_validation_size_loads_each_requested_instance(monkeypatch) -> None:
     loaded_sizes = []
     loaded_instances = []
 
-    class FakeSavedURS:
-        def __init__(self, size: int) -> None:
+    class FakeSavedProblems:
+        def __init__(self, size: int, dataset_dir) -> None:
             loaded_sizes.append(size)
 
         def load(self, variant: str, index: int = 0) -> tuple[dict, float]:
@@ -376,11 +376,12 @@ def test_validation_size_loads_each_requested_instance(monkeypatch) -> None:
 
     args = _args()
     args.n_node = 20
+    args.dataset_dir = "dataset-root"
     args.val_size = 2
     args.val_seen = 1
     args.val_heldout = 1
     curriculum = SimpleNamespace(variants=["tsp"], held_out=["cvrp"])
-    monkeypatch.setattr("train.SavedURS", FakeSavedURS)
+    monkeypatch.setattr("train.SavedProblems", FakeSavedProblems)
 
     data = build_validation_data(args, curriculum)
 

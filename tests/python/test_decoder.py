@@ -8,7 +8,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
 import prism_decoder  # noqa: E402
-from urs_data import generated_problem  # noqa: E402
+from problem_data import generated_problem  # noqa: E402
 
 
 def euclidean_problem(size: int, seed: int) -> tuple[np.ndarray, np.ndarray]:

@@ -27,7 +27,12 @@ if str(SRC) not in sys.path:
 
 import prism_decoder
 from net import ConstraintFieldNet, build_decoder_data
-from urs_data import SavedURS, VariantCurriculum, generated_problem
+from problem_data import (
+    DEFAULT_DATASET_DIR,
+    SavedProblems,
+    VariantCurriculum,
+    generated_problem,
+)
 from utils import MetricsCollector, get_logger, init_logger
 
 
@@ -1220,7 +1225,7 @@ def build_validation_data(
 ) -> list[dict]:
     if args.val_size < 1:
         raise ValueError("val_size must be at least one instance per problem")
-    saved = SavedURS(args.n_node)
+    saved = SavedProblems(args.n_node, args.dataset_dir)
     seen = curriculum.variants[: args.val_seen]
     heldout = curriculum.held_out[: args.val_heldout]
     dataset = []
@@ -1276,6 +1281,15 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=8,
         help="Number of saved instances to validate for each selected problem",
+    )
+    parser.add_argument(
+        "--dataset-dir",
+        type=Path,
+        default=DEFAULT_DATASET_DIR,
+        help=(
+            "Benchmark dataset root. Defaults to PRISM_DATASET_DIR, then "
+            "baselines/URS/dataset"
+        ),
     )
     parser.add_argument("--capacity", type=int, default=50)
     parser.add_argument("--candidates", type=int, default=64)
@@ -1412,7 +1426,7 @@ def main() -> None:
             config=vars(args),
         )
 
-    curriculum = VariantCurriculum.urs_seen(args.seed)
+    curriculum = VariantCurriculum.default(args.seed)
     model = ConstraintFieldNet(
         grad_checkpointing=args.grad_checkpointing
     ).to(args.device)

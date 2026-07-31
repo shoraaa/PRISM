@@ -11,11 +11,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "src"))
-sys.path.insert(0, str(ROOT / "baselines" / "URS"))
 
 import prism_decoder  # noqa: E402
-from problem.ProblemSet import ProblemSet  # noqa: E402
-from urs_data import SavedURS  # noqa: E402
+from problem_data import BENCHMARK_VARIANTS, SavedProblems  # noqa: E402
 
 
 def main() -> int:
@@ -24,11 +22,11 @@ def main() -> int:
     parser.add_argument("--size", type=int, default=100)
     args = parser.parse_args()
 
-    saved = SavedURS(args.size)
+    saved = SavedProblems(args.size)
     fast = 0
     fallback = 0
     failures = []
-    variants = list(ProblemSet.get())
+    variants = list(BENCHMARK_VARIANTS)
     for index, variant in enumerate(variants):
         try:
             problem, _ = saved.load(variant)

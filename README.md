@@ -55,6 +55,12 @@ uv run python setup.py build_ext --inplace
 uv run pytest -q
 ```
 
+Problem definitions, random generators, dataset discovery, and saved-file
+readers are owned by [`problem_data.py`](problem_data.py). PRISM does not import
+Python code from a baseline repository. The existing 110-task benchmark files
+remain input artifacts; point to a relocated copy with `PRISM_DATASET_DIR` or
+`--dataset-dir`.
+
 Run the end-to-end size-100 URS feasibility gates with:
 
 ```bash

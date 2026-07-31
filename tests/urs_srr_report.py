@@ -6,19 +6,23 @@ import csv
 import logging
 import pickle
 import statistics
+import sys
 import time
 from pathlib import Path
 
 import torch
 
-from urs_one_each import (
-    ROOT,
-    DataFinder,
-    ProblemSet,
-    prism_decoder,
-    get_saved_data,
-    solver_problem,
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+sys.path.insert(0, str(ROOT))
+
+from problem_data import (
+    BENCHMARK_VARIANTS,
+    DEFAULT_DATASET_DIR,
+    DatasetFinder,
+    load_saved_data,
 )
+from urs_one_each import prism_decoder, solver_problem
 
 
 EMBEDDED_REFERENCES = {"tsp", "acvrp"}
@@ -90,24 +94,24 @@ def main() -> int:
     parser.add_argument("--disable-srr", action="store_true")
     parser.add_argument("--no-pheromone", action="store_true")
     parser.add_argument("--csv", type=Path)
+    parser.add_argument("--dataset-dir", type=Path, default=DEFAULT_DATASET_DIR)
     args = parser.parse_args()
     if args.iterations < 2:
         parser.error("--iterations must be at least 2")
 
     logging.disable(logging.CRITICAL)
-    finder = DataFinder(ROOT / "baselines" / "URS" / "dataset")
+    finder = DatasetFinder(args.dataset_dir)
     prism_decoder.set_num_threads(args.threads)
     ants = args.ants if args.ants is not None else args.threads
     rows = []
     started = time.perf_counter()
-    for index, name in enumerate(ProblemSet.get()):
+    for index, name in enumerate(BENCHMARK_VARIANTS):
         paths = finder.get(name, 100)
-        data, embedded_reference = get_saved_data(
+        data, embedded_reference = load_saved_data(
             paths["data_path"],
             name,
             1,
-            "cpu",
-            solution_name=paths["solution_path"],
+            solution_path=paths["solution_path"],
         )
         has_reference, reference = first_reference(paths, embedded_reference)
         solver = prism_decoder.Decoder(

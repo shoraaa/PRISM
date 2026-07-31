@@ -18,13 +18,15 @@ import torch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT))
-sys.path.append(str(ROOT / "baselines" / "URS"))
 
 import prism_decoder  # noqa: E402
-from data.DataFinder import DataFinder  # noqa: E402
-from data.DataReader import get_saved_data  # noqa: E402
 from net import ConstraintFieldNet  # noqa: E402
-from problem.ProblemSet import ProblemSet  # noqa: E402
+from problem_data import (  # noqa: E402
+    BENCHMARK_VARIANTS,
+    DEFAULT_DATASET_DIR,
+    DatasetFinder,
+    load_saved_data,
+)
 from train import _canonical_cost, infer_instance, setup_seeds  # noqa: E402
 from urs_one_each import solver_problem  # noqa: E402
 from urs_srr_report import first_reference, gap_percent  # noqa: E402
@@ -54,11 +56,12 @@ def parse_args() -> argparse.Namespace:
         "--device", default="cuda:0" if torch.cuda.is_available() else "cpu"
     )
     parser.add_argument("--csv", type=Path)
+    parser.add_argument("--dataset-dir", type=Path, default=DEFAULT_DATASET_DIR)
     return parser.parse_args()
 
 
 def selected_variants(value: str) -> list[str]:
-    available = list(ProblemSet.get())
+    available = list(BENCHMARK_VARIANTS)
     if value == "all":
         return available
     requested = [name.strip() for name in value.split(",") if name.strip()]
@@ -85,7 +88,7 @@ def main() -> int:
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
 
-    finder = DataFinder(ROOT / "baselines" / "URS" / "dataset")
+    finder = DatasetFinder(args.dataset_dir)
     variants = selected_variants(args.variants)
     rows: list[dict] = []
     failures: list[tuple[str, str]] = []
@@ -95,12 +98,11 @@ def main() -> int:
         test_started = time.perf_counter()
         try:
             paths = finder.get(name, 100)
-            data, embedded_reference = get_saved_data(
+            data, embedded_reference = load_saved_data(
                 paths["data_path"],
                 name,
                 1,
-                "cpu",
-                solution_name=paths["solution_path"],
+                solution_path=paths["solution_path"],
             )
             has_reference, reference = first_reference(
                 paths, embedded_reference
