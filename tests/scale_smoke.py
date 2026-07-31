@@ -17,7 +17,10 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT))
 
-from net import ConstraintFieldNet  # noqa: E402
+from net import (  # noqa: E402
+    ConstraintFieldNet,
+    load_constraint_field_state_dict,
+)
 from train import infer_instance, setup_seeds  # noqa: E402
 from problem_data import generated_problem  # noqa: E402
 
@@ -44,7 +47,7 @@ def main() -> None:
         payload = torch.load(
             cli.checkpoint, map_location=cli.device, weights_only=False
         )
-        model.load_state_dict(payload["model_state_dict"])
+        load_constraint_field_state_dict(model, payload["model_state_dict"])
     model.eval()
     decoder_args = SimpleNamespace(
         candidates=64,

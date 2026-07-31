@@ -20,7 +20,10 @@ sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT))
 
 import prism_decoder  # noqa: E402
-from net import ConstraintFieldNet  # noqa: E402
+from net import (  # noqa: E402
+    ConstraintFieldNet,
+    load_constraint_field_state_dict,
+)
 from problem_data import (  # noqa: E402
     BENCHMARK_VARIANTS,
     DEFAULT_DATASET_DIR,
@@ -93,7 +96,7 @@ def main() -> int:
         args.checkpoint, map_location=args.device, weights_only=False
     )
     model = ConstraintFieldNet().to(args.device)
-    model.load_state_dict(checkpoint["model_state_dict"])
+    load_constraint_field_state_dict(model, checkpoint["model_state_dict"])
     model.eval()
 
     finder = DatasetFinder(args.dataset_dir)

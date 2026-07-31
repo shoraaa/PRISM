@@ -12,6 +12,44 @@ import numpy as np
 import torch
 
 
+_VALIDATION_WANDB_AGGREGATES = {
+    "emissions",
+    "time_neural",
+    "time_decoder",
+    "net_evals",
+    "feasibility_rate",
+    "worst_variant_feasibility_rate",
+    "worst_variant_gap",
+    "worst_variant_baseline_improvement_percent",
+    "seen_gap",
+    "heldout_gap",
+    "seen_baseline_improvement_percent",
+    "heldout_baseline_improvement_percent",
+}
+_VALIDATION_WANDB_VARIANT_SUFFIXES = {
+    "objective",
+    "gap",
+    "baseline_improvement_percent",
+    "feasibility_rate",
+}
+
+
+def validation_metrics_for_wandb(
+    metrics: dict[str, float],
+) -> dict[str, float]:
+    """Drop invariant validation-manifest bookkeeping from W&B histories."""
+    selected = {}
+    for name, value in metrics.items():
+        if name in _VALIDATION_WANDB_AGGREGATES:
+            selected[name] = value
+            continue
+        if name.startswith("variants/") and name.rsplit("/", 1)[-1] in (
+            _VALIDATION_WANDB_VARIANT_SUFFIXES
+        ):
+            selected[name] = value
+    return selected
+
+
 class Logger:
     def __init__(
         self,
@@ -55,7 +93,9 @@ class Logger:
     def error(self, message: str) -> None:
         self._logger.error(message)
 
-    def _wandb_log(self, values: dict[str, float], step: Optional[int]) -> None:
+    def _wandb_log(
+        self, values: dict[str, float | str], step: Optional[int]
+    ) -> None:
         if not self.use_wandb:
             return
         try:
@@ -78,6 +118,7 @@ class Logger:
 
     def log_train_step(
         self,
+        variant: str,
         avg_cost: float,
         best_cost: float,
         epoch: int,
@@ -85,8 +126,9 @@ class Logger:
         step: Optional[int] = None,
     ) -> None:
         values = {
-            "train/avg_cost": avg_cost,
-            "train/best_cost": best_cost,
+            "train/variant": variant,
+            f"train/variants/{variant}/avg_cost": avg_cost,
+            f"train/variants/{variant}/best_cost": best_cost,
             "train/epoch": epoch,
         }
         values.update({f"train/{key}": float(value) for key, value in metrics.items()})
@@ -103,23 +145,54 @@ class Logger:
         step: Optional[int] = None,
     ) -> None:
         values = {
-            "val/avg_last": avg_last,
-            "val/avg_best": avg_best,
-            "val/gap": gap,
+            # Raw canonical costs cannot be compared across distance, penalty,
+            # and maximize-prize variants. Keep the mixed value diagnostic.
+            "val/diagnostic_mixed_canonical_best": avg_best,
             "val/epoch": epoch,
+            "val_summary/macro_gap": gap,
+            "val_summary/macro_improvement": float(
+                metrics["macro_baseline_improvement_percent"]
+            ),
+            "val_summary/macro_score": float(metrics["macro_score"]),
         }
-        values.update({f"val/{key}": float(value) for key, value in metrics.items()})
+        values.update(
+            {
+                f"val/{key}": float(value)
+                for key, value in validation_metrics_for_wandb(metrics).items()
+            }
+        )
         if timing:
             values.update({f"time/{key}": float(value) for key, value in timing.items()})
         self._wandb_log(values, step)
 
+    def log_baseline(self, gap: float) -> None:
+        """Store the classical reference as run metadata, not epoch history."""
+        if self.use_wandb:
+            try:
+                import wandb
+            except ImportError:
+                wandb = None
+            if wandb is not None and wandb.run is not None:
+                wandb.run.summary["baseline/gap"] = float(gap)
+        self.info(f"Baseline: Gap={gap:.2f}%")
+
     def log_epoch_summary(
-        self, epoch: int, train_cost: float, val_best: float, gap: float
+        self,
+        epoch: int,
+        train_cost: float,
+        val_best: float,
+        gap: Optional[float],
+        feasibility_rate: Optional[float] = None,
     ) -> None:
-        self.info(
-            f"Epoch {epoch}: TrainCost={train_cost:.4f} "
-            f"ValBest={val_best:.4f} Gap={gap:.2f}%"
+        message = f"Epoch {epoch}: MixedTrainCost={train_cost:.4f}"
+        message += (
+            " Validation=skipped"
+            if gap is None
+            else f" MacroGap={gap:.2f}%"
         )
+        if feasibility_rate is not None:
+            message += f" Feasible={feasibility_rate:.2%}"
+        self.info(message)
 
 
 @dataclass

@@ -18,6 +18,7 @@ from net import (  # noqa: E402
     ConstraintFieldNet,
     build_decoder_data,
     decode_iteration,
+    load_constraint_field_state_dict,
 )
 from train import (  # noqa: E402
     replay_decision_logp_from_cpp_batch_trace,
@@ -57,6 +58,9 @@ def test_constraint_field_net_uses_normalized_decoder_contract() -> None:
     assert output["binding_logits"].shape == (1, channel_count)
     assert output["feasibility_logits"].shape == (edge_count,)
     assert output["feasibility_risk"].shape == (edge_count,)
+    assert output["value_context"].shape == (1, 16)
+    assert model.value(output, 0.5).shape == (1,)
+    assert torch.equal(model.value(output, 0.5), torch.zeros(1))
     assert torch.all(
         (output["feasibility_risk"] >= 0.0)
         & (output["feasibility_risk"] <= 1.0)
@@ -65,6 +69,28 @@ def test_constraint_field_net_uses_normalized_decoder_contract() -> None:
     assert torch.all(output["multipliers"] >= 0.0)
     active = torch.as_tensor(decoder.metadata["field_channel_mask"]).bool()
     assert torch.all(output["multipliers"][0, ~active] == 0.0)
+
+
+def test_legacy_checkpoint_keeps_zero_initialized_value_head() -> None:
+    original = ConstraintFieldNet(depth=1, units=8)
+    legacy = {
+        key: value
+        for key, value in original.state_dict().items()
+        if not key.startswith("value_head.")
+    }
+    restored = ConstraintFieldNet(depth=1, units=8)
+
+    upgraded = load_constraint_field_state_dict(restored, legacy)
+
+    assert upgraded is True
+    assert torch.equal(
+        restored.value_head.weight,
+        torch.zeros_like(restored.value_head.weight),
+    )
+    assert torch.equal(
+        restored.value_head.bias,
+        torch.zeros_like(restored.value_head.bias),
+    )
 
 
 def test_python_dimensions_come_from_cpp_extension() -> None:
