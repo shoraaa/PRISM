@@ -471,14 +471,45 @@ void parse_guidance(py::object edge_field, py::object edge_additive,
     coupler_bias_values = static_cast<const float *>(buffer.ptr);
   }
   if (!edge_risk.is_none()) {
-    risk_storage = edge_risk.cast<
+    py::array_t<float, py::array::c_style | py::array::forcecast> input =
+        edge_risk.cast<
         py::array_t<float, py::array::c_style | py::array::forcecast>>();
-    const py::buffer_info buffer = risk_storage.request();
-    if (buffer.ndim != 1 || buffer.shape[0] != edge_count) {
+    const py::buffer_info buffer = input.request();
+    if (buffer.ndim == 2 && buffer.shape[0] == edge_count &&
+        buffer.shape[1] == prism::RISK_GUIDANCE_FEATURE_COUNT) {
+      risk_storage = input;
+    } else if (buffer.ndim == 1 && buffer.shape[0] == edge_count) {
+      // Compatibility for callers that provide static probabilities. Expand
+      // them into zero-state logits with an always-open trust gate.
+      risk_storage = py::array_t<float>(
+          {edge_count, prism::RISK_GUIDANCE_FEATURE_COUNT});
+      float *packed = risk_storage.mutable_data();
+      std::fill_n(
+          packed,
+          static_cast<size_t>(edge_count) *
+              prism::RISK_GUIDANCE_FEATURE_COUNT,
+          0.0f);
+      const float *probability = static_cast<const float *>(buffer.ptr);
+      for (int32_t edge = 0; edge < edge_count; ++edge) {
+        if (!std::isfinite(probability[edge]) || probability[edge] < 0.0f ||
+            probability[edge] > 1.0f) {
+          throw std::invalid_argument(
+              "legacy edge feasibility risk must be normalized to [0, 1]");
+        }
+        const float value = std::clamp(probability[edge], 1.0e-6f,
+                                       1.0f - 1.0e-6f);
+        float *row = packed + static_cast<size_t>(edge) *
+                                  prism::RISK_GUIDANCE_FEATURE_COUNT;
+        row[0] = std::log(value / (1.0f - value));
+        row[1 + prism::LIVE_STATE_FEATURE_COUNT] = 20.0f;
+      }
+    } else {
       throw std::invalid_argument(
-          "edge_risk must have shape (edge_count,)");
+          "edge_risk must have shape (edge_count,) or "
+          "(edge_count, RISK_GUIDANCE_FEATURE_COUNT)");
     }
-    risk_values = static_cast<const float *>(buffer.ptr);
+    const py::buffer_info packed_buffer = risk_storage.request();
+    risk_values = static_cast<const float *>(packed_buffer.ptr);
   }
 }
 
@@ -513,6 +544,16 @@ py::dict trace_to_dict(const DecisionTrace &trace) {
   result["feasibility_risk_labels"] = vector_copy<float>(
       trace.feasibility_risk_labels,
       {static_cast<py::ssize_t>(trace.feasibility_edges.size())});
+  result["feasibility_offsets"] = vector_copy<int32_t>(
+      trace.feasibility_offsets,
+      {static_cast<py::ssize_t>(trace.feasibility_offsets.size())});
+  result["feasibility_live_state"] = vector_copy<float>(
+      trace.feasibility_live_state,
+      {static_cast<py::ssize_t>(
+           trace.feasibility_offsets.empty()
+               ? 0
+               : trace.feasibility_offsets.size() - 1),
+       prism::LIVE_STATE_FEATURE_COUNT});
   result["screened_edges"] = vector_copy<int32_t>(
       trace.screened_edges,
       {static_cast<py::ssize_t>(trace.screened_edges.size())});
@@ -757,6 +798,7 @@ public:
     result["constraints"] = prism::constraint_names(problem.constraints);
     result["objective"] = prism::objective_name(problem.objective);
     result["objective_scale"] = solver_.objective_scale();
+    result["objective_energy_scale"] = solver_.objective_energy_scale();
     result["direction"] = prism::objective_direction(problem.objective);
     result["multi_route"] = problem.multi_route;
     result["open_route"] = problem.open_route;
@@ -1007,4 +1049,6 @@ PYBIND11_MODULE(prism_decoder, module) {
   module.attr("EDGE_FEATURE_COUNT") = prism::EDGE_FEATURE_COUNT;
   module.attr("FIELD_CHANNEL_COUNT") = prism::FIELD_CHANNEL_COUNT;
   module.attr("LIVE_STATE_FEATURE_COUNT") = prism::LIVE_STATE_FEATURE_COUNT;
+  module.attr("RISK_GUIDANCE_FEATURE_COUNT") =
+      prism::RISK_GUIDANCE_FEATURE_COUNT;
 }

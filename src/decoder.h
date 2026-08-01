@@ -11,6 +11,10 @@ namespace prism {
 
 static constexpr int32_t FIELD_CHANNEL_COUNT = 7;
 static constexpr int32_t LIVE_STATE_FEATURE_COUNT = FIELD_CHANNEL_COUNT;
+// Packed per-edge risk guidance:
+// [risk_logit, risk_state_weights..., gate_logit, gate_state_weights...].
+static constexpr int32_t RISK_GUIDANCE_FEATURE_COUNT =
+    2 * (LIVE_STATE_FEATURE_COUNT + 1);
 static constexpr int32_t NODE_FEATURE_COUNT = 24;
 static constexpr int32_t EDGE_FEATURE_COUNT = 11;
 
@@ -153,6 +157,10 @@ struct DecisionTrace {
   std::vector<int32_t> feasibility_edges;
   // Aligned with feasibility_edges.
   std::vector<float> feasibility_risk_labels;
+  // Partition feasibility edges/labels by the exact live state that produced
+  // their state-dependent lookahead targets.
+  std::vector<int32_t> feasibility_offsets;
+  std::vector<float> feasibility_live_state;
   std::vector<int32_t> screened_edges;
   std::vector<float> screened_resource_delta;
   int64_t screening_fast_evaluations = 0;
@@ -233,6 +241,10 @@ public:
   // distance scale, in [0, 1). Gives the field the raw objective scale that
   // per-edge normalization hides, so the multiplier can calibrate its units.
   float objective_scale() const;
+  // Mean absolute customer-arrival objective edge cost. Unlike the bounded
+  // neural descriptor above, this retains objective units and scales the
+  // maximum risk energy consistently across coordinate/prize units.
+  float objective_energy_scale() const { return objective_energy_scale_; }
   const Solution &best_solution() const { return best_solution_; }
 
 private:
@@ -246,6 +258,8 @@ private:
     std::vector<float> live_state;
     std::vector<int32_t> feasibility_edges;
     std::vector<float> feasibility_risk_labels;
+    std::vector<int32_t> feasibility_offsets = {0};
+    std::vector<float> feasibility_live_state;
     std::vector<int32_t> screened_edges;
     std::vector<float> screened_resource_delta;
     int64_t screening_fast_evaluations = 0;
@@ -297,6 +311,8 @@ private:
   float time_scale_ = 1.0f;
   float prize_scale_ = 1.0f;
   float penalty_scale_ = 1.0f;
+  float objective_scale_value_ = 0.0f;
+  float objective_energy_scale_ = 0.0f;
   int32_t pair_count_ = 0;
 
   std::vector<float> pheromone_;
@@ -343,6 +359,8 @@ private:
                             const float *coupler_weights,
                             const float *coupler_bias,
                             const float *live_state) const;
+  double state_conditioned_risk(int32_t edge, const float *edge_risk,
+                                const float *live_state) const;
   void record_decision(AntTrace *trace, int32_t current,
                        const std::vector<int32_t> &valid_indices,
                        int32_t chosen_index, bool stochastic,

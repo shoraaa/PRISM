@@ -10,6 +10,7 @@ FIELD_CHANNEL_COUNT = prism_decoder.FIELD_CHANNEL_COUNT
 LIVE_STATE_FEATURE_COUNT = prism_decoder.LIVE_STATE_FEATURE_COUNT
 NODE_FEATURE_COUNT = prism_decoder.NODE_FEATURE_COUNT
 EDGE_FEATURE_COUNT = prism_decoder.EDGE_FEATURE_COUNT
+RISK_GUIDANCE_FEATURE_COUNT = 2 * (LIVE_STATE_FEATURE_COUNT + 1)
 
 
 OBJECTIVE_TYPES = ("distance", "prize", "distance_plus_penalty")
@@ -72,6 +73,11 @@ def build_decoder_data(decoder, device="cpu"):
         dtype=torch.float32,
         device=device,
     )
+    objective_energy_scale = torch.tensor(
+        [[float(decoder.metadata["objective_energy_scale"])]],
+        dtype=torch.float32,
+        device=device,
+    )
     multi_route = torch.tensor(
         [[float(bool(decoder.metadata["multi_route"]))]],
         dtype=torch.float32,
@@ -114,6 +120,11 @@ def build_decoder_data(decoder, device="cpu"):
     if not torch.isfinite(objective_edge_costs).all():
         raise ValueError("objective_edge_costs must contain only finite values")
     if (
+        not torch.isfinite(objective_energy_scale).all()
+        or torch.any(objective_energy_scale < 0.0)
+    ):
+        raise ValueError("objective_energy_scale must be finite and non-negative")
+    if (
         resource_scales.shape != (FIELD_CHANNEL_COUNT,)
         or not torch.isfinite(resource_scales).all()
         or torch.any(resource_scales <= 0.0)
@@ -127,6 +138,7 @@ def build_decoder_data(decoder, device="cpu"):
         open_route=open_route,
         objective_type=objective_type,
         objective_scale=objective_scale,
+        objective_energy_scale=objective_energy_scale,
         multi_route=multi_route,
         depot_scale=depot_scale,
         raw_resource_pressure=raw_resource_pressure,
@@ -138,7 +150,7 @@ def build_decoder_data(decoder, device="cpu"):
 
 
 @torch.no_grad()
-def decode_iteration(decoder, model, device="cpu", risk_penalty=10.0):
+def decode_iteration(decoder, model, device="cpu", risk_penalty=1.0):
     """Run one model refresh and one decoder iteration on the current graph."""
     graph = build_decoder_data(decoder, device=device)
     output = model(graph)
@@ -153,7 +165,7 @@ def decode_iteration(decoder, model, device="cpu", risk_penalty=10.0):
         multipliers=multipliers,
         coupler_weights=output["coupler_weights"][0].detach().cpu().numpy(),
         coupler_bias=output["coupler_bias"][0].detach().cpu().numpy(),
-        edge_risk=output["feasibility_risk"].detach().cpu().numpy(),
+        edge_risk=output["risk_guidance"].detach().cpu().numpy(),
         risk_penalty=float(risk_penalty),
     )
     return solution, output
@@ -273,6 +285,16 @@ class ConstraintFieldNet(nn.Module):
         self.coupler_head = nn.Linear(units, LIVE_STATE_FEATURE_COUNT)
         self.coupler_bias_head = nn.Linear(units, 1)
         self.value_head = nn.Linear(units + 1, 1)
+        # Appended after every legacy parameter so existing optimizer slots
+        # remain loadable. The classifier is supervised from exact lookahead
+        # labels; the separate bounded gate is shaped by PPO.
+        self.feasibility_state_head = nn.Linear(
+            units, LIVE_STATE_FEATURE_COUNT
+        )
+        self.risk_gate_head = nn.Linear(units, 1)
+        self.risk_gate_state_head = nn.Linear(
+            units, LIVE_STATE_FEATURE_COUNT
+        )
         nn.init.zeros_(self.field_head.weight)
         nn.init.zeros_(self.field_head.bias)
         nn.init.zeros_(self.additive_head.weight)
@@ -287,6 +309,12 @@ class ConstraintFieldNet(nn.Module):
         # enabling temporal credit leave the field policy unchanged initially.
         nn.init.zeros_(self.value_head.weight)
         nn.init.zeros_(self.value_head.bias)
+        nn.init.zeros_(self.feasibility_state_head.weight)
+        nn.init.zeros_(self.feasibility_state_head.bias)
+        nn.init.zeros_(self.risk_gate_head.weight)
+        nn.init.zeros_(self.risk_gate_head.bias)
+        nn.init.zeros_(self.risk_gate_state_head.weight)
+        nn.init.zeros_(self.risk_gate_state_head.bias)
         self.register_buffer(
             "resource_types", torch.eye(FIELD_CHANNEL_COUNT)
         )
@@ -448,10 +476,25 @@ class ConstraintFieldNet(nn.Module):
         additive = F.softplus(
             torch.stack(additive_channels, dim=1) + self.additive_softplus_shift
         )
-        feasibility_logits = self.feasibility_head(
-            torch.tanh(projected_edges)
-        ).squeeze(-1)
+        risk_edge_state = torch.tanh(projected_edges)
+        feasibility_logits = self.feasibility_head(risk_edge_state).squeeze(-1)
+        feasibility_state_weights = self.feasibility_state_head(
+            risk_edge_state
+        )
         feasibility_risk = torch.sigmoid(feasibility_logits)
+        risk_gate_logits = self.risk_gate_head(risk_edge_state).squeeze(-1)
+        risk_gate_state_weights = self.risk_gate_state_head(risk_edge_state)
+        risk_guidance = torch.cat(
+            (
+                feasibility_logits.unsqueeze(-1),
+                feasibility_state_weights,
+                risk_gate_logits.unsqueeze(-1),
+                risk_gate_state_weights,
+            ),
+            dim=-1,
+        )
+        if risk_guidance.shape[-1] != RISK_GUIDANCE_FEATURE_COUNT:
+            raise RuntimeError("invalid packed risk-guidance width")
         edge_active = active[edge_batch] if batched else active[0]
         residual = residual * edge_active + (1.0 - edge_active)
         additive = additive * edge_active
@@ -471,7 +514,11 @@ class ConstraintFieldNet(nn.Module):
             "residual": residual,
             "additive": additive,
             "feasibility_logits": feasibility_logits,
+            "feasibility_state_weights": feasibility_state_weights,
             "feasibility_risk": feasibility_risk,
+            "risk_gate_logits": risk_gate_logits,
+            "risk_gate_state_weights": risk_gate_state_weights,
+            "risk_guidance": risk_guidance,
             "multipliers": multipliers,
             "binding_logits": binding_logits,
             "raw_residual": raw_residual,
@@ -480,6 +527,33 @@ class ConstraintFieldNet(nn.Module):
             "value_context": graph_state,
             "active_channels": active,
         }
+
+    def feasibility_for_state(self, output, edges, live_state):
+        """Return state-conditioned supervised feasibility logits and risk."""
+        _require_unit_interval("live_state", live_state)
+        edges = torch.as_tensor(
+            edges, dtype=torch.long, device=output["feasibility_logits"].device
+        )
+        state = live_state.to(output["feasibility_logits"].device)
+        if state.shape != edges.shape + (LIVE_STATE_FEATURE_COUNT,):
+            raise ValueError("live_state must provide one state per risk edge")
+        logits = output["feasibility_logits"][edges]
+        weights = output["feasibility_state_weights"][edges]
+        logits = logits + (weights * state).sum(dim=-1)
+        return logits, torch.sigmoid(logits)
+
+    def risk_gate_for_state(self, output, edges, live_state):
+        """Return the PPO-controlled trust gate, bounded to [0, 1]."""
+        _require_unit_interval("live_state", live_state)
+        edges = torch.as_tensor(
+            edges, dtype=torch.long, device=output["risk_gate_logits"].device
+        )
+        state = live_state.to(output["risk_gate_logits"].device)
+        if state.shape != edges.shape + (LIVE_STATE_FEATURE_COUNT,):
+            raise ValueError("live_state must provide one state per risk edge")
+        logits = output["risk_gate_logits"][edges]
+        weights = output["risk_gate_state_weights"][edges]
+        return torch.sigmoid(logits + (weights * state).sum(dim=-1))
 
     def couple(self, output, live_state, graph_index=None):
         """Apply the same cheap state modulation evaluated by the C++ decoder."""
@@ -537,13 +611,22 @@ class ConstraintFieldNet(nn.Module):
 def load_constraint_field_state_dict(
     model: ConstraintFieldNet, state_dict: dict
 ) -> bool:
-    """Load current or pre-value-head checkpoints without hiding other drift.
+    """Load current or legacy checkpoints without hiding other drift.
 
     Returns ``True`` when a legacy checkpoint was upgraded by retaining the
-    value head's zero initialization.
+    missing heads' neutral initialization.
     """
     incompatible = model.load_state_dict(state_dict, strict=False)
-    allowed_missing = {"value_head.weight", "value_head.bias"}
+    allowed_missing = {
+        "value_head.weight",
+        "value_head.bias",
+        "feasibility_state_head.weight",
+        "feasibility_state_head.bias",
+        "risk_gate_head.weight",
+        "risk_gate_head.bias",
+        "risk_gate_state_head.weight",
+        "risk_gate_state_head.bias",
+    }
     missing = set(incompatible.missing_keys)
     unexpected = set(incompatible.unexpected_keys)
     if unexpected or missing - allowed_missing:

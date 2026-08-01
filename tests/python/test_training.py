@@ -94,6 +94,9 @@ def test_event_driven_option_rollout_and_pretrain_update(
     coupler_before = model.coupler_head.weight.detach().clone()
     coupler_bias_before = model.coupler_bias_head.weight.detach().clone()
     feasibility_before = model.feasibility_head.weight.detach().clone()
+    feasibility_state_before = (
+        model.feasibility_state_head.weight.detach().clone()
+    )
 
     rollout = collect_instance_rollout(model, problem, "cvrp", args)
     metrics = ppo_update(model, optimizer, [rollout], args, epoch=0)
@@ -126,6 +129,10 @@ def test_event_driven_option_rollout_and_pretrain_update(
     assert not torch.equal(multiplier_before, model.multiplier_head.weight.detach())
     assert not torch.equal(
         feasibility_before, model.feasibility_head.weight.detach()
+    )
+    assert not torch.equal(
+        feasibility_state_before,
+        model.feasibility_state_head.weight.detach(),
     )
     assert not (
         torch.equal(coupler_before, model.coupler_head.weight.detach())
@@ -164,8 +171,23 @@ def test_decision_level_ppo_moves_policy_without_auxiliary_losses(
     args.price_weight = 0.0
     args.entropy_weight = 0.0
     model = ConstraintFieldNet(depth=1, units=8)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
-    rollout = collect_instance_rollout(model, problem, "cvrp", args)
+    with torch.no_grad():
+        model.feasibility_head.weight.copy_(
+            torch.linspace(
+                -0.25,
+                0.25,
+                model.feasibility_head.weight.numel(),
+            ).reshape_as(model.feasibility_head.weight)
+        )
+        model.feasibility_head.bias.zero_()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=0.0)
+    rollout = collect_instance_rollout(
+        model,
+        problem,
+        "cvrp",
+        args,
+        risk_penalty=args.feasibility_risk_penalty,
+    )
     for step in rollout.steps:
         step.rewards = torch.tensor([-1.0, 1.0])
     policy_before = {
@@ -174,6 +196,16 @@ def test_decision_level_ppo_moves_policy_without_auxiliary_losses(
         if name.startswith(("field_head", "additive_head", "multiplier_head"))
     }
     value_before = model.value_head.weight.detach().clone()
+    classifier_before = {
+        name: parameter.detach().clone()
+        for name, parameter in model.named_parameters()
+        if name.startswith(("feasibility_head", "feasibility_state_head"))
+    }
+    gate_before = {
+        name: parameter.detach().clone()
+        for name, parameter in model.named_parameters()
+        if name.startswith(("risk_gate_head", "risk_gate_state_head"))
+    }
 
     metrics = ppo_update(model, optimizer, [rollout], args, epoch=0)
 
@@ -200,6 +232,18 @@ def test_decision_level_ppo_moves_policy_without_auxiliary_losses(
         for name, parameter in model.named_parameters()
         if name in policy_before
     )
+    assert all(
+        torch.equal(classifier_before[name], parameter.detach())
+        for name, parameter in model.named_parameters()
+        if name in classifier_before
+    )
+    assert any(
+        not torch.equal(gate_before[name], parameter.detach())
+        for name, parameter in model.named_parameters()
+        if name in gate_before
+    )
+    assert 0.0 <= metrics["risk_gate_mean"] <= 1.0
+    assert 0.0 <= metrics["risk_energy_max"] <= metrics["risk_energy_cap"]
     assert metrics["approx_kl"] == pytest.approx(0.0, abs=1e-10)
     assert abs(metrics["rl_loss"]) < 1e-5
     assert abs(metrics["rl_score_proxy"]) > 1e-6
@@ -320,16 +364,16 @@ def test_winner_temporal_advantage_is_non_cancelling_pomo_contrast() -> None:
     assert float(advantage.abs().sum()) > 0.0
 
 
-def test_legacy_optimizer_state_initializes_appended_value_head() -> None:
+def test_legacy_optimizer_state_initializes_appended_risk_heads() -> None:
     model = ConstraintFieldNet(depth=1, units=8)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
     sum(parameter.square().sum() for parameter in model.parameters()).backward()
     optimizer.step()
     legacy = copy.deepcopy(optimizer.state_dict())
-    removed = legacy["param_groups"][0]["params"][-2:]
+    removed = legacy["param_groups"][0]["params"][-6:]
     legacy["param_groups"][0]["params"] = legacy["param_groups"][0][
         "params"
-    ][:-2]
+    ][:-6]
     for parameter_id in removed:
         legacy["state"].pop(parameter_id)
     restored = ConstraintFieldNet(depth=1, units=8)
@@ -337,11 +381,11 @@ def test_legacy_optimizer_state_initializes_appended_value_head() -> None:
 
     added = _load_optimizer_state_compat(restored_optimizer, legacy)
 
-    assert added == 2
+    assert added == 6
     assert len(restored_optimizer.param_groups[0]["params"]) == len(
         list(restored.parameters())
     )
-    assert len(restored_optimizer.state) == len(list(restored.parameters())) - 2
+    assert len(restored_optimizer.state) == len(list(restored.parameters())) - 6
 
 
 def test_positive_class_weight_balances_rare_events() -> None:

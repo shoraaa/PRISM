@@ -268,6 +268,9 @@ with resource-indexed pools, and the GNN uses direct single-graph reductions.
 Training enables activation checkpointing automatically from `n=1000`, while
 inference remains checkpoint-free.
 
-The feasibility look-ahead defaults to two steps and its search penalty to
-`10.0` objective units. Configure them with
-`--feasibility-lookahead-depth` and `--feasibility-risk-penalty`.
+The feasibility look-ahead defaults to two steps. Its learned risk is conditioned
+on the decoder's live resource state, and its contribution is bounded by
+`--feasibility-risk-penalty` times the instance objective scale (default `1.0`).
+The supervised risk classifier remains isolated from PPO; PPO instead controls a
+separate sigmoid trust gate that can suppress unreliable risk guidance. Configure
+the look-ahead with `--feasibility-lookahead-depth`.

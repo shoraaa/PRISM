@@ -748,25 +748,7 @@ std::vector<float> RoutingDecoder::resource_scales() const {
 }
 
 float RoutingDecoder::objective_scale() const {
-  // Average the objective magnitude over customer-arrival edges; depot legs are
-  // mode-specific (open/closed) and would bias the scale, so they are skipped.
-  double total = 0.0;
-  int64_t count = 0;
-  for (int32_t from = 0; from < problem_.node_count; ++from) {
-    for (int32_t edge = edge_offsets_[from]; edge < edge_offsets_[from + 1];
-         ++edge) {
-      if (edge_to_[edge] < problem_.depot_count)
-        continue;
-      total += std::abs(objective_edge_costs_[edge]);
-      ++count;
-    }
-  }
-  if (count == 0)
-    return 0.0f;
-  const double ratio =
-      (total / static_cast<double>(count)) / std::max(distance_scale_, EPS);
-  // ratio / (1 + ratio) squashes [0, inf) into [0, 1) without a hard clamp.
-  return static_cast<float>(ratio / (1.0 + ratio));
+  return objective_scale_value_;
 }
 
 float RoutingDecoder::analytic_resource_pressure(int32_t from, int32_t to,
@@ -887,11 +869,12 @@ void RoutingDecoder::validate_guidance(const float *edge_field,
         "feasibility risk penalty must be finite and non-negative");
   }
   if (edge_risk != nullptr) {
-    for (int32_t edge = 0; edge < edge_count(); ++edge) {
-      if (!std::isfinite(edge_risk[edge]) || edge_risk[edge] < 0.0f ||
-          edge_risk[edge] > 1.0f) {
+    const size_t count = static_cast<size_t>(edge_count()) *
+                         RISK_GUIDANCE_FEATURE_COUNT;
+    for (size_t index = 0; index < count; ++index) {
+      if (!std::isfinite(edge_risk[index])) {
         throw std::invalid_argument(
-            "edge feasibility risk must be normalized to [0, 1]");
+            "state-conditioned edge risk guidance must be finite");
       }
     }
   }
@@ -984,6 +967,28 @@ double RoutingDecoder::coupled_multiplier(
   return base * modulation;
 }
 
+double RoutingDecoder::state_conditioned_risk(
+    int32_t edge, const float *edge_risk, const float *live_state) const {
+  if (edge < 0 || edge_risk == nullptr)
+    return 0.0;
+  const float *packed =
+      edge_risk + static_cast<size_t>(edge) * RISK_GUIDANCE_FEATURE_COUNT;
+  double risk_logit = packed[0];
+  double gate_logit = packed[1 + LIVE_STATE_FEATURE_COUNT];
+  if (live_state != nullptr) {
+    for (int32_t feature = 0; feature < LIVE_STATE_FEATURE_COUNT; ++feature) {
+      risk_logit += packed[1 + feature] * live_state[feature];
+      gate_logit += packed[2 + LIVE_STATE_FEATURE_COUNT + feature] *
+                    live_state[feature];
+    }
+  }
+  const auto sigmoid = [](double value) {
+    return value >= 0.0 ? 1.0 / (1.0 + std::exp(-value))
+                        : std::exp(value) / (1.0 + std::exp(value));
+  };
+  return sigmoid(risk_logit) * sigmoid(gate_logit);
+}
+
 void RoutingDecoder::record_decision(AntTrace *trace, int32_t current,
                                      const std::vector<int32_t> &valid_indices,
                                      int32_t chosen_index, bool stochastic,
@@ -1007,6 +1012,9 @@ void RoutingDecoder::record_feasibility_labels(AntTrace *trace,
                                                State &state) const {
   if (trace == nullptr)
     return;
+  const auto live_state = live_state_features(state);
+  trace->feasibility_live_state.insert(
+      trace->feasibility_live_state.end(), live_state.begin(), live_state.end());
   for (int32_t edge = edge_offsets_[state.current];
        edge < edge_offsets_[state.current + 1]; ++edge) {
     const int32_t node = edge_to_[edge];
@@ -1014,6 +1022,8 @@ void RoutingDecoder::record_feasibility_labels(AntTrace *trace,
     trace->feasibility_risk_labels.push_back(
         legal_node(state, node) ? feasibility_risk_label(state, node) : 1.0f);
   }
+  trace->feasibility_offsets.push_back(
+      static_cast<int32_t>(trace->feasibility_edges.size()));
 }
 
 double RoutingDecoder::field_score(int32_t from, int32_t to, int32_t edge,
@@ -1062,11 +1072,11 @@ double RoutingDecoder::edge_energy(int32_t from, int32_t to, int32_t edge,
                                    const float *live_state,
                                    const float *edge_risk,
                                    float risk_penalty) const {
-  const double risk = edge >= 0 && edge_risk != nullptr ? edge_risk[edge] : 0.0;
+  const double risk = state_conditioned_risk(edge, edge_risk, live_state);
   return objective_edge_cost(from, to) +
          field_score(from, to, edge, edge_field, edge_additive, multipliers,
                      coupler_weights, coupler_bias, live_state) +
-         risk_penalty * risk;
+         risk_penalty * objective_energy_scale_ * risk;
 }
 
 void RoutingDecoder::build_candidate_graph(const std::vector<int32_t> &incumbent,
@@ -1388,8 +1398,15 @@ void RoutingDecoder::build_candidate_graph(const std::vector<int32_t> &incumbent
                               FIELD_CHANNEL_COUNT,
                           0.0f);
   }
-  if (edge_risk != nullptr)
-    edge_risk->assign(edge_to_.size(), 0.0f);
+  if (edge_risk != nullptr) {
+    edge_risk->assign(
+        edge_to_.size() * RISK_GUIDANCE_FEATURE_COUNT, 0.0f);
+    for (int32_t edge = 0; edge < edge_count(); ++edge) {
+      (*edge_risk)[static_cast<size_t>(edge) *
+                       RISK_GUIDANCE_FEATURE_COUNT +
+                   1 + LIVE_STATE_FEATURE_COUNT] = -20.0f;
+    }
+  }
   for (int32_t from = 0; from < n; ++from) {
     int32_t old_edge =
         old_offsets.size() == static_cast<size_t>(n + 1)
@@ -1436,9 +1453,35 @@ void RoutingDecoder::build_candidate_graph(const std::vector<int32_t> &incumbent
                         static_cast<size_t>(edge) * FIELD_CHANNEL_COUNT);
       }
       if (edge_risk != nullptr && preserved &&
-          static_cast<size_t>(old_edge) < old_risk.size())
-        (*edge_risk)[edge] = old_risk[old_edge];
+          static_cast<size_t>(old_edge + 1) * RISK_GUIDANCE_FEATURE_COUNT <=
+              old_risk.size()) {
+        std::copy_n(
+            old_risk.data() +
+                static_cast<size_t>(old_edge) * RISK_GUIDANCE_FEATURE_COUNT,
+            RISK_GUIDANCE_FEATURE_COUNT,
+            edge_risk->data() +
+                static_cast<size_t>(edge) * RISK_GUIDANCE_FEATURE_COUNT);
+      }
     }
+  }
+  double objective_total = 0.0;
+  int64_t objective_count = 0;
+  for (int32_t edge = 0; edge < edge_count(); ++edge) {
+    if (edge_to_[edge] < problem_.depot_count)
+      continue;
+    objective_total += std::abs(objective_edge_costs_[edge]);
+    ++objective_count;
+  }
+  if (objective_count == 0) {
+    objective_energy_scale_ = 0.0f;
+    objective_scale_value_ = 0.0f;
+  } else {
+    objective_energy_scale_ = static_cast<float>(
+        objective_total / static_cast<double>(objective_count));
+    const double ratio =
+        objective_energy_scale_ /
+        std::max(distance_scale_, EPS);
+    objective_scale_value_ = static_cast<float>(ratio / (1.0 + ratio));
   }
   incumbent_route_ = incumbent;
   build_model_features();
@@ -2630,8 +2673,10 @@ Solution RoutingDecoder::scope_restricted_refine(
     GuidanceValue value;
     value.objective = objective_edge_cost(from, to);
     const int32_t edge = find_edge(from, to);
-    value.feasibility_risk =
-        edge >= 0 && edge_risk != nullptr ? edge_risk[edge] : 0.0;
+    const auto edge_state = incumbent_state_features(from);
+    value.feasibility_risk = objective_energy_scale_ *
+                             state_conditioned_risk(
+                                 edge, edge_risk, edge_state.data());
     for (int32_t channel = 0; channel < FIELD_CHANNEL_COUNT; ++channel) {
       if (!field_channel_active(channel))
         continue;
@@ -4974,6 +5019,7 @@ std::vector<Solution> RoutingDecoder::sample(const float *edge_field,
     trace->starts.reserve(n_ants_ + 1);
     trace->starts.push_back(0);
     trace->valid_offsets.push_back(0);
+    trace->feasibility_offsets.push_back(0);
     for (AntTrace &ant : ant_traces) {
       trace->current_nodes.insert(trace->current_nodes.end(),
                                   ant.current_nodes.begin(),
@@ -5002,6 +5048,16 @@ std::vector<Solution> RoutingDecoder::sample(const float *edge_field,
           trace->feasibility_risk_labels.end(),
           ant.feasibility_risk_labels.begin(),
           ant.feasibility_risk_labels.end());
+      const int32_t feasibility_base =
+          trace->feasibility_offsets.back();
+      for (size_t index = 1; index < ant.feasibility_offsets.size(); ++index) {
+        trace->feasibility_offsets.push_back(
+            feasibility_base + ant.feasibility_offsets[index]);
+      }
+      trace->feasibility_live_state.insert(
+          trace->feasibility_live_state.end(),
+          ant.feasibility_live_state.begin(),
+          ant.feasibility_live_state.end());
       trace->screened_edges.insert(trace->screened_edges.end(),
                                    ant.screened_edges.begin(),
                                    ant.screened_edges.end());
@@ -5123,7 +5179,10 @@ Solution RoutingDecoder::solve(int32_t iterations, const float *edge_field,
                             FIELD_CHANNEL_COUNT);
   }
   if (edge_risk != nullptr)
-    working_risk.assign(edge_risk, edge_risk + edge_to_.size());
+    working_risk.assign(
+        edge_risk,
+        edge_risk + static_cast<size_t>(edge_to_.size()) *
+                        RISK_GUIDANCE_FEATURE_COUNT);
   for (int32_t iteration = 0; iteration < iterations; ++iteration) {
     std::vector<Solution> solutions = sample(
         working_field.empty() ? nullptr : working_field.data(),

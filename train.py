@@ -144,12 +144,28 @@ def replay_decision_logp_from_cpp_batch_trace(
     multiplier = model.couple(output, states)
     if not field_enabled:
         multiplier = torch.zeros_like(multiplier)
-    feasibility_risk = output["feasibility_risk"].detach()
+    risk_states = states.unsqueeze(1).expand(
+        -1, global_edge.shape[1], -1
+    )
+    _, feasibility_risk = model.feasibility_for_state(
+        output, global_edge, risk_states
+    )
+    # The classifier stays calibrated by supervised lookahead labels. PPO
+    # controls only the separately bounded trust gate.
+    feasibility_risk = feasibility_risk.detach()
+    risk_gate = model.risk_gate_for_state(output, global_edge, risk_states)
+    objective_scale = graph.objective_energy_scale.to(device).reshape(-1)[0]
+    risk_energy = (
+        float(risk_penalty)
+        * objective_scale
+        * feasibility_risk
+        * risk_gate
+    )
     energy = objective + (
         multiplier.unsqueeze(1)
         * torch.clamp_min(pressure * residual + scales * additive, 0.0)
     ).sum(dim=-1)
-    energy = energy + float(risk_penalty) * feasibility_risk[global_edge]
+    energy = energy + risk_energy
     logits = (-float(beta) * energy).masked_fill(~valid, -torch.inf)
 
     chosen_edge = edge_offsets[current[selected]] + chosen[selected]
@@ -163,9 +179,17 @@ def replay_decision_logp_from_cpp_batch_trace(
             0.0,
         )
     ).sum(dim=-1)
-    chosen_energy = (
-        chosen_energy
-        + float(risk_penalty) * feasibility_risk[chosen_edge]
+    _, chosen_risk = model.feasibility_for_state(
+        output, chosen_edge, states[selected]
+    )
+    chosen_gate = model.risk_gate_for_state(
+        output, chosen_edge, states[selected]
+    )
+    chosen_energy = chosen_energy + (
+        float(risk_penalty)
+        * objective_scale
+        * chosen_risk.detach()
+        * chosen_gate
     )
     step_logp = (
         -float(beta) * chosen_energy
@@ -217,7 +241,7 @@ def _guidance_numpy(
         "multipliers": multipliers.detach().cpu().numpy(),
         "coupler_weights": output["coupler_weights"][0].detach().cpu().numpy(),
         "coupler_bias": output["coupler_bias"][0].detach().cpu().numpy(),
-        "edge_risk": output["feasibility_risk"].detach().cpu().numpy(),
+        "edge_risk": output["risk_guidance"].detach().cpu().numpy(),
         "risk_penalty": float(risk_penalty),
     }
 
@@ -236,7 +260,13 @@ def _neutral_guidance(decoder) -> dict:
             (channels, prism_decoder.LIVE_STATE_FEATURE_COUNT), dtype=np.float32
         ),
         "coupler_bias": np.zeros(channels, dtype=np.float32),
-        "edge_risk": np.zeros(decoder.metadata["edge_count"], dtype=np.float32),
+        "edge_risk": np.zeros(
+            (
+                decoder.metadata["edge_count"],
+                2 * (prism_decoder.LIVE_STATE_FEATURE_COUNT + 1),
+            ),
+            dtype=np.float32,
+        ),
         "risk_penalty": 0.0,
     }
 
@@ -685,6 +715,7 @@ def _dual_loss(step: OptionStep, output: dict) -> torch.Tensor:
 
 
 def _feasibility_loss(
+    model: ConstraintFieldNet,
     step: OptionStep,
     output: dict,
     pos_weight: Optional[torch.Tensor] = None,
@@ -700,8 +731,22 @@ def _feasibility_loss(
         return output["feasibility_logits"].sum() * 0.0
     if labels.shape != edges.shape:
         raise RuntimeError("feasibility labels are not aligned with edges")
+    offsets = torch.as_tensor(
+        step.trace["feasibility_offsets"], device=device
+    ).long()
+    states = torch.as_tensor(
+        step.trace["feasibility_live_state"], device=device
+    ).float()
+    if offsets.ndim != 1 or offsets.numel() != states.shape[0] + 1:
+        raise RuntimeError("feasibility offsets are not aligned with states")
+    if offsets.numel() == 0 or offsets[0] != 0 or offsets[-1] != edges.numel():
+        raise RuntimeError("feasibility offsets do not partition labels")
+    lengths = offsets[1:] - offsets[:-1]
+    if torch.any(lengths < 0):
+        raise RuntimeError("feasibility offsets must be nondecreasing")
+    label_states = torch.repeat_interleave(states, lengths, dim=0)
     target = labels
-    logits = output["feasibility_logits"][edges]
+    logits, _ = model.feasibility_for_state(output, edges, label_states)
     if pos_weight is None:
         pos_weight = _positive_class_weight(target)
     return F.binary_cross_entropy_with_logits(
@@ -762,6 +807,9 @@ def _detached_output(
         "residual",
         "additive",
         "feasibility_logits",
+        "feasibility_state_weights",
+        "risk_gate_logits",
+        "risk_gate_state_weights",
         "multipliers",
         "binding_logits",
         "coupler_weights",
@@ -938,6 +986,7 @@ def _step_loss(
 
     dual = _dual_loss(step, output)
     feasibility = _feasibility_loss(
+        model,
         step,
         output,
         None if class_weights is None else class_weights["feasibility"],
@@ -964,6 +1013,39 @@ def _step_loss(
         risk_labels = torch.as_tensor(
             step.trace["feasibility_risk_labels"], device=logp.device
         ).float()
+        risk_edges = torch.as_tensor(
+            step.trace["feasibility_edges"], device=logp.device
+        ).long()
+        risk_offsets = torch.as_tensor(
+            step.trace["feasibility_offsets"], device=logp.device
+        ).long()
+        risk_states = torch.as_tensor(
+            step.trace["feasibility_live_state"], device=logp.device
+        ).float()
+        if risk_labels.numel():
+            risk_lengths = risk_offsets[1:] - risk_offsets[:-1]
+            label_states = torch.repeat_interleave(
+                risk_states, risk_lengths, dim=0
+            )
+            _, observed_risk = model.feasibility_for_state(
+                output, risk_edges, label_states
+            )
+            observed_gate = model.risk_gate_for_state(
+                output, risk_edges, label_states
+            )
+            risk_energy_cap = (
+                float(step.risk_penalty)
+                * step.graph.objective_energy_scale.to(logp.device)
+                .reshape(-1)[0]
+            )
+            observed_risk_energy = (
+                risk_energy_cap * observed_risk * observed_gate
+            )
+        else:
+            observed_risk = risk_labels
+            observed_gate = risk_labels
+            observed_risk_energy = risk_labels
+            risk_energy_cap = 0.0
         screening_fast = float(
             step.trace.get("screening_fast_evaluations", 0)
         )
@@ -994,6 +1076,37 @@ def _step_loss(
             "feasibility_labels": float(risk_labels.numel()),
             "feasibility_positive_rate": (
                 risk_labels.mean().detach() if risk_labels.numel() else 0.0
+            ),
+            "feasibility_risk_mean": (
+                observed_risk.mean().detach()
+                if observed_risk.numel()
+                else 0.0
+            ),
+            "risk_gate_mean": (
+                observed_gate.mean().detach()
+                if observed_gate.numel()
+                else 0.0
+            ),
+            "risk_gate_closed_fraction": (
+                (observed_gate < 0.1).float().mean().detach()
+                if observed_gate.numel()
+                else 0.0
+            ),
+            "risk_gate_open_fraction": (
+                (observed_gate > 0.9).float().mean().detach()
+                if observed_gate.numel()
+                else 0.0
+            ),
+            "risk_energy_cap": risk_energy_cap,
+            "risk_energy_mean": (
+                observed_risk_energy.mean().detach()
+                if observed_risk_energy.numel()
+                else 0.0
+            ),
+            "risk_energy_max": (
+                observed_risk_energy.max().detach()
+                if observed_risk_energy.numel()
+                else 0.0
             ),
             "screening_fast_evaluations": screening_fast,
             "screening_fallback_evaluations": screening_fallback,
@@ -1927,7 +2040,13 @@ def parse_args() -> argparse.Namespace:
         "--feasibility-lookahead-depth", type=int, default=2
     )
     parser.add_argument(
-        "--feasibility-risk-penalty", type=float, default=10.0
+        "--feasibility-risk-penalty",
+        type=float,
+        default=1.0,
+        help=(
+            "Maximum state-conditioned feasibility-risk contribution in "
+            "objective-scale units (default: 1.0)"
+        ),
     )
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--grad-clip", type=float, default=1.0)
@@ -2037,13 +2156,13 @@ def main() -> None:
         )
         if upgraded:
             logger.warning(
-                "resumed a pre-critic checkpoint; initialized the refresh "
-                "value head at zero"
+                "resumed a legacy checkpoint; initialized missing value/risk "
+                "heads at neutral defaults"
             )
         if added_optimizer_parameters:
             logger.warning(
                 "initialized optimizer state for "
-                f"{added_optimizer_parameters} new critic parameters"
+                f"{added_optimizer_parameters} newly appended parameters"
             )
         start_epoch = int(checkpoint["epoch"]) + 1
         global_step = int(

@@ -15,6 +15,7 @@ from net import (  # noqa: E402
     FIELD_CHANNEL_COUNT,
     LIVE_STATE_FEATURE_COUNT,
     NODE_FEATURE_COUNT,
+    RISK_GUIDANCE_FEATURE_COUNT,
     ConstraintFieldNet,
     build_decoder_data,
     decode_iteration,
@@ -58,6 +59,14 @@ def test_constraint_field_net_uses_normalized_decoder_contract() -> None:
     assert output["binding_logits"].shape == (1, channel_count)
     assert output["feasibility_logits"].shape == (edge_count,)
     assert output["feasibility_risk"].shape == (edge_count,)
+    assert output["feasibility_state_weights"].shape == (
+        edge_count,
+        prism_decoder.LIVE_STATE_FEATURE_COUNT,
+    )
+    assert output["risk_guidance"].shape == (
+        edge_count,
+        prism_decoder.RISK_GUIDANCE_FEATURE_COUNT,
+    )
     assert output["value_context"].shape == (1, 16)
     assert model.value(output, 0.5).shape == (1,)
     assert torch.equal(model.value(output, 0.5), torch.zeros(1))
@@ -71,12 +80,19 @@ def test_constraint_field_net_uses_normalized_decoder_contract() -> None:
     assert torch.all(output["multipliers"][0, ~active] == 0.0)
 
 
-def test_legacy_checkpoint_keeps_zero_initialized_value_head() -> None:
+def test_legacy_checkpoint_keeps_new_heads_neutral() -> None:
     original = ConstraintFieldNet(depth=1, units=8)
     legacy = {
         key: value
         for key, value in original.state_dict().items()
-        if not key.startswith("value_head.")
+        if not key.startswith(
+            (
+                "value_head.",
+                "feasibility_state_head.",
+                "risk_gate_head.",
+                "risk_gate_state_head.",
+            )
+        )
     }
     restored = ConstraintFieldNet(depth=1, units=8)
 
@@ -91,6 +107,14 @@ def test_legacy_checkpoint_keeps_zero_initialized_value_head() -> None:
         restored.value_head.bias,
         torch.zeros_like(restored.value_head.bias),
     )
+    for prefix in (
+        "feasibility_state_head.",
+        "risk_gate_head.",
+        "risk_gate_state_head.",
+    ):
+        for name, parameter in restored.named_parameters():
+            if name.startswith(prefix):
+                assert torch.equal(parameter, torch.zeros_like(parameter))
 
 
 def test_python_dimensions_come_from_cpp_extension() -> None:
@@ -98,6 +122,33 @@ def test_python_dimensions_come_from_cpp_extension() -> None:
     assert LIVE_STATE_FEATURE_COUNT == prism_decoder.LIVE_STATE_FEATURE_COUNT
     assert NODE_FEATURE_COUNT == prism_decoder.NODE_FEATURE_COUNT
     assert EDGE_FEATURE_COUNT == prism_decoder.EDGE_FEATURE_COUNT
+    assert RISK_GUIDANCE_FEATURE_COUNT == prism_decoder.RISK_GUIDANCE_FEATURE_COUNT
+
+
+def test_risk_energy_scale_tracks_objective_units() -> None:
+    coordinates = np.array(
+        [[0.0, 0.0], [0.2, 0.1], [0.7, 0.4], [1.0, 0.9]],
+        dtype=np.float32,
+    )
+
+    def metadata(scale: float) -> dict:
+        scaled = coordinates * scale
+        distance = np.linalg.norm(
+            scaled[:, None] - scaled[None, :], axis=-1
+        ).astype(np.float32)
+        decoder = prism_decoder.Decoder(
+            {"name": "tsp", "coordinates": scaled, "distance": distance}
+        )
+        return decoder.metadata
+
+    unit = metadata(1.0)
+    rescaled = metadata(100.0)
+    assert rescaled["objective_energy_scale"] == pytest.approx(
+        100.0 * unit["objective_energy_scale"], rel=1e-5
+    )
+    assert rescaled["objective_scale"] == pytest.approx(
+        unit["objective_scale"], rel=1e-5
+    )
 
 
 def test_coupler_supports_states_from_multiple_graphs() -> None:
@@ -306,13 +357,21 @@ def test_cpp_trace_replays_exact_state_dependent_policy() -> None:
 
     graph = build_decoder_data(decoder)
     with torch.no_grad():
+        model.feasibility_state_head.bias.copy_(
+            torch.linspace(-0.4, 0.4, LIVE_STATE_FEATURE_COUNT)
+        )
+        model.risk_gate_head.bias.fill_(0.3)
+        model.risk_gate_state_head.bias.copy_(
+            torch.linspace(0.2, -0.2, LIVE_STATE_FEATURE_COUNT)
+        )
+    with torch.no_grad():
         output = model(graph)
     traced = decoder.sample_traced(
         edge_field=output["residual"].detach().numpy(),
         multipliers=output["multipliers"][0].detach().numpy(),
         coupler_weights=output["coupler_weights"][0].detach().numpy(),
         coupler_bias=output["coupler_bias"][0].detach().numpy(),
-        edge_risk=output["feasibility_risk"].detach().numpy(),
+        edge_risk=output["risk_guidance"].detach().numpy(),
         risk_penalty=3.0,
     )
     trace = traced["trace"]
@@ -345,6 +404,12 @@ def test_cpp_trace_replays_exact_state_dependent_policy() -> None:
     assert np.all(decisions.detach().numpy() >= 0)
     assert trace["live_state"].shape[1] == prism_decoder.LIVE_STATE_FEATURE_COUNT
     assert np.all((trace["live_state"] >= 0.0) & (trace["live_state"] <= 1.0))
+    assert trace["feasibility_offsets"][0] == 0
+    assert trace["feasibility_offsets"][-1] == trace["feasibility_edges"].size
+    assert trace["feasibility_live_state"].shape == (
+        trace["feasibility_offsets"].size - 1,
+        prism_decoder.LIVE_STATE_FEATURE_COUNT,
+    )
     assert trace["screened_edges"].size > 0
     assert trace["screened_resource_delta"].shape == (
         trace["screened_edges"].shape[0],

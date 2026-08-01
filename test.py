@@ -243,7 +243,7 @@ def main() -> int:
                     seed=args.seed + index * args.val_size + instance_index,
                     search_iterations=args.iterations,
                     feasibility_lookahead_depth=2,
-                    feasibility_risk_penalty=10.0,
+                    feasibility_risk_penalty=1.0,
                     device=args.device,
                     static_field=args.static_field,
                 )
