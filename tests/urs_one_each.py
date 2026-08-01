@@ -45,7 +45,7 @@ def assert_normalized_model_inputs(solver) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--ants", type=int)
+    parser.add_argument("--rollouts", type=int)
     parser.add_argument("--iterations", type=int, default=2)
     parser.add_argument(
         "--threads", type=int, default=prism_decoder.get_available_threads()
@@ -53,7 +53,6 @@ def main() -> int:
     parser.add_argument(
         "--guidance", choices=("classical", "field"), default="classical"
     )
-    parser.add_argument("--no-pheromone", action="store_true")
     parser.add_argument("--verify-incremental-srr", action="store_true")
     parser.add_argument("--dataset-dir", type=Path, default=DEFAULT_DATASET_DIR)
     args = parser.parse_args()
@@ -63,7 +62,7 @@ def main() -> int:
     logging.disable(logging.CRITICAL)
     finder = DatasetFinder(args.dataset_dir)
     prism_decoder.set_num_threads(args.threads)
-    ants = args.ants if args.ants is not None else args.threads
+    rollouts = args.rollouts if args.rollouts is not None else args.threads
     failures = []
     perturbed = 0
     improved = 0
@@ -95,10 +94,9 @@ def main() -> int:
                 solver_problem(name, data),
                 search_config={
                     "classical_behavior": args.guidance == "classical",
-                    "use_pheromone": not args.no_pheromone,
                     "verify_incremental_srr": args.verify_incremental_srr,
                 },
-                n_ants=ants,
+                n_rollouts=rollouts,
             )
             solver.seed(20260727 + index)
             assert_normalized_model_inputs(solver)
@@ -114,8 +112,11 @@ def main() -> int:
                     dtype=np.float32,
                 )
                 multipliers = np.zeros(
-                    len(prism_decoder.FIELD_CHANNEL_NAMES), dtype=np.float32
+                    prism_decoder.MULTIPLIER_COUNT, dtype=np.float32
                 )
+                # Keep the objective weight (final slot) at 1 so the neutral
+                # field reduces to the plain objective edge cost.
+                multipliers[prism_decoder.FIELD_CHANNEL_COUNT] = 1.0
                 return {"edge_field": field, "multipliers": multipliers}
 
             bootstrap = solver.solve(1, **guidance())
@@ -187,7 +188,6 @@ def main() -> int:
     print(
         "URS_ONE_EACH",
         f"guidance={args.guidance}",
-        f"pheromone={'off' if args.no_pheromone else 'on'}",
         f"passed={len(variants) - len(failures)}",
         f"failed={len(failures)}",
         f"perturbed={perturbed}",

@@ -344,8 +344,6 @@ SearchConfig parse_search_config(const py::dict &data) {
   config.use_srr = value_or<bool>(data, "use_srr", config.use_srr);
   config.classical_behavior =
       value_or<bool>(data, "classical_behavior", config.classical_behavior);
-  config.use_pheromone =
-      value_or<bool>(data, "use_pheromone", config.use_pheromone);
   config.verify_screening_resources = value_or<bool>(
       data, "verify_screening_resources",
       config.verify_screening_resources);
@@ -442,9 +440,9 @@ void parse_guidance(py::object edge_field, py::object edge_additive,
         py::array_t<float, py::array::c_style | py::array::forcecast>>();
     const py::buffer_info multiplier_buffer = multiplier_storage.request();
     if (multiplier_buffer.ndim != 1 ||
-        multiplier_buffer.shape[0] != prism::FIELD_CHANNEL_COUNT) {
+        multiplier_buffer.shape[0] != prism::MULTIPLIER_COUNT) {
       throw std::invalid_argument(
-          "multipliers must have shape (FIELD_CHANNEL_COUNT,)");
+          "multipliers must have shape (MULTIPLIER_COUNT,)");
     }
     multiplier_values = static_cast<const float *>(multiplier_buffer.ptr);
   }
@@ -452,10 +450,10 @@ void parse_guidance(py::object edge_field, py::object edge_additive,
     coupler_weight_storage = coupler_weights.cast<
         py::array_t<float, py::array::c_style | py::array::forcecast>>();
     const py::buffer_info buffer = coupler_weight_storage.request();
-    if (buffer.ndim != 2 || buffer.shape[0] != prism::FIELD_CHANNEL_COUNT ||
+    if (buffer.ndim != 2 || buffer.shape[0] != prism::MULTIPLIER_COUNT ||
         buffer.shape[1] != prism::LIVE_STATE_FEATURE_COUNT) {
       throw std::invalid_argument(
-          "coupler_weights must have shape (FIELD_CHANNEL_COUNT, "
+          "coupler_weights must have shape (MULTIPLIER_COUNT, "
           "LIVE_STATE_FEATURE_COUNT)");
     }
     coupler_weight_values = static_cast<const float *>(buffer.ptr);
@@ -464,9 +462,9 @@ void parse_guidance(py::object edge_field, py::object edge_additive,
     coupler_bias_storage = coupler_bias.cast<
         py::array_t<float, py::array::c_style | py::array::forcecast>>();
     const py::buffer_info buffer = coupler_bias_storage.request();
-    if (buffer.ndim != 1 || buffer.shape[0] != prism::FIELD_CHANNEL_COUNT) {
+    if (buffer.ndim != 1 || buffer.shape[0] != prism::MULTIPLIER_COUNT) {
       throw std::invalid_argument(
-          "coupler_bias must have shape (FIELD_CHANNEL_COUNT,)");
+          "coupler_bias must have shape (MULTIPLIER_COUNT,)");
     }
     coupler_bias_values = static_cast<const float *>(buffer.ptr);
   }
@@ -537,12 +535,10 @@ py::dict trace_to_dict(const DecisionTrace &trace) {
 class PyDecoder {
 public:
   PyDecoder(py::dict problem, py::dict candidate_config,
-               py::dict search_config, int32_t n_ants, float decay, float alpha,
-               float beta, float p_best)
+               py::dict search_config, int32_t n_rollouts, float beta)
       : solver_(parse_problem(problem),
                 parse_candidate_config(candidate_config),
-                parse_search_config(search_config), n_ants, decay, alpha, beta,
-                p_best) {}
+                parse_search_config(search_config), n_rollouts, beta) {}
 
   py::list sample(py::object edge_field, py::object edge_additive,
                   py::object multipliers,
@@ -815,17 +811,12 @@ public:
         search.feasibility_lookahead_depth;
     search_values["use_srr"] = search.use_srr;
     search_values["classical_behavior"] = search.classical_behavior;
-    search_values["use_pheromone"] = search.use_pheromone;
     search_values["verify_screening_resources"] =
         search.verify_screening_resources;
     search_values["verify_incremental_srr"] =
         search.verify_incremental_srr;
     result["search"] = search_values;
     return result;
-  }
-
-  py::array_t<float> pheromone() const {
-    return vector_copy<float>(solver_.pheromone(), {solver_.edge_count()});
   }
 
   py::array_t<float> heuristic() const {
@@ -902,7 +893,6 @@ public:
   uint64_t graph_version() const { return solver_.graph_version(); }
 
   void seed(uint64_t value) { solver_.seed(value); }
-  void reset_pheromone(float value) { solver_.reset_pheromone(value); }
   void set_incumbent(
       py::array_t<int32_t, py::array::c_style | py::array::forcecast> route) {
     const py::buffer_info buffer = route.request();
@@ -935,12 +925,10 @@ PYBIND11_MODULE(prism_decoder, module) {
   module.def("get_available_threads", []() { return omp_get_num_procs(); });
 
   py::class_<PyDecoder>(module, "Decoder")
-      .def(py::init<py::dict, py::dict, py::dict, int32_t, float, float, float,
-                    float>(),
+      .def(py::init<py::dict, py::dict, py::dict, int32_t, float>(),
            py::arg("problem"), py::arg("candidate_config") = py::dict(),
-           py::arg("search_config") = py::dict(), py::arg("n_ants") = 20,
-           py::arg("decay") = 0.9f, py::arg("alpha") = 1.0f,
-           py::arg("beta") = 2.0f, py::arg("p_best") = 0.05f)
+           py::arg("search_config") = py::dict(), py::arg("n_rollouts") = 20,
+           py::arg("beta") = 2.0f)
       .def("seed", &PyDecoder::seed, py::arg("value"))
       .def("sample", &PyDecoder::sample,
            py::arg("edge_field") = py::none(),
@@ -979,10 +967,7 @@ PYBIND11_MODULE(prism_decoder, module) {
            py::arg("route"))
       .def("set_incumbent", &PyDecoder::set_incumbent, py::arg("route"))
       .def("mask", &PyDecoder::mask, py::arg("prefix"))
-      .def("reset_pheromone", &PyDecoder::reset_pheromone,
-           py::arg("value") = 1.0f)
       .def_property_readonly("metadata", &PyDecoder::metadata)
-      .def_property_readonly("pheromone", &PyDecoder::pheromone)
       .def_property_readonly("heuristic", &PyDecoder::heuristic)
       .def_property_readonly("proximity", &PyDecoder::proximity)
       .def_property_readonly("edge_features", &PyDecoder::edge_features)
@@ -1007,4 +992,5 @@ PYBIND11_MODULE(prism_decoder, module) {
   module.attr("EDGE_FEATURE_COUNT") = prism::EDGE_FEATURE_COUNT;
   module.attr("FIELD_CHANNEL_COUNT") = prism::FIELD_CHANNEL_COUNT;
   module.attr("LIVE_STATE_FEATURE_COUNT") = prism::LIVE_STATE_FEATURE_COUNT;
+  module.attr("MULTIPLIER_COUNT") = prism::MULTIPLIER_COUNT;
 }

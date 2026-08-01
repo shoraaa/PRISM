@@ -24,7 +24,7 @@ def test_tsp_perturbation_and_srr_improve_incumbent() -> None:
     coordinates, distance = euclidean_problem(60, 7)
     solver = prism_decoder.Decoder(
         {"name": "tsp", "coordinates": coordinates, "distance": distance},
-        n_ants=8,
+        n_rollouts=8,
     )
     solver.seed(20260727)
 
@@ -54,7 +54,7 @@ def test_cvrp_uses_same_perturbation_backend() -> None:
             "demand": demand,
             "capacity": 0.6,
         },
-        n_ants=8,
+        n_rollouts=8,
     )
     solver.seed(20260728)
 
@@ -71,7 +71,7 @@ def test_cvrp_uses_same_perturbation_backend() -> None:
 
 def test_capacity_free_vrptw_uses_closed_multi_route_semantics() -> None:
     problem = generated_problem("vrptw", 20)
-    solver = prism_decoder.Decoder(problem, n_ants=2)
+    solver = prism_decoder.Decoder(problem, n_rollouts=2)
     solver.seed(20260731)
 
     solution = solver.solve(2)
@@ -93,7 +93,7 @@ def test_search_configuration_is_exposed() -> None:
             "max_perturb_attempts": 20,
             "or_opt_max_segment": 2,
         },
-        n_ants=2,
+        n_rollouts=2,
     )
 
     assert solver.metadata["max_candidates"] == 12
@@ -104,7 +104,6 @@ def test_search_configuration_is_exposed() -> None:
         "feasibility_lookahead_depth": 2,
         "use_srr": True,
         "classical_behavior": True,
-        "use_pheromone": True,
         "verify_screening_resources": False,
         "verify_incremental_srr": False,
     }
@@ -122,11 +121,10 @@ def test_o1_screening_resources_match_full_evaluation_and_search(
         solver = prism_decoder.Decoder(
             problem,
             search_config={
-                "use_pheromone": False,
                 "verify_screening_resources": verify,
                 "verify_incremental_srr": verify,
             },
-            n_ants=4,
+            n_rollouts=4,
         )
         solver.seed(8601)
         solver.solve(1)
@@ -160,7 +158,7 @@ def test_classical_behavior_flag_matches_default() -> None:
         solver = prism_decoder.Decoder(
             {"name": "tsp", "coordinates": coordinates, "distance": distance},
             search_config=search_config or {},
-            n_ants=8,
+            n_rollouts=8,
         )
         solver.seed(818)
         return solver.solve(1)
@@ -177,7 +175,7 @@ def test_typed_field_mode_is_exposed_and_feasible() -> None:
     solver = prism_decoder.Decoder(
         {"name": "tsp", "coordinates": coordinates, "distance": distance},
         search_config={"classical_behavior": False},
-        n_ants=8,
+        n_rollouts=8,
     )
     channels = list(prism_decoder.FIELD_CHANNEL_NAMES)
     assert channels == [
@@ -201,7 +199,8 @@ def test_typed_field_mode_is_exposed_and_feasible() -> None:
     field = np.ones(
         (solver.metadata["edge_count"], len(channels)), dtype=np.float32
     )
-    multipliers = np.zeros(len(channels), dtype=np.float32)
+    multipliers = np.zeros(prism_decoder.MULTIPLIER_COUNT, dtype=np.float32)
+    multipliers[prism_decoder.FIELD_CHANNEL_COUNT] = 1.0
     version = solver.graph_version
     result = solver.solve(2, edge_field=field, multipliers=multipliers)
 
@@ -226,7 +225,7 @@ def test_all_decoder_gnn_inputs_are_normalized() -> None:
             "tw_start": tw_start,
             "tw_end": tw_end,
         },
-        n_ants=4,
+        n_rollouts=4,
     )
     for values, width in (
         (solver.node_features, prism_decoder.NODE_FEATURE_COUNT),
@@ -266,7 +265,7 @@ def test_incumbent_live_state_matches_transition_scales_and_timing() -> None:
             "tw_end": np.full(4, 30.0, dtype=np.float32),
             "service_time": service_time,
         },
-        n_ants=1,
+        n_rollouts=1,
     )
 
     solver.set_incumbent(np.array([0, 1, 2, 3, 0], dtype=np.int32))
@@ -297,7 +296,7 @@ def test_incumbent_tour_state_uses_tour_limit() -> None:
                 [0.0, 2.0, 2.0, 2.0], dtype=np.float32
             ),
         },
-        n_ants=1,
+        n_rollouts=1,
     )
 
     solver.set_incumbent(np.array([0, 1, 2, 3, 0], dtype=np.int32))
@@ -317,7 +316,7 @@ def test_resource_features_use_exported_cpp_scales() -> None:
             "demand": np.array([0.0, 1.2, 1.2], dtype=np.float32),
             "capacity": 2.0,
         },
-        n_ants=1,
+        n_rollouts=1,
     )
 
     scales = solver.resource_scales
@@ -346,7 +345,7 @@ def test_resource_evaluator_returns_aligned_labels() -> None:
             "demand": demand,
             "capacity": 0.5,
         },
-        n_ants=4,
+        n_rollouts=4,
     )
     solver.seed(2222)
     solution = solver.solve(1)
@@ -368,7 +367,7 @@ def test_guidance_validation_and_inactive_channel_masking() -> None:
         solver = prism_decoder.Decoder(
             {"name": "tsp", "coordinates": coordinates, "distance": distance},
             search_config={"classical_behavior": False},
-            n_ants=4,
+            n_rollouts=4,
         )
         solver.seed(919)
         return solver
@@ -393,7 +392,9 @@ def test_guidance_validation_and_inactive_channel_masking() -> None:
         make_solver().solve(
             1,
             edge_field=ones,
-            multipliers=-np.ones(shape[1], dtype=np.float32),
+            multipliers=-np.ones(
+                prism_decoder.MULTIPLIER_COUNT, dtype=np.float32
+            ),
         )
 
     classical = prism_decoder.Decoder(
@@ -422,7 +423,7 @@ def test_typed_field_changes_greedy_construction() -> None:
                 "capacity": 1.0,
             },
             search_config={"classical_behavior": False},
-            n_ants=1,
+            n_rollouts=1,
         )
         solver.seed(1001)
         return solver
@@ -432,10 +433,14 @@ def test_typed_field_changes_greedy_construction() -> None:
         baseline_solver.metadata["edge_count"],
         len(prism_decoder.FIELD_CHANNEL_NAMES),
     )
+    # High resource-field intensities with a unit objective weight (final slot),
+    # so the field dominates the plain objective as this test intends.
+    multipliers = np.full(prism_decoder.MULTIPLIER_COUNT, 100.0, dtype=np.float32)
+    multipliers[prism_decoder.FIELD_CHANNEL_COUNT] = 1.0
     baseline = baseline_solver.solve(
         1,
         edge_field=np.ones(shape, np.float32),
-        multipliers=np.full(shape[1], 100.0, dtype=np.float32),
+        multipliers=multipliers,
     )
     start, original_next = baseline["route"][:2]
 
@@ -451,7 +456,7 @@ def test_typed_field_changes_greedy_construction() -> None:
     guided = guided_solver.solve(
         1,
         edge_field=field,
-        multipliers=np.full(shape[1], 100.0, dtype=np.float32),
+        multipliers=multipliers,
     )
 
     assert guided["route"][0] == start
@@ -473,7 +478,7 @@ def test_additive_field_guides_zero_pressure_edge() -> None:
                 "capacity": 1.0,
             },
             search_config={"classical_behavior": False},
-            n_ants=1,
+            n_rollouts=1,
         )
 
     baseline_solver = make_solver()
@@ -483,8 +488,9 @@ def test_additive_field_guides_zero_pressure_edge() -> None:
     )
     field = np.ones(shape, dtype=np.float32)
     additive = np.zeros(shape, dtype=np.float32)
-    multipliers = np.zeros(shape[1], dtype=np.float32)
+    multipliers = np.zeros(prism_decoder.MULTIPLIER_COUNT, dtype=np.float32)
     multipliers[0] = 100.0
+    multipliers[prism_decoder.FIELD_CHANNEL_COUNT] = 1.0
     baseline = baseline_solver.sample_greedy(
         edge_field=field,
         edge_additive=additive,
@@ -533,19 +539,20 @@ def test_lookahead_risk_labels_and_avoids_time_window_dead_end() -> None:
             problem,
             search_config={
                 "classical_behavior": False,
-                "use_pheromone": False,
                 "feasibility_lookahead_depth": 1,
             },
-            n_ants=1,
+            n_rollouts=1,
         )
         solver.seed(123)
         return solver
 
     solver = make_solver()
     shape = (solver.metadata["edge_count"], prism_decoder.FIELD_CHANNEL_COUNT)
+    multipliers = np.zeros(prism_decoder.MULTIPLIER_COUNT, dtype=np.float32)
+    multipliers[prism_decoder.FIELD_CHANNEL_COUNT] = 1.0
     guidance = {
         "edge_field": np.ones(shape, dtype=np.float32),
-        "multipliers": np.zeros(shape[1], dtype=np.float32),
+        "multipliers": multipliers,
     }
     traced = solver.sample_traced(**guidance)["trace"]
     first_edges = traced["feasibility_edges"][:2]
@@ -573,28 +580,6 @@ def test_lookahead_risk_labels_and_avoids_time_window_dead_end() -> None:
     assert np.array_equal(guided["route"], np.array([0, 2, 1]))
 
 
-def test_pheromone_ablation_skips_all_updates() -> None:
-    coordinates, distance = euclidean_problem(40, 106)
-
-    def run(use_pheromone: bool) -> tuple[dict, np.ndarray]:
-        solver = prism_decoder.Decoder(
-            {"name": "tsp", "coordinates": coordinates, "distance": distance},
-            search_config={"use_pheromone": use_pheromone},
-            n_ants=8,
-        )
-        solver.seed(1101)
-        result = solver.solve(2)
-        return result, solver.pheromone
-
-    enabled, enabled_pheromone = run(True)
-    disabled, disabled_pheromone = run(False)
-
-    assert enabled["feasible"]
-    assert disabled["feasible"]
-    assert not np.all(enabled_pheromone == 1.0)
-    assert np.all(disabled_pheromone == 1.0)
-
-
 def test_directed_srr_improves_atsp_without_reversal() -> None:
     rng = np.random.default_rng(33)
     size = 30
@@ -607,7 +592,7 @@ def test_directed_srr_improves_atsp_without_reversal() -> None:
         )
     solver = prism_decoder.Decoder(
         {"name": "atsp", "distance": distance},
-        n_ants=8,
+        n_rollouts=8,
     )
     solver.seed(77)
 
@@ -631,7 +616,7 @@ def test_optional_srr_can_insert_unserved_nodes() -> None:
             "prize": prize,
             "tour_limit": 3.0,
         },
-        n_ants=8,
+        n_rollouts=8,
     )
     solver.seed(88)
 
@@ -653,7 +638,7 @@ def test_static_ant_parallelism_is_deterministic() -> None:
         prism_decoder.set_num_threads(threads)
         solver = prism_decoder.Decoder(
             {"name": "tsp", "coordinates": coordinates, "distance": distance},
-            n_ants=8,
+            n_rollouts=8,
         )
         solver.seed(909)
         solver.solve(1)
@@ -676,7 +661,7 @@ def test_coordinate_backed_distance_matches_euclidean_evaluation() -> None:
         [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]], dtype=np.float32
     )
     solver = prism_decoder.Decoder(
-        {"name": "tsp", "coordinates": coordinates}, n_ants=1
+        {"name": "tsp", "coordinates": coordinates}, n_rollouts=1
     )
 
     solution = solver.evaluate(np.array([0, 1, 2], dtype=np.int32))
@@ -698,7 +683,7 @@ def test_large_coordinate_problem_keeps_sparse_candidate_storage() -> None:
             "capacity": 1.0,
         },
         candidate_config={"max_candidates": 64},
-        n_ants=1,
+        n_rollouts=1,
     )
 
     # Customers have at most K edges; the depot keeps its mandatory overlay.

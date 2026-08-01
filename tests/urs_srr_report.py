@@ -86,13 +86,12 @@ def group_rows(rows: list[dict], label: str, predicate) -> dict:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--ants", type=int)
+    parser.add_argument("--rollouts", type=int)
     parser.add_argument("--iterations", type=int, default=2)
     parser.add_argument(
         "--threads", type=int, default=prism_decoder.get_available_threads()
     )
     parser.add_argument("--disable-srr", action="store_true")
-    parser.add_argument("--no-pheromone", action="store_true")
     parser.add_argument("--csv", type=Path)
     parser.add_argument("--dataset-dir", type=Path, default=DEFAULT_DATASET_DIR)
     args = parser.parse_args()
@@ -102,7 +101,7 @@ def main() -> int:
     logging.disable(logging.CRITICAL)
     finder = DatasetFinder(args.dataset_dir)
     prism_decoder.set_num_threads(args.threads)
-    ants = args.ants if args.ants is not None else args.threads
+    rollouts = args.rollouts if args.rollouts is not None else args.threads
     rows = []
     started = time.perf_counter()
     for index, name in enumerate(BENCHMARK_VARIANTS):
@@ -118,9 +117,8 @@ def main() -> int:
             solver_problem(name, data),
             search_config={
                 "use_srr": not args.disable_srr,
-                "use_pheromone": not args.no_pheromone,
             },
-            n_ants=ants,
+            n_rollouts=rollouts,
         )
         solver.seed(20260727 + index)
         bootstrap = solver.solve(1)
@@ -158,7 +156,6 @@ def main() -> int:
             "open_route": metadata["open_route"],
             "pickup_delivery": "pd" in name,
             "optional": name in {"op", "aop"} or "pctsp" in name,
-            "use_pheromone": not args.no_pheromone,
         }
         rows.append(row)
 
@@ -177,7 +174,6 @@ def main() -> int:
     print(
         "URS_SRR_REPORT",
         f"mode={'perturb_only' if args.disable_srr else 'srr'}",
-        f"pheromone={'off' if args.no_pheromone else 'on'}",
         f"variants={len(rows)}",
         f"references={len(exact)}",
         f"improved={sum(row['improvement_pct'] > 0 for row in rows)}",

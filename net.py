@@ -142,14 +142,13 @@ def decode_iteration(decoder, model, device="cpu", risk_penalty=10.0):
     """Run one model refresh and one decoder iteration on the current graph."""
     graph = build_decoder_data(decoder, device=device)
     output = model(graph)
-    residual = output["residual"].detach().cpu().numpy()
+    scales = graph.resource_scales.unsqueeze(0)
+    edge_field = (output["residual"] * scales).detach().cpu().numpy()
     multipliers = output["multipliers"][0].detach().cpu().numpy()
     solution = decoder.solve(
         1,
-        edge_field=residual,
-        edge_additive=(
-            output["additive"] * graph.resource_scales.unsqueeze(0)
-        ).detach().cpu().numpy(),
+        edge_field=edge_field,
+        edge_additive=(output["additive"] * scales).detach().cpu().numpy(),
         multipliers=multipliers,
         coupler_weights=output["coupler_weights"][0].detach().cpu().numpy(),
         coupler_bias=output["coupler_bias"][0].detach().cpu().numpy(),
@@ -239,8 +238,16 @@ class ConstraintFieldNet(nn.Module):
         act_fn="silu",
         agg_fn="mean",
         grad_checkpointing=False,
+        gate_multipliers_by_binding=False,
     ):
         super().__init__()
+        # When False (default), the resource multipliers lambda_r are a plain
+        # softplus of the multiplier head, so RL gradients reach them directly
+        # from step 0. Gating them by the binding classifier makes the policy
+        # gradient vanish wherever the (initially untrained) binding head is
+        # unsure -- the chicken-and-egg that stalled field learning -- so it is
+        # off by default and kept only as an ablation.
+        self.gate_multipliers_by_binding = gate_multipliers_by_binding
         self.emb_net = EmbNet(
             depth=depth,
             feats=NODE_FEATURE_COUNT,
@@ -272,6 +279,13 @@ class ConstraintFieldNet(nn.Module):
         self.binding_head = nn.Linear(units, 1)
         self.coupler_head = nn.Linear(units, LIVE_STATE_FEATURE_COUNT)
         self.coupler_bias_head = nn.Linear(units, 1)
+        # Objective multiplier slot (w_obj): a learned, state-conditioned weight
+        # on the objective edge cost. It lets the objective enter the search
+        # energy through a learned coefficient instead of a hard unit term, and
+        # is appended as multiplier slot FIELD_CHANNEL_COUNT.
+        self.objective_multiplier_head = nn.Linear(units, 1)
+        self.objective_coupler_head = nn.Linear(units, LIVE_STATE_FEATURE_COUNT)
+        self.objective_coupler_bias_head = nn.Linear(units, 1)
         self.value_head = nn.Linear(units + 1, 1)
         nn.init.zeros_(self.field_head.weight)
         nn.init.zeros_(self.field_head.bias)
@@ -283,6 +297,15 @@ class ConstraintFieldNet(nn.Module):
         nn.init.zeros_(self.coupler_head.bias)
         nn.init.zeros_(self.coupler_bias_head.weight)
         nn.init.zeros_(self.coupler_bias_head.bias)
+        # w_obj initializes to 1.0: softplus(unit_softplus_shift) * 2*sigmoid(0),
+        # so the objective term reproduces the plain objective edge cost before
+        # search reward moves it.
+        nn.init.zeros_(self.objective_multiplier_head.weight)
+        nn.init.zeros_(self.objective_multiplier_head.bias)
+        nn.init.zeros_(self.objective_coupler_head.weight)
+        nn.init.zeros_(self.objective_coupler_head.bias)
+        nn.init.zeros_(self.objective_coupler_bias_head.weight)
+        nn.init.zeros_(self.objective_coupler_bias_head.bias)
         # A zero value is the neutral bootstrap for old checkpoints and makes
         # enabling temporal credit leave the field policy unchanged initially.
         nn.init.zeros_(self.value_head.weight)
@@ -444,7 +467,11 @@ class ConstraintFieldNet(nn.Module):
             raw_channels.append(raw)
             additive_channels.append(additive_channel)
         raw_residual = torch.stack(raw_channels, dim=1)
-        residual = F.softplus(raw_residual + self.unit_softplus_shift)
+        # The residual is now the direct per-edge resource field (the analytic
+        # pressure gate has been removed), so it initializes near zero like the
+        # additive term and learns its magnitude from search reward instead of
+        # scaling a hand-supplied pressure.
+        residual = F.softplus(raw_residual + self.additive_softplus_shift)
         additive = F.softplus(
             torch.stack(additive_channels, dim=1) + self.additive_softplus_shift
         )
@@ -453,20 +480,39 @@ class ConstraintFieldNet(nn.Module):
         ).squeeze(-1)
         feasibility_risk = torch.sigmoid(feasibility_logits)
         edge_active = active[edge_batch] if batched else active[0]
-        residual = residual * edge_active + (1.0 - edge_active)
+        residual = residual * edge_active
         additive = additive * edge_active
 
         projected_graph = self.graph_projection(graph_embedding)
         state = torch.tanh(projected_graph.unsqueeze(1) + tokens)
         graph_state = torch.tanh(projected_graph)
         binding_logits = self.binding_head(state).squeeze(-1)
-        multipliers = (
-            F.softplus(self.multiplier_head(state).squeeze(-1))
-            * torch.sigmoid(binding_logits)
-            * active
-        )
+        multipliers = F.softplus(self.multiplier_head(state).squeeze(-1))
+        if self.gate_multipliers_by_binding:
+            multipliers = multipliers * torch.sigmoid(binding_logits)
+        multipliers = multipliers * active
         coupler_weights = self.coupler_head(state) * active.unsqueeze(-1)
         coupler_bias = self.coupler_bias_head(state).squeeze(-1) * active
+        # Append the always-on objective multiplier slot (w_obj) so the guidance
+        # arrays carry MULTIPLIER_COUNT = FIELD_CHANNEL_COUNT + 1 entries. The
+        # objective weight is graph-level and is not gated by active channels.
+        objective_multiplier = F.softplus(
+            self.objective_multiplier_head(graph_state).squeeze(-1)
+            + self.unit_softplus_shift
+        )
+        objective_coupler_weights = self.objective_coupler_head(graph_state)
+        objective_coupler_bias = self.objective_coupler_bias_head(
+            graph_state
+        ).squeeze(-1)
+        multipliers = torch.cat(
+            (multipliers, objective_multiplier.unsqueeze(1)), dim=1
+        )
+        coupler_weights = torch.cat(
+            (coupler_weights, objective_coupler_weights.unsqueeze(1)), dim=1
+        )
+        coupler_bias = torch.cat(
+            (coupler_bias, objective_coupler_bias.unsqueeze(1)), dim=1
+        )
         return {
             "residual": residual,
             "additive": additive,
@@ -543,7 +589,16 @@ def load_constraint_field_state_dict(
     value head's zero initialization.
     """
     incompatible = model.load_state_dict(state_dict, strict=False)
-    allowed_missing = {"value_head.weight", "value_head.bias"}
+    allowed_missing = {
+        "value_head.weight",
+        "value_head.bias",
+        "objective_multiplier_head.weight",
+        "objective_multiplier_head.bias",
+        "objective_coupler_head.weight",
+        "objective_coupler_head.bias",
+        "objective_coupler_bias_head.weight",
+        "objective_coupler_bias_head.bias",
+    }
     missing = set(incompatible.missing_keys)
     unexpected = set(incompatible.unexpected_keys)
     if unexpected or missing - allowed_missing:

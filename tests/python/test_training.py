@@ -36,7 +36,8 @@ def _args() -> Namespace:
     return Namespace(
         candidates=64,
         val_size=1,
-        n_ants=2,
+        n_rollouts=2,
+        val_n_rollouts=None,
         beta=2.0,
         seed=404,
         device="cpu",
@@ -108,7 +109,7 @@ def test_event_driven_option_rollout_and_pretrain_update(
         for step in rollout.steps
     )
     transition_steps = [
-        step for step in rollout.steps if step.transition_ant is not None
+        step for step in rollout.steps if step.transition_rollout is not None
     ]
     assert len(transition_steps) == rollout.improvements
     assert any(step.value_target is not None for step in rollout.steps)
@@ -281,7 +282,7 @@ def test_refresh_gae_credits_only_the_transition_winner() -> None:
             transition_reward=1.0,
             old_value=0.2,
             transition_step=first_transition_step,
-            winner_ant=1,
+            winner_rollout=1,
         ),
         OptionOutcome(
             [second_step],
@@ -290,7 +291,7 @@ def test_refresh_gae_credits_only_the_transition_winner() -> None:
             transition_reward=3.0,
             old_value=0.4,
             transition_step=second_step,
-            winner_ant=0,
+            winner_rollout=0,
         ),
     ]
 
@@ -299,15 +300,15 @@ def test_refresh_gae_credits_only_the_transition_winner() -> None:
     assert second_step.temporal_advantage == pytest.approx(2.6)
     assert second_step.value_target == pytest.approx(3.0)
     assert first_transition_step.temporal_advantage == pytest.approx(1.42)
-    assert first_transition_step.transition_ant == 1
+    assert first_transition_step.transition_rollout == 1
     assert first_value_step.value_target == pytest.approx(1.62)
-    assert not hasattr(first_value_step, "transition_ant")
+    assert not hasattr(first_value_step, "transition_rollout")
 
 
 def test_winner_temporal_advantage_is_non_cancelling_pomo_contrast() -> None:
     advantage = _winner_temporal_advantage(
-        ant_count=4,
-        winner_ant=2,
+        rollout_count=4,
+        winner_rollout=2,
         advantage=3.0,
         scale=1.0,
         device=torch.device("cpu"),
@@ -528,6 +529,7 @@ def test_validation_size_defaults_to_eight_instances(monkeypatch) -> None:
     args = parse_args()
 
     assert args.val_size == 8
+    assert args.val_n_rollouts is None
     assert args.val_seen is None
     assert args.val_heldout == 16
     assert args.allow_missing_validation is False
@@ -535,6 +537,58 @@ def test_validation_size_defaults_to_eight_instances(monkeypatch) -> None:
     assert args.gae_lambda == pytest.approx(1.0)
     assert args.temporal_credit_weight == pytest.approx(0.1)
     assert args.value_loss_weight == pytest.approx(0.0)
+
+
+@pytest.mark.parametrize(
+    ("val_n_rollouts", "expected_rollouts"), [(None, 3), (7, 7)]
+)
+def test_validation_rollouts_can_override_training_rollouts(
+    monkeypatch, val_n_rollouts, expected_rollouts
+) -> None:
+    args = _args()
+    args.n_rollouts = 3
+    args.val_n_rollouts = val_n_rollouts
+    observed_rollouts = []
+
+    def fake_infer(_model, _problem, inference_args):
+        observed_rollouts.append(inference_args.n_rollouts)
+        return (
+            1.0,
+            {
+                "objective": 1.0,
+                "direction": "minimize",
+                "feasible": True,
+            },
+            {},
+        )
+
+    monkeypatch.setattr("train.infer_instance", fake_infer)
+    dataset = [
+        {
+            "variant": "tsp",
+            "split": "seen",
+            "problem": {"name": "tsp"},
+            "reference": None,
+        }
+    ]
+
+    validation(None, dataset, args)
+
+    assert observed_rollouts == [expected_rollouts]
+    assert args.n_rollouts == 3
+
+
+def test_validation_rollout_cli_override_is_parsed(monkeypatch) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["train.py", "--n-rollouts", "3", "--val-n-rollouts", "7"],
+    )
+
+    args = parse_args()
+
+    assert args.n_rollouts == 3
+    assert args.val_n_rollouts == 7
 
 
 def test_pretraining_hyperparameters_are_configurable(monkeypatch) -> None:
@@ -700,7 +754,13 @@ def test_validation_rank_is_feasibility_and_coverage_first() -> None:
         "macro_score": 2.0,
     }
 
-    assert _validation_rank({**complete, "macro_score": 3.0}, 5.0) < (
+    # Gap-to-oracle is the primary quality metric: a lower gap wins even when a
+    # higher baseline improvement (macro_score) would have favored the other.
+    assert _validation_rank({**complete, "macro_score": 3.0}, 5.0) > (
+        _validation_rank(complete, 4.0)
+    )
+    # Baseline improvement only breaks ties when the gap is equal.
+    assert _validation_rank({**complete, "macro_score": 3.0}, 4.0) < (
         _validation_rank(complete, 4.0)
     )
     assert _validation_rank(

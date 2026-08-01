@@ -41,7 +41,7 @@ def test_constraint_field_net_uses_normalized_decoder_contract() -> None:
             "demand": demand,
             "capacity": 0.6,
         },
-        n_ants=4,
+        n_rollouts=4,
     )
     decoder.seed(3001)
     decoder.solve(1)
@@ -54,7 +54,7 @@ def test_constraint_field_net_uses_normalized_decoder_contract() -> None:
     edge_count = decoder.metadata["edge_count"]
     channel_count = prism_decoder.FIELD_CHANNEL_COUNT
     assert output["residual"].shape == (edge_count, channel_count)
-    assert output["multipliers"].shape == (1, channel_count)
+    assert output["multipliers"].shape == (1, prism_decoder.MULTIPLIER_COUNT)
     assert output["binding_logits"].shape == (1, channel_count)
     assert output["feasibility_logits"].shape == (edge_count,)
     assert output["feasibility_risk"].shape == (edge_count,)
@@ -65,10 +65,15 @@ def test_constraint_field_net_uses_normalized_decoder_contract() -> None:
         (output["feasibility_risk"] >= 0.0)
         & (output["feasibility_risk"] <= 1.0)
     )
-    assert torch.allclose(output["residual"], torch.ones_like(output["residual"]))
-    assert torch.all(output["multipliers"] >= 0.0)
+    # The residual is now the direct per-edge field (no pressure gate): it is
+    # non-negative and exactly zero on inactive channels.
     active = torch.as_tensor(decoder.metadata["field_channel_mask"]).bool()
-    assert torch.all(output["multipliers"][0, ~active] == 0.0)
+    assert torch.all(output["residual"] >= 0.0)
+    assert torch.all(output["residual"][:, ~active] == 0.0)
+    assert torch.all(output["multipliers"] >= 0.0)
+    # The objective weight slot (final) is always on; field channels are gated.
+    field_multipliers = output["multipliers"][0, :channel_count]
+    assert torch.all(field_multipliers[~active] == 0.0)
 
 
 def test_legacy_checkpoint_keeps_zero_initialized_value_head() -> None:
@@ -128,7 +133,7 @@ def test_constraint_field_net_rejects_unnormalized_inputs() -> None:
     ).astype(np.float32)
     decoder = prism_decoder.Decoder(
         {"name": "tsp", "coordinates": coordinates, "distance": distance},
-        n_ants=1,
+        n_rollouts=1,
     )
     data = build_decoder_data(decoder)
     data.edge_attr[0, 0] = 1.01
@@ -147,7 +152,7 @@ def test_objective_conditioning_reaches_descriptor_and_field() -> None:
 
     distance_problem = prism_decoder.Decoder(
         {"name": "tsp", "coordinates": coordinates, "distance": distance},
-        n_ants=1,
+        n_rollouts=1,
     )
     prize_problem = prism_decoder.Decoder(
         {
@@ -157,7 +162,7 @@ def test_objective_conditioning_reaches_descriptor_and_field() -> None:
             "prize": prize,
             "tour_limit": 4.0,
         },
-        n_ants=1,
+        n_rollouts=1,
     )
 
     distance_data = build_decoder_data(distance_problem)
@@ -188,10 +193,10 @@ def test_depot_conditioning_reaches_descriptor_and_field() -> None:
     import problem_data
 
     single = prism_decoder.Decoder(
-        problem_data.generated_problem("ocvrp", 16), n_ants=1
+        problem_data.generated_problem("ocvrp", 16), n_rollouts=1
     )
     multi = prism_decoder.Decoder(
-        problem_data.generated_problem("mdocvrp", 16), n_ants=1
+        problem_data.generated_problem("mdocvrp", 16), n_rollouts=1
     )
     single_data = build_decoder_data(single)
     multi_data = build_decoder_data(multi)
@@ -229,7 +234,7 @@ def test_resource_attention_handles_no_active_constraint_tokens() -> None:
     ).astype(np.float32)
     decoder = prism_decoder.Decoder(
         {"name": "tsp", "coordinates": coordinates, "distance": distance},
-        n_ants=1,
+        n_rollouts=1,
     )
 
     with torch.no_grad():
@@ -238,7 +243,11 @@ def test_resource_attention_handles_no_active_constraint_tokens() -> None:
         )
 
     assert all(torch.isfinite(value).all() for value in output.values())
-    assert torch.all(output["multipliers"] == 0.0)
+    # No active constraints -> every resource-field intensity is zero (the
+    # always-on objective weight slot is excluded).
+    assert torch.all(
+        output["multipliers"][0, : prism_decoder.FIELD_CHANNEL_COUNT] == 0.0
+    )
 
 
 def test_model_output_drives_field_decoder_iteration() -> None:
@@ -258,9 +267,8 @@ def test_model_output_drives_field_decoder_iteration() -> None:
         },
         search_config={
             "classical_behavior": False,
-            "use_pheromone": False,
         },
-        n_ants=4,
+        n_rollouts=4,
     )
     decoder.seed(3002)
     solution, _ = decode_iteration(
@@ -286,8 +294,8 @@ def test_cpp_trace_replays_exact_state_dependent_policy() -> None:
             "demand": demand,
             "capacity": 0.5,
         },
-        search_config={"classical_behavior": False, "use_pheromone": False},
-        n_ants=4,
+        search_config={"classical_behavior": False},
+        n_rollouts=4,
         beta=2.0,
     )
     decoder.seed(3003)
@@ -296,9 +304,11 @@ def test_cpp_trace_replays_exact_state_dependent_policy() -> None:
     initial_graph = build_decoder_data(decoder)
     with torch.no_grad():
         initial = model(initial_graph)
+    initial_scales = initial_graph.resource_scales.unsqueeze(0)
     decoder.solve(
         1,
-        edge_field=initial["residual"].detach().numpy(),
+        edge_field=(initial["residual"] * initial_scales).detach().numpy(),
+        edge_additive=(initial["additive"] * initial_scales).detach().numpy(),
         multipliers=initial["multipliers"][0].detach().numpy(),
         coupler_weights=initial["coupler_weights"][0].detach().numpy(),
         coupler_bias=initial["coupler_bias"][0].detach().numpy(),
@@ -307,8 +317,10 @@ def test_cpp_trace_replays_exact_state_dependent_policy() -> None:
     graph = build_decoder_data(decoder)
     with torch.no_grad():
         output = model(graph)
+    scales = graph.resource_scales.unsqueeze(0)
     traced = decoder.sample_traced(
-        edge_field=output["residual"].detach().numpy(),
+        edge_field=(output["residual"] * scales).detach().numpy(),
+        edge_additive=(output["additive"] * scales).detach().numpy(),
         multipliers=output["multipliers"][0].detach().numpy(),
         coupler_weights=output["coupler_weights"][0].detach().numpy(),
         coupler_bias=output["coupler_bias"][0].detach().numpy(),
@@ -319,7 +331,7 @@ def test_cpp_trace_replays_exact_state_dependent_policy() -> None:
     replayed, decisions = replay_logp_from_cpp_batch_trace(
         trace, graph, output, model, beta=2.0, risk_penalty=3.0
     )
-    decision_logp, decision_ants, decision_counts = (
+    decision_logp, decision_rollouts, decision_counts = (
         replay_decision_logp_from_cpp_batch_trace(
             trace, graph, output, model, beta=2.0, risk_penalty=3.0
         )
@@ -327,10 +339,10 @@ def test_cpp_trace_replays_exact_state_dependent_policy() -> None:
 
     starts = trace["starts"]
     expected = np.zeros(4, dtype=np.float32)
-    for ant in range(4):
-        selected = trace["stochastic"][starts[ant] : starts[ant + 1]].astype(bool)
-        expected[ant] = trace["log_probabilities"][
-            starts[ant] : starts[ant + 1]
+    for rollout in range(4):
+        selected = trace["stochastic"][starts[rollout] : starts[rollout + 1]].astype(bool)
+        expected[rollout] = trace["log_probabilities"][
+            starts[rollout] : starts[rollout + 1]
         ][selected].sum()
     assert np.allclose(replayed.detach().numpy(), expected, atol=2e-5)
     selected = trace["stochastic"].astype(bool) & (trace["chosen_indices"] >= 0)
@@ -339,8 +351,8 @@ def test_cpp_trace_replays_exact_state_dependent_policy() -> None:
         trace["log_probabilities"][selected],
         atol=2e-5,
     )
-    expected_ants = np.repeat(np.arange(4), np.diff(starts))[selected]
-    assert np.array_equal(decision_ants.detach().numpy(), expected_ants)
+    expected_rollouts = np.repeat(np.arange(4), np.diff(starts))[selected]
+    assert np.array_equal(decision_rollouts.detach().numpy(), expected_rollouts)
     assert torch.equal(decision_counts, decisions)
     assert np.all(decisions.detach().numpy() >= 0)
     assert trace["live_state"].shape[1] == prism_decoder.LIVE_STATE_FEATURE_COUNT

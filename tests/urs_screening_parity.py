@@ -18,7 +18,7 @@ from problem_data import BENCHMARK_VARIANTS, SavedProblems  # noqa: E402
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--ants", type=int, default=1)
+    parser.add_argument("--rollouts", type=int, default=1)
     parser.add_argument("--size", type=int, default=100)
     args = parser.parse_args()
 
@@ -33,10 +33,9 @@ def main() -> int:
             decoder = prism_decoder.Decoder(
                 problem,
                 search_config={
-                    "use_pheromone": False,
                     "verify_screening_resources": True,
                 },
-                n_ants=args.ants,
+                n_rollouts=args.rollouts,
             )
             decoder.seed(20260727 + index)
             bootstrap = decoder.solve(1)

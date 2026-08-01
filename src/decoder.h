@@ -13,6 +13,13 @@ static constexpr int32_t FIELD_CHANNEL_COUNT = 7;
 static constexpr int32_t LIVE_STATE_FEATURE_COUNT = FIELD_CHANNEL_COUNT;
 static constexpr int32_t NODE_FEATURE_COUNT = 24;
 static constexpr int32_t EDGE_FEATURE_COUNT = 11;
+// One learned multiplier slot beyond the resource channels carries the
+// state-conditioned objective weight w_obj applied to the objective edge cost,
+// so the objective enters the search energy through a learned coefficient
+// rather than a hard-coded additive term. The multiplier, coupler-weight, and
+// coupler-bias guidance arrays therefore have MULTIPLIER_COUNT entries.
+static constexpr int32_t OBJECTIVE_MULTIPLIER = FIELD_CHANNEL_COUNT;
+static constexpr int32_t MULTIPLIER_COUNT = FIELD_CHANNEL_COUNT + 1;
 
 enum class FieldChannel : uint8_t {
   CAPACITY = 0,
@@ -106,7 +113,6 @@ struct SearchConfig {
   int32_t feasibility_lookahead_depth = 2;
   bool use_srr = true;
   bool classical_behavior = true;
-  bool use_pheromone = true;
   bool verify_screening_resources = false;
   bool verify_incremental_srr = false;
 
@@ -141,7 +147,7 @@ struct ResourceEvaluation {
 };
 
 struct DecisionTrace {
-  // starts has n_ants + 1 entries and partitions every other decision array.
+  // starts has n_rollouts + 1 entries and partitions every other decision array.
   std::vector<int32_t> starts;
   std::vector<int32_t> current_nodes;
   std::vector<int32_t> valid_offsets;
@@ -165,9 +171,8 @@ struct DecisionTrace {
 class RoutingDecoder {
 public:
   RoutingDecoder(Problem problem, CandidateConfig candidate_config = {},
-             SearchConfig search_config = {}, int32_t n_ants = 20,
-             float decay = 0.9f, float alpha = 1.0f, float beta = 2.0f,
-             float p_best = 0.05f);
+             SearchConfig search_config = {}, int32_t n_rollouts = 20,
+             float beta = 2.0f);
 
   void seed(uint64_t value);
   std::vector<Solution> sample(const float *edge_field = nullptr,
@@ -197,19 +202,14 @@ public:
   evaluate_resources(const std::vector<int32_t> &route) const;
   void set_incumbent(const std::vector<int32_t> &route);
   std::vector<uint8_t> mask(const std::vector<int32_t> &prefix) const;
-  void reset_pheromone(float value = 1.0f);
 
   const Problem &problem() const { return problem_; }
   const CandidateConfig &candidate_config() const { return candidate_config_; }
   const SearchConfig &search_config() const { return search_config_; }
-  int32_t n_ants() const { return n_ants_; }
+  int32_t n_rollouts() const { return n_rollouts_; }
   int32_t edge_count() const { return static_cast<int32_t>(edge_to_.size()); }
   uint64_t graph_version() const { return graph_version_; }
-  float decay() const { return decay_; }
-  float alpha() const { return alpha_; }
   float beta() const { return beta_; }
-  float p_best() const { return p_best_; }
-  const std::vector<float> &pheromone() const { return pheromone_; }
   const std::vector<float> &heuristic() const { return heuristic_; }
   const std::vector<int32_t> &edge_offsets() const { return edge_offsets_; }
   const std::vector<int32_t> &edge_to() const { return edge_to_; }
@@ -236,7 +236,7 @@ public:
   const Solution &best_solution() const { return best_solution_; }
 
 private:
-  struct AntTrace {
+  struct RolloutTrace {
     std::vector<int32_t> current_nodes;
     std::vector<int32_t> valid_offsets = {0};
     std::vector<int32_t> valid_indices;
@@ -284,11 +284,8 @@ private:
   Problem problem_;
   CandidateConfig candidate_config_;
   SearchConfig search_config_;
-  int32_t n_ants_;
-  float decay_;
-  float alpha_;
+  int32_t n_rollouts_;
   float beta_;
-  float p_best_;
   uint64_t seed_ = 1;
   uint64_t generation_ = 0;
   uint64_t graph_version_ = 0;
@@ -299,7 +296,6 @@ private:
   float penalty_scale_ = 1.0f;
   int32_t pair_count_ = 0;
 
-  std::vector<float> pheromone_;
   std::vector<float> heuristic_;
   std::vector<float> proximity_;
   std::vector<float> edge_features_;
@@ -343,12 +339,12 @@ private:
                             const float *coupler_weights,
                             const float *coupler_bias,
                             const float *live_state) const;
-  void record_decision(AntTrace *trace, int32_t current,
+  void record_decision(RolloutTrace *trace, int32_t current,
                        const std::vector<int32_t> &valid_indices,
                        int32_t chosen_index, bool stochastic,
                        float log_probability,
                        const float *live_state) const;
-  void record_feasibility_labels(AntTrace *trace, State &state) const;
+  void record_feasibility_labels(RolloutTrace *trace, State &state) const;
   double field_score(int32_t from, int32_t to, int32_t edge,
                      const float *edge_field,
                      const float *edge_additive,
@@ -377,17 +373,17 @@ private:
   float feasibility_risk_label(State &state, int32_t next) const;
   bool complete(const State &state) const;
   Solution finish(State state) const;
-  Solution construct(uint64_t ant_seed, const float *edge_field,
+  Solution construct(uint64_t rollout_seed, const float *edge_field,
                      const float *edge_additive,
                      const float *multipliers,
                      const float *coupler_weights,
                      const float *coupler_bias, const float *edge_risk,
-                     float risk_penalty, AntTrace *trace,
+                     float risk_penalty, RolloutTrace *trace,
                      bool greedy = false) const;
-  Solution perturb(uint64_t ant_seed, const float *edge_field,
+  Solution perturb(uint64_t rollout_seed, const float *edge_field,
                    const float *edge_additive, const float *multipliers,
                    const float *coupler_weights, const float *coupler_bias,
-                   const float *edge_risk, float risk_penalty, AntTrace *trace,
+                   const float *edge_risk, float risk_penalty, RolloutTrace *trace,
                    bool greedy = false) const;
   Solution
   scope_restricted_refine(Solution solution,
@@ -398,14 +394,14 @@ private:
                           const float *coupler_weights,
                           const float *coupler_bias,
                           const float *edge_risk, float risk_penalty,
-                          AntTrace *trace) const;
+                          RolloutTrace *trace) const;
   int32_t select_next(State &state, std::mt19937_64 &rng,
                       const float *edge_field,
                       const float *edge_additive,
                       const float *multipliers,
                       const float *coupler_weights,
                       const float *coupler_bias, const float *edge_risk,
-                      float risk_penalty, AntTrace *trace,
+                      float risk_penalty, RolloutTrace *trace,
                       bool greedy = false) const;
   std::vector<OrderedChoice>
   perturbation_order(int32_t current, const std::vector<uint8_t> &used,
@@ -419,8 +415,6 @@ private:
                                      int32_t *new_edge_count = nullptr) const;
   bool reversal_safe() const;
   bool better(const Solution &lhs, const Solution &rhs) const;
-  void update_pheromone(const Solution &solution);
-  void deposit_edge(int32_t from, int32_t to, float amount);
 };
 
 const char *objective_name(Objective objective);

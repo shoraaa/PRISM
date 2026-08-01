@@ -482,26 +482,18 @@ std::vector<std::string> field_channel_names() {
 }
 
 RoutingDecoder::RoutingDecoder(Problem problem, CandidateConfig candidate_config,
-                       SearchConfig search_config, int32_t n_ants, float decay,
-                       float alpha, float beta, float p_best)
+                       SearchConfig search_config, int32_t n_rollouts, float beta)
     : problem_(std::move(problem)),
       candidate_config_(std::move(candidate_config)),
-      search_config_(std::move(search_config)), n_ants_(n_ants), decay_(decay),
-      alpha_(alpha), beta_(beta), p_best_(p_best) {
+      search_config_(std::move(search_config)), n_rollouts_(n_rollouts), beta_(beta) {
   problem_.validate();
   candidate_config_.validate();
   search_config_.validate();
-  if (n_ants_ <= 0) {
-    throw std::invalid_argument("n_ants must be positive");
+  if (n_rollouts_ <= 0) {
+    throw std::invalid_argument("n_rollouts must be positive");
   }
-  if (!(decay_ > 0.0f && decay_ <= 1.0f)) {
-    throw std::invalid_argument("decay must be in (0, 1]");
-  }
-  if (alpha_ < 0.0f || beta_ < 0.0f) {
-    throw std::invalid_argument("alpha and beta must be non-negative");
-  }
-  if (!(p_best_ > 0.0f && p_best_ < 1.0f)) {
-    throw std::invalid_argument("p_best must be in (0, 1)");
+  if (beta_ < 0.0f) {
+    throw std::invalid_argument("beta must be non-negative");
   }
   for (float value : problem_.distance) {
     if (std::isfinite(value))
@@ -552,15 +544,6 @@ RoutingDecoder::RoutingDecoder(Problem problem, CandidateConfig candidate_config
 
 void RoutingDecoder::seed(uint64_t value) {
   seed_ = value;
-  generation_ = 0;
-}
-
-void RoutingDecoder::reset_pheromone(float value) {
-  if (!std::isfinite(value) || value <= 0.0f) {
-    throw std::invalid_argument("pheromone value must be finite and positive");
-  }
-  std::fill(pheromone_.begin(), pheromone_.end(), value);
-  best_solution_ = Solution{};
   generation_ = 0;
 }
 
@@ -859,7 +842,7 @@ void RoutingDecoder::validate_guidance(const float *edge_field,
     }
   }
   if (multipliers != nullptr) {
-    for (int32_t channel = 0; channel < FIELD_CHANNEL_COUNT; ++channel) {
+    for (int32_t channel = 0; channel < MULTIPLIER_COUNT; ++channel) {
       if (!std::isfinite(multipliers[channel]) || multipliers[channel] < 0.0f) {
         throw std::invalid_argument(
             "field multipliers must be finite and non-negative");
@@ -868,7 +851,7 @@ void RoutingDecoder::validate_guidance(const float *edge_field,
   }
   if (coupler_weights != nullptr) {
     const size_t count =
-        static_cast<size_t>(FIELD_CHANNEL_COUNT) * LIVE_STATE_FEATURE_COUNT;
+        static_cast<size_t>(MULTIPLIER_COUNT) * LIVE_STATE_FEATURE_COUNT;
     for (size_t index = 0; index < count; ++index) {
       if (!std::isfinite(coupler_weights[index])) {
         throw std::invalid_argument("coupler weights must be finite");
@@ -876,7 +859,7 @@ void RoutingDecoder::validate_guidance(const float *edge_field,
     }
   }
   if (coupler_bias != nullptr) {
-    for (int32_t channel = 0; channel < FIELD_CHANNEL_COUNT; ++channel) {
+    for (int32_t channel = 0; channel < MULTIPLIER_COUNT; ++channel) {
       if (!std::isfinite(coupler_bias[channel])) {
         throw std::invalid_argument("coupler bias must be finite");
       }
@@ -984,7 +967,7 @@ double RoutingDecoder::coupled_multiplier(
   return base * modulation;
 }
 
-void RoutingDecoder::record_decision(AntTrace *trace, int32_t current,
+void RoutingDecoder::record_decision(RolloutTrace *trace, int32_t current,
                                      const std::vector<int32_t> &valid_indices,
                                      int32_t chosen_index, bool stochastic,
                                      float log_probability,
@@ -1003,7 +986,7 @@ void RoutingDecoder::record_decision(AntTrace *trace, int32_t current,
                            live_state + LIVE_STATE_FEATURE_COUNT);
 }
 
-void RoutingDecoder::record_feasibility_labels(AntTrace *trace,
+void RoutingDecoder::record_feasibility_labels(RolloutTrace *trace,
                                                State &state) const {
   if (trace == nullptr)
     return;
@@ -1030,17 +1013,15 @@ double RoutingDecoder::field_score(int32_t from, int32_t to, int32_t edge,
   for (int32_t channel = 0; channel < FIELD_CHANNEL_COUNT; ++channel) {
     if (!field_channel_active(channel))
       continue;
-    const double residual = edge >= 0 && edge_field != nullptr
-                                ? edge_field[static_cast<size_t>(edge) *
-                                                 FIELD_CHANNEL_COUNT +
-                                             channel]
-                                : 1.0;
-    const double pressure =
-        edge >= 0
-            ? resource_pressure_[static_cast<size_t>(edge) *
-                                     FIELD_CHANNEL_COUNT +
-                                 channel]
-            : analytic_resource_pressure(from, to, channel);
+    // edge_field is the learned per-edge resource field (already scaled to the
+    // resource's units by the model). Analytic pressure is no longer a
+    // multiplicative gate -- it is exposed to the GNN as an input feature -- so
+    // it only serves as the fallback field on off-graph reachability edges.
+    const double field = edge >= 0 && edge_field != nullptr
+                             ? edge_field[static_cast<size_t>(edge) *
+                                              FIELD_CHANNEL_COUNT +
+                                          channel]
+                             : analytic_resource_pressure(from, to, channel);
     const double additive =
         edge >= 0 && edge_additive != nullptr
             ? edge_additive[static_cast<size_t>(edge) * FIELD_CHANNEL_COUNT +
@@ -1048,7 +1029,7 @@ double RoutingDecoder::field_score(int32_t from, int32_t to, int32_t edge,
             : 0.0;
     const double multiplier = coupled_multiplier(
         channel, multipliers, coupler_weights, coupler_bias, live_state);
-    result += multiplier * std::max(pressure * residual + additive, 0.0);
+    result += multiplier * std::max(field + additive, 0.0);
   }
   return result;
 }
@@ -1063,7 +1044,13 @@ double RoutingDecoder::edge_energy(int32_t from, int32_t to, int32_t edge,
                                    const float *edge_risk,
                                    float risk_penalty) const {
   const double risk = edge >= 0 && edge_risk != nullptr ? edge_risk[edge] : 0.0;
-  return objective_edge_cost(from, to) +
+  // The objective enters through a learned, state-conditioned weight w_obj
+  // (multiplier slot OBJECTIVE_MULTIPLIER) rather than a hard unit coefficient.
+  // With no guidance the coupler returns 1.0, recovering the plain objective.
+  const double objective_weight = coupled_multiplier(
+      OBJECTIVE_MULTIPLIER, multipliers, coupler_weights, coupler_bias,
+      live_state);
+  return objective_weight * objective_edge_cost(from, to) +
          field_score(from, to, edge, edge_field, edge_additive, multipliers,
                      coupler_weights, coupler_bias, live_state) +
          risk_penalty * risk;
@@ -1078,7 +1065,6 @@ void RoutingDecoder::build_candidate_graph(const std::vector<int32_t> &incumbent
 
   const std::vector<int32_t> old_offsets = std::move(edge_offsets_);
   const std::vector<int32_t> old_to = std::move(edge_to_);
-  const std::vector<float> old_pheromone = std::move(pheromone_);
   std::vector<float> old_field;
   std::vector<float> old_additive;
   std::vector<float> old_risk;
@@ -1373,7 +1359,6 @@ void RoutingDecoder::build_candidate_graph(const std::vector<int32_t> &incumbent
   for (const auto &row : rows) {
     edge_to_.insert(edge_to_.end(), row.begin(), row.end());
   }
-  pheromone_.resize(edge_to_.size());
   proximity_.resize(edge_to_.size());
   heuristic_.resize(edge_to_.size());
   resource_pressure_.assign(edge_to_.size() * FIELD_CHANNEL_COUNT, 0.0f);
@@ -1405,10 +1390,6 @@ void RoutingDecoder::build_candidate_graph(const std::vector<int32_t> &incumbent
       while (old_edge < old_end && old_to[old_edge] < to)
         ++old_edge;
       const bool preserved = old_edge < old_end && old_to[old_edge] == to;
-      pheromone_[edge] =
-          preserved && static_cast<size_t>(old_edge) < old_pheromone.size()
-              ? old_pheromone[old_edge]
-              : 1.0f;
       proximity_[edge] = classical_proximity(from, edge_to_[edge]);
       heuristic_[edge] = 1.0f / std::max(proximity_[edge], EPS);
       objective_edge_costs_[edge] = objective_edge_cost(from, to);
@@ -2012,7 +1993,7 @@ int32_t RoutingDecoder::select_next(State &state,
                                     const float *coupler_weights,
                                     const float *coupler_bias,
                                     const float *edge_risk,
-                                    float risk_penalty, AntTrace *trace,
+                                    float risk_penalty, RolloutTrace *trace,
                                     bool greedy) const {
   struct Choice {
     int32_t node;
@@ -2070,31 +2051,26 @@ int32_t RoutingDecoder::select_next(State &state,
                            (problem_.constraints & ~savings_flags) == 0;
   for (size_t index = 0; index < pool.size(); ++index) {
     const int32_t edge = pool[index].edge;
-    const float tau = search_config_.use_pheromone && edge >= 0
-                          ? pheromone_[edge]
-                          : 1.0f;
-    float eta = edge >= 0
-                    ? heuristic_[edge]
-                    : 1.0f / std::max(classical_proximity(state.current,
-                                                          pool[index].node),
-                                      EPS);
-    if (use_savings) {
-      const int32_t node = pool[index].node;
-      if (node < problem_.depot_count) {
-        eta = EPS;
-      } else if (greedy || state.at_depot) {
-        eta = 1.0f / std::max(problem_.dist(state.current, node), EPS);
-      } else {
-        eta = std::max(problem_.dist(state.current, state.route_depot) +
-                           problem_.dist(state.route_depot, node) -
-                           problem_.dist(state.current, node),
-                       EPS);
-      }
-    }
-    double value = search_config_.use_pheromone
-                       ? alpha_ * std::log(std::max(tau, EPS))
-                       : 0.0;
+    double value = 0.0;
     if (search_config_.classical_behavior) {
+      float eta = edge >= 0
+                      ? heuristic_[edge]
+                      : 1.0f / std::max(classical_proximity(state.current,
+                                                            pool[index].node),
+                                        EPS);
+      if (use_savings) {
+        const int32_t node = pool[index].node;
+        if (node < problem_.depot_count) {
+          eta = EPS;
+        } else if (greedy || state.at_depot) {
+          eta = 1.0f / std::max(problem_.dist(state.current, node), EPS);
+        } else {
+          eta = std::max(problem_.dist(state.current, state.route_depot) +
+                             problem_.dist(state.route_depot, node) -
+                             problem_.dist(state.current, node),
+                         EPS);
+        }
+      }
       value += beta_ * std::log(std::max(eta, EPS));
     } else {
       const double energy = edge_energy(state.current, pool[index].node, edge,
@@ -2137,20 +2113,20 @@ int32_t RoutingDecoder::select_next(State &state,
                   std::log(log_weights.back() / total));
 }
 
-Solution RoutingDecoder::construct(uint64_t ant_seed, const float *edge_field,
+Solution RoutingDecoder::construct(uint64_t rollout_seed, const float *edge_field,
                                    const float *edge_additive,
                                    const float *multipliers,
                                    const float *coupler_weights,
                                    const float *coupler_bias,
                                    const float *edge_risk,
-                                   float risk_penalty, AntTrace *trace,
+                                   float risk_penalty, RolloutTrace *trace,
                                    bool greedy) const {
-  std::mt19937_64 rng(ant_seed);
+  std::mt19937_64 rng(rollout_seed);
   int32_t start = 0;
   if (problem_.depot_count > 0) {
-    start = static_cast<int32_t>(ant_seed % problem_.depot_count);
+    start = static_cast<int32_t>(rollout_seed % problem_.depot_count);
   } else {
-    start = static_cast<int32_t>(ant_seed % problem_.node_count);
+    start = static_cast<int32_t>(rollout_seed % problem_.node_count);
   }
   State state = initial_state(start);
   const int32_t max_steps = 3 * problem_.node_count + 8;
@@ -2224,20 +2200,17 @@ RoutingDecoder::perturbation_order(int32_t current,
         (node < problem_.depot_count && !problem_.multi_route)) {
       continue;
     }
-    float eta = heuristic_[edge];
-    if (use_savings) {
-      eta = node < problem_.depot_count
-                ? EPS
-                : std::max(problem_.dist(current, route_depot) +
-                               problem_.dist(route_depot, node) -
-                               problem_.dist(current, node),
-                           EPS);
-    }
-    double log_weight =
-        search_config_.use_pheromone
-            ? alpha_ * std::log(std::max(pheromone_[edge], EPS))
-            : 0.0;
+    double log_weight = 0.0;
     if (search_config_.classical_behavior) {
+      float eta = heuristic_[edge];
+      if (use_savings) {
+        eta = node < problem_.depot_count
+                  ? EPS
+                  : std::max(problem_.dist(current, route_depot) +
+                                 problem_.dist(route_depot, node) -
+                                 problem_.dist(current, node),
+                             EPS);
+      }
       log_weight += beta_ * std::log(std::max(eta, EPS));
     } else {
       log_weight -= beta_ *
@@ -2337,7 +2310,7 @@ Solution RoutingDecoder::scope_restricted_refine(
     const float *multipliers,
     const float *coupler_weights, const float *coupler_bias,
     const float *edge_risk, float risk_penalty,
-    AntTrace *trace) const {
+    RolloutTrace *trace) const {
   if (!search_config_.use_srr || !solution.feasible) {
     return solution;
   }
@@ -4764,21 +4737,21 @@ Solution RoutingDecoder::scope_restricted_refine(
   return solution;
 }
 
-Solution RoutingDecoder::perturb(uint64_t ant_seed, const float *edge_field,
+Solution RoutingDecoder::perturb(uint64_t rollout_seed, const float *edge_field,
                                  const float *edge_additive,
                                  const float *multipliers,
                                  const float *coupler_weights,
                                  const float *coupler_bias,
                                  const float *edge_risk,
-                                 float risk_penalty, AntTrace *trace,
+                                 float risk_penalty, RolloutTrace *trace,
                                  bool greedy) const {
   const Solution source = evaluate(incumbent_route_);
   if (!source.feasible) {
-    return construct(ant_seed, edge_field, edge_additive, multipliers,
+    return construct(rollout_seed, edge_field, edge_additive, multipliers,
                      coupler_weights, coupler_bias, edge_risk, risk_penalty,
                      trace, greedy);
   }
-  std::mt19937_64 rng(ant_seed);
+  std::mt19937_64 rng(rollout_seed);
   Solution raw = source;
   std::vector<uint8_t> used(problem_.node_count, 0);
   std::vector<int32_t> active;
@@ -4951,72 +4924,72 @@ std::vector<Solution> RoutingDecoder::sample(const float *edge_field,
                                              DecisionTrace *trace) {
   validate_guidance(edge_field, edge_additive, multipliers, coupler_weights,
                     coupler_bias, edge_risk, risk_penalty);
-  std::vector<Solution> solutions(n_ants_);
-  std::vector<AntTrace> ant_traces(trace == nullptr ? 0 : n_ants_);
+  std::vector<Solution> solutions(n_rollouts_);
+  std::vector<RolloutTrace> rollout_traces(trace == nullptr ? 0 : n_rollouts_);
   const uint64_t generation_seed = splitmix64(seed_ ^ generation_++);
-  const int32_t thread_count = std::min(n_ants_, omp_get_max_threads());
+  const int32_t thread_count = std::min(n_rollouts_, omp_get_max_threads());
 #pragma omp parallel for schedule(static) num_threads(thread_count)
-  for (int32_t ant = 0; ant < n_ants_; ++ant) {
-    const uint64_t ant_seed = splitmix64(generation_seed + ant);
-    AntTrace *ant_trace = trace == nullptr ? nullptr : &ant_traces[ant];
-    solutions[ant] =
+  for (int32_t rollout = 0; rollout < n_rollouts_; ++rollout) {
+    const uint64_t rollout_seed = splitmix64(generation_seed + rollout);
+    RolloutTrace *rollout_trace = trace == nullptr ? nullptr : &rollout_traces[rollout];
+    solutions[rollout] =
         incumbent_route_.empty()
-            ? construct(ant_seed, edge_field, edge_additive, multipliers,
+            ? construct(rollout_seed, edge_field, edge_additive, multipliers,
                         coupler_weights, coupler_bias, edge_risk, risk_penalty,
-                        ant_trace,
-                        ant < std::max(1, n_ants_ / 2))
-            : perturb(ant_seed, edge_field, edge_additive, multipliers,
+                        rollout_trace,
+                        rollout < std::max(1, n_rollouts_ / 2))
+            : perturb(rollout_seed, edge_field, edge_additive, multipliers,
                       coupler_weights, coupler_bias, edge_risk, risk_penalty,
-                      ant_trace);
+                      rollout_trace);
   }
   if (trace != nullptr) {
     *trace = DecisionTrace{};
-    trace->starts.reserve(n_ants_ + 1);
+    trace->starts.reserve(n_rollouts_ + 1);
     trace->starts.push_back(0);
     trace->valid_offsets.push_back(0);
-    for (AntTrace &ant : ant_traces) {
+    for (RolloutTrace &rollout : rollout_traces) {
       trace->current_nodes.insert(trace->current_nodes.end(),
-                                  ant.current_nodes.begin(),
-                                  ant.current_nodes.end());
+                                  rollout.current_nodes.begin(),
+                                  rollout.current_nodes.end());
       const int32_t valid_base =
           static_cast<int32_t>(trace->valid_indices.size());
       trace->valid_indices.insert(trace->valid_indices.end(),
-                                  ant.valid_indices.begin(),
-                                  ant.valid_indices.end());
-      for (size_t index = 1; index < ant.valid_offsets.size(); ++index)
-        trace->valid_offsets.push_back(valid_base + ant.valid_offsets[index]);
+                                  rollout.valid_indices.begin(),
+                                  rollout.valid_indices.end());
+      for (size_t index = 1; index < rollout.valid_offsets.size(); ++index)
+        trace->valid_offsets.push_back(valid_base + rollout.valid_offsets[index]);
       trace->chosen_indices.insert(trace->chosen_indices.end(),
-                                   ant.chosen_indices.begin(),
-                                   ant.chosen_indices.end());
-      trace->stochastic.insert(trace->stochastic.end(), ant.stochastic.begin(),
-                               ant.stochastic.end());
+                                   rollout.chosen_indices.begin(),
+                                   rollout.chosen_indices.end());
+      trace->stochastic.insert(trace->stochastic.end(), rollout.stochastic.begin(),
+                               rollout.stochastic.end());
       trace->log_probabilities.insert(trace->log_probabilities.end(),
-                                      ant.log_probabilities.begin(),
-                                      ant.log_probabilities.end());
-      trace->live_state.insert(trace->live_state.end(), ant.live_state.begin(),
-                               ant.live_state.end());
+                                      rollout.log_probabilities.begin(),
+                                      rollout.log_probabilities.end());
+      trace->live_state.insert(trace->live_state.end(), rollout.live_state.begin(),
+                               rollout.live_state.end());
       trace->feasibility_edges.insert(trace->feasibility_edges.end(),
-                                      ant.feasibility_edges.begin(),
-                                      ant.feasibility_edges.end());
+                                      rollout.feasibility_edges.begin(),
+                                      rollout.feasibility_edges.end());
       trace->feasibility_risk_labels.insert(
           trace->feasibility_risk_labels.end(),
-          ant.feasibility_risk_labels.begin(),
-          ant.feasibility_risk_labels.end());
+          rollout.feasibility_risk_labels.begin(),
+          rollout.feasibility_risk_labels.end());
       trace->screened_edges.insert(trace->screened_edges.end(),
-                                   ant.screened_edges.begin(),
-                                   ant.screened_edges.end());
+                                   rollout.screened_edges.begin(),
+                                   rollout.screened_edges.end());
       trace->screened_resource_delta.insert(
           trace->screened_resource_delta.end(),
-          ant.screened_resource_delta.begin(),
-          ant.screened_resource_delta.end());
-      trace->screening_fast_evaluations += ant.screening_fast_evaluations;
+          rollout.screened_resource_delta.begin(),
+          rollout.screened_resource_delta.end());
+      trace->screening_fast_evaluations += rollout.screening_fast_evaluations;
       trace->screening_fallback_evaluations +=
-          ant.screening_fallback_evaluations;
+          rollout.screening_fallback_evaluations;
       trace->screening_verification_failures +=
-          ant.screening_verification_failures;
+          rollout.screening_verification_failures;
       for (int32_t channel = 0; channel < FIELD_CHANNEL_COUNT; ++channel) {
         trace->screening_verification_failures_by_channel[channel] +=
-            ant.screening_verification_failures_by_channel[channel];
+            rollout.screening_verification_failures_by_channel[channel];
       }
       trace->starts.push_back(
           static_cast<int32_t>(trace->current_nodes.size()));
@@ -5056,43 +5029,6 @@ bool RoutingDecoder::better(const Solution &lhs, const Solution &rhs) const {
     return lhs.distance < rhs.distance;
   }
   return lhs.objective < rhs.objective;
-}
-
-void RoutingDecoder::deposit_edge(int32_t from, int32_t to, float amount) {
-  const int32_t edge = find_edge(from, to);
-  if (edge >= 0) {
-    pheromone_[edge] += amount;
-  }
-}
-
-void RoutingDecoder::update_pheromone(const Solution &solution) {
-  for (float &value : pheromone_) {
-    value = std::max(value * decay_, EPS);
-  }
-  float deposit = 1.0f;
-  if (problem_.objective == Objective::MAX_PRIZE) {
-    deposit = std::max(solution.objective, EPS);
-  } else {
-    deposit = 1.0f / std::max(solution.objective, EPS);
-  }
-  for (size_t index = 1; index < solution.route.size(); ++index) {
-    deposit_edge(solution.route[index - 1], solution.route[index], deposit);
-  }
-  if (problem_.has(VISIT_ALL) && !problem_.multi_route &&
-      !problem_.open_route && !solution.route.empty()) {
-    const int32_t end = problem_.depot_count == 0 ? solution.route.front()
-                                                  : solution.route.front();
-    deposit_edge(solution.route.back(), end, deposit);
-  }
-
-  const float tau_max = deposit / std::max(1.0f - decay_, 0.01f);
-  const float root = std::pow(p_best_, 1.0f / problem_.node_count);
-  const float denominator =
-      std::max((problem_.node_count / 2.0f - 1.0f) * root, 1.0f);
-  const float tau_min = std::max(tau_max * (1.0f - root) / denominator, EPS);
-  for (float &value : pheromone_) {
-    value = std::clamp(value, tau_min, tau_max);
-  }
 }
 
 Solution RoutingDecoder::solve(int32_t iterations, const float *edge_field,
@@ -5149,9 +5085,6 @@ Solution RoutingDecoder::solve(int32_t iterations, const float *edge_field,
                             working_additive.empty() ? nullptr
                                                      : &working_additive,
                             working_risk.empty() ? nullptr : &working_risk);
-    }
-    if (search_config_.use_pheromone) {
-      update_pheromone(best_solution_);
     }
   }
   if (!best_solution_.feasible) {

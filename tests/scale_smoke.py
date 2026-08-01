@@ -51,7 +51,7 @@ def main() -> None:
     model.eval()
     decoder_args = SimpleNamespace(
         candidates=64,
-        n_ants=32,
+        n_rollouts=32,
         beta=2.0,
         seed=cli.seed,
         search_iterations=cli.search_iterations,

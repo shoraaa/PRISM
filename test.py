@@ -51,7 +51,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="comma-separated names, or 'all' for all 110 variants (default)",
     )
     parser.add_argument("--iterations", type=int, default=16)
-    parser.add_argument("--ants", type=int, default=32)
+    parser.add_argument("--rollouts", type=int, default=32)
     parser.add_argument("--candidates", type=int, default=64)
     parser.add_argument(
         "--val-size",
@@ -73,6 +73,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=20260727)
     parser.add_argument(
         "--device", default="cuda:0" if torch.cuda.is_available() else "cpu"
+    )
+    parser.add_argument(
+        "--baseline",
+        choices=["fields-off", "classical"],
+        default="fields-off",
+        help=(
+            "Reference the neural field is scored against. 'fields-off' (default)"
+            " is the same decoder with the field ablated to pure distance"
+            " (E = c(e)); 'classical' is the hand-tuned proximity ranking."
+        ),
     )
     parser.add_argument("--csv", type=Path)
     parser.add_argument("--dataset-dir", type=Path, default=DEFAULT_DATASET_DIR)
@@ -238,7 +248,7 @@ def main() -> int:
                 )
                 decoder_args = SimpleNamespace(
                     candidates=args.candidates,
-                    n_ants=args.ants,
+                    n_rollouts=args.rollouts,
                     beta=2.0,
                     seed=args.seed + index * args.val_size + instance_index,
                     search_iterations=args.iterations,
@@ -246,6 +256,7 @@ def main() -> int:
                     feasibility_risk_penalty=10.0,
                     device=args.device,
                     static_field=args.static_field,
+                    baseline=args.baseline,
                 )
 
                 baseline_started = time.perf_counter()

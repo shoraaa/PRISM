@@ -1,113 +1,145 @@
-# PRISM: Compositional Constraint Interaction Fields for Routing Search
+# PRISM: Learned Constraint-Interaction Fields for Routing Search
+
+PRISM is a **learned search policy** for vehicle routing under composed
+constraints. A native decoder defines an action space of candidate moves that
+are guaranteed feasible, and a graph neural network defines the policy that
+ranks those moves. That policy is a **constraint-interaction field**: a typed,
+continuous, edge-level scoring function that is trained end to end by
+reinforcement learning from the search's own accepted improvements. No
+hand-tuned heuristic term appears in the ranking — classical quantities such as
+edge distance and analytic resource pressure enter only as network inputs or as
+ablatable references, never as fixed terms in the energy.
 
 Routing constraints rarely act in isolation. Capacity changes which time-window
 transitions remain useful; route limits alter the value of returning to a depot;
 pickup-delivery precedence reshapes feasible neighborhoods; and these effects
 change again as the incumbent solution evolves. A binary feasibility mask can
-reject an illegal move, but it does not express how several active resources
-jointly reshape the value of otherwise feasible choices.
-
-PRISM introduces **constraint interaction fields**: typed, continuous edge-level
-signals that represent how individual routing resources and their interactions
-reshape the value of candidate search moves. The fields combine analytic
-resource pressure, learned pressure corrections, live state-dependent
-modulation, and continuation-risk potential. A unified native decoder maintains
-exact routing semantics and feasibility while the learned fields provide
-continuous guidance before hard constraint violations occur.
+reject an illegal move, but it cannot express how several active resources
+jointly reshape the value of the moves that remain legal. PRISM learns exactly
+that continuous, composition- and state-dependent value, while the decoder keeps
+every constructed solution feasible by construction.
 
 The C++ backend builds a directed `O(nK)` candidate graph with `K=64`, runs
-parallel search ants with static OpenMP scheduling, and improves solutions with
-scope-restricted refinement (SRR). The neural model operates directly on this
-search graph and is refreshed whenever an accepted incumbent installs a new
-graph. Classical ACO guidance remains available as a matched search baseline.
+parallel search rollouts with static OpenMP scheduling, and improves solutions
+with scope-restricted refinement (SRR). The neural policy operates directly on
+this search graph and is refreshed whenever an accepted incumbent installs a new
+graph.
 
-## Constraint interaction fields
+## The learned policy
 
-For candidate edge `e` in search state `s`, PRISM uses the constraint-aware
-search energy
+The network defines the search policy: for candidate edge `e` in search state
+`s`, PRISM ranks moves by the energy
 
 ```text
-E(e | s) = c(e)
-         + sum_r lambda_r(s) * [p_r(e) * rho_r(e) + a_r(e)]_+
+E(e | s) = w_obj(s) * c(e)
+         + sum_r lambda_r(s) * [field_r(e) + a_r(e)]_+
          + kappa * q(e),
 ```
 
-where:
+and samples the next node from `softmax(-beta * E)`. Every term is produced by
+the network:
 
-- `c(e)` is the objective-aware edge cost;
-- `p_r(e)` is the analytic pressure of resource `r`;
-- `rho_r(e)` and `a_r(e)` are learned multiplicative and additive pressure
-  corrections;
-- `lambda_r(s)` is the learned, live-state-modulated intensity of that resource;
-  and
-- `q(e)` is a learned continuation-risk potential.
+- `c(e)` is the objective edge cost, entered through a learned,
+  state-conditioned weight `w_obj(s)` rather than a hard unit coefficient;
+- `field_r(e)` and `a_r(e)` are the learned per-edge field and additive term for
+  resource `r` (scaled to that resource's units);
+- `lambda_r(s)` is the learned, live-state-modulated intensity of resource `r`,
+  a Lagrangian-style multiplier shaped by search reward rather than supervision;
+- `q(e)` is an optional learned continuation-risk potential.
 
-The multiplicative term adapts known physical pressure, while the additive term
-represents interactions that remain informative when the analytic pressure is
-zero. Resource-token attention lets capacity, time windows, route limits,
-backhaul, pickup-delivery, and prize requirements change one another's learned
-intensities. A lightweight state coupler then updates those intensities at every
-logged decision without rerunning the full GNN.
+Nothing in the ranking is hand-tuned. Analytic resource pressure — the classical
+signal a heuristic would multiply in here — is **not** a term in the energy; it
+is exposed to the GNN only as an input edge feature, so the network must *learn*
+where each resource matters instead of scaling a supplied pressure. The plain
+objective cost is likewise only recovered as an ablation (`lambda_r = 0,
+w_obj = 1`), not assumed.
 
-Together, the resource-specific channels form the constraint interaction field.
-Each **resource field** describes one typed constraint over the candidate graph;
-resource-token attention makes every channel depend on the complete active
-constraint composition, and state modulation adapts it to the current partial
-solution.
-
-The field is trained at two resolutions. Exact C++ screening traces teach it to
-predict counterfactual resource changes and binding structure; sparse
-continuation look-ahead teaches the continuation-risk potential. PPO then
-optimizes the resulting search policy from accepted improvements, using
-event-driven SMDP options to carry credit across incumbent changes.
+Resource-token attention lets capacity, time windows, route limits, backhaul,
+pickup-delivery, and prize requirements change one another's learned intensities,
+so each channel depends on the complete active constraint composition. A
+lightweight state coupler then updates those intensities -- and `w_obj` -- at
+every logged decision without rerunning the full GNN, adapting the policy to the
+live partial solution.
 
 ## Contributions
 
-- **Constraint interaction fields.** PRISM factorizes neural search guidance
-  into typed resource-specific fields whose values depend jointly on candidate
-  edges, active constraint composition, and live search state. This structure
-  provides continuous guidance before hard constraint violation while retaining
-  exact decoder-enforced feasibility.
-- **Compositional routing representation.** A shared resource-token model and a
-  unified decoder cover capacity, time windows, route and tour limits, backhaul,
-  pickup-delivery, prize quota, open routes, multiple depots, optional customers,
-  and symmetric or asymmetric costs.
-- **Search-native learning.** Neural fields are recomputed after incumbent
-  changes, coupled to live decoder state at individual decisions, and trained by
-  replaying the exact stochastic decisions made by the native search.
+- **A learned policy, not a heuristic with a learned nudge.** The GNN defines
+  the entire move-ranking energy end to end. The objective weight and every
+  constraint intensity are learned and state-conditioned; distance and analytic
+  pressure are inputs or ablations, never load-bearing terms. Ablating the field
+  reduces PRISM to distance-only search, isolating exactly what the network adds.
+- **Compositional constraint-interaction fields.** Typed per-resource fields
+  with resource-token attention make each constraint's learned intensity depend
+  on the full active constraint composition and the live search state, targeting
+  zero-shot transfer to unseen constraint compositions.
+- **Reinforcement learning over a feasibility-guaranteed action space.**
+  Decision-level PPO trains the policy from the native search's accepted
+  improvements. The exact decoder guarantees feasibility, so learning shapes
+  *quality* rather than legality. Multipliers are shaped by RL instead of pinned
+  to a supervised target, and policy gradients reach them from the first step.
 - **Scalable exact resource accounting.** Sparse candidate support, composable
-  route summaries, incremental caches, and affected-scope repair make learned
+  route summaries, incremental caches, and affected-scope repair make the learned
   search practical from mixed size-100 training through size-10,000 inference.
 
-## Search and learning architecture
+## Architecture
 
-### Typed constraint fields
+### Compositional field network
 
-The GNN emits one field for each constraint resource. Node, edge,
-resource-token, and live-state inputs are normalized to `[0, 1]`. Active
-resource tokens attend to one another before producing edge pressure
-corrections, global resource intensities, binding predictions, and live-state
-coupler parameters. The decoder is the source of truth for graph dimensions,
-resource scales, and active channels.
+The GNN emits one field for each constraint resource plus the objective weight.
+Node, edge, resource-token, and live-state inputs are normalized to `[0, 1]`;
+the decoder is the source of truth for graph dimensions, resource scales, and
+active channels. Active resource tokens attend to one another before producing
+per-edge resource fields, global resource intensities, a state-conditioned
+objective weight, binding predictions, and live-state coupler parameters. The
+field is refreshed when the incumbent improves or a new candidate graph is
+installed; stagnation ends the current SMDP option without recomputing an
+identical graph, while the state coupler keeps responding to load, time, route
+progress, and other live variables at each stochastic choice.
 
-The field is refreshed when the incumbent improves or a new candidate graph is
-installed. Stagnation ends the current SMDP option without recomputing an
-identical graph, while the state coupler continues to respond to load, time,
-route progress, and other live search variables at each stochastic choice.
+### Guaranteed-feasible action space
+
+A unified native decoder covers capacity, time windows, route and tour limits,
+backhaul, pickup-delivery, prize quota, open routes, multiple depots, optional
+customers, and symmetric or asymmetric costs. It enforces every hard constraint
+during construction and refinement, so the learned policy only ever chooses
+among feasible moves and can express continuous preference *before* a violation
+would occur.
+
+### Reinforcement learning
+
+Training replays one probability ratio per stochastic decoder decision. Option
+returns are assigned to rollouts, and inverse decision-count weighting gives
+every rollout equal total influence independent of trace length. The update runs
+multiple PPO passes per rollout, so the probability ratio departs from one and
+clipping engages as the policy moves. The resource multipliers are left ungated
+by the binding classifier by default, so RL gradients reach them from step 0
+(`--gate-multipliers-by-binding` restores the gate as an ablation), and the
+multiplier-to-binding supervision is off by default (`--price-weight 0`) so the
+policy's intensities are learned from search outcome.
+
+Auxiliary resource, binding, and feasibility heads are trained as representation
+pretraining and downweighted to `0.1` during RL fine-tuning (`--aux-rl-scale`);
+they inform the policy but do not define it. Winner-gated Monte Carlo credit
+connects consecutive incumbent improvements: the rollout that installs the next
+incumbent receives the sampled continuation advantage, preserving temporal
+information after within-option POMO centering. An optional progress-conditioned
+GAE critic supplies a learned continuation value for longer search horizons. On
+HIP/ROCm, training automatically selects the detached-output small-VRAM update;
+`--no-smallvram` selects the conventional retained-graph update.
 
 ### Counterfactual feasibility learning
 
-At traced states, the decoder labels candidate edges that are immediately
-masked and applies configurable sparse look-ahead to currently legal edges.
-The feasibility head learns the resulting continuation risk. After auxiliary
-pretraining, this risk guides proposal, perturbation, and SRR sequence energy,
-with the prediction detached from policy replay.
+At traced states, the decoder labels candidate edges that are immediately masked
+and applies configurable sparse look-ahead to currently legal edges. The
+feasibility head learns the resulting continuation risk; after auxiliary
+pretraining it can guide proposal, perturbation, and SRR sequence energy, with
+the prediction detached from policy replay.
 
 ### Exact and incremental SRR
 
 SRR evaluates planned capacity, route-limit, tour-limit, backhaul, and prize
-changes from cached route summaries. Once a planned sequence is available,
-these resource replacements are constant in the number and length of routes.
+changes from cached route summaries. Once a planned sequence is available, these
+resource replacements are constant in the number and length of routes.
 Time-window cascading lateness and pickup-delivery open-pair maxima use exact
 route replay, preserving their full state-dependent semantics. Trace output
 reports both summary and replay evaluation counts.
@@ -132,23 +164,6 @@ replay. The second reconstructs and compares the complete cache after every
 accepted incremental update. Solutions expose `srr_incremental_rebuilds`,
 `srr_full_rebuilds`, and `srr_rebuilt_nodes`.
 
-### Decision-level PPO
-
-Training replays one probability ratio per stochastic decoder decision. Option
-returns are assigned to ants, and inverse decision-count weighting gives every
-ant equal total influence independent of trace length. Auxiliary resource,
-binding, and feasibility losses use full weight during pretraining and default
-to `0.1` during RL fine-tuning through `--aux-rl-scale`.
-
-Winner-gated Monte Carlo credit connects consecutive incumbent improvements.
-The ant that installs the next incumbent receives the sampled continuation
-advantage, preserving temporal information after within-option POMO centering.
-An optional progress-conditioned GAE critic supplies a learned continuation
-value for longer search horizons.
-
-On HIP/ROCm, training automatically selects the detached-output small-VRAM
-update. `--no-smallvram` selects the conventional retained-graph update.
-
 ## Build and test
 
 ```bash
@@ -172,7 +187,7 @@ uv run python generate_validation_data.py --n-node 100
 
 ## Training
 
-Train the resource-token interaction fields and event-driven decoder with:
+Train the constraint-interaction field policy and event-driven decoder with:
 
 ```bash
 uv run python train.py --n-node 1000 --pretrain-epochs 3 \
@@ -201,61 +216,70 @@ Monte Carlo continuation credit.
 
 ## Validation and checkpoint selection
 
-Validation covers all 12 training variants and a fixed 16-variant held-out
+Validation covers the 16 training variants and a fixed 16-variant held-out
 manifest stratified by objective, pickup-delivery structure, symmetry, depot
-count, and number of interacting constraints. With `--val-size 8`, the complete
-manifest contains 224 fixed instances. Missing entries fail validation unless
-`--allow-missing-validation` is selected.
+count, and number of interacting constraints. Missing entries fail validation
+unless `--allow-missing-validation` is selected. Validation inherits
+`--n-rollouts` by default; use `--val-n-rollouts` to give it a separate rollout
+budget.
 
-Before epoch 0, PRISM evaluates the matched non-neural decoder under the same
-search budget. W&B records per-variant objective, feasibility, reference gap,
-and paired learned-field improvement, together with:
-
-- `val_summary/macro_gap`
-- `val_summary/macro_improvement`
-- `val_summary/macro_score`
+PRISM is scored against an **ablation of itself**: before epoch 0 it evaluates
+the identical decoder and search with the field ablated to pure distance
+(`E = c(e)`), i.e. *PRISM without fields* (`--baseline fields-off`, the default).
+Reported quality is **gap to saved oracle references** (`--gap-reference oracle`,
+the default); reference-less variants drop out of the gap rather than falling
+back to the ablation. W&B records per-variant objective, feasibility, oracle gap,
+and paired field-improvement, together with `val_summary/macro_gap`,
+`val_summary/macro_improvement`, and `val_summary/macro_score`.
 
 Checkpoint selection is lexicographic: worst-variant feasibility, overall
-feasibility, paired-baseline coverage, variant-macro improvement, and finally
-variant-macro reference gap. This ordering favors constraint reliability across
-the full compositional family before average objective quality.
+feasibility, paired-baseline coverage, variant-macro gap-to-oracle, and finally
+variant-macro field improvement. Feasibility across the full compositional family
+is the prior gate; the quality choice is then driven by gap to the oracle
+references. Because gap-to-oracle only covers variants that ship an oracle
+solution, field improvement over the fields-off ablation remains the tiebreaker
+so oracle-less variants still influence selection.
+
+The hand-tuned classical-proximity ranking is retained only as a diagnostic
+(`--baseline classical`); it is not part of the reported comparison.
 
 ## Evaluation
 
 Run the end-to-end size-100 feasibility and resource-parity gates:
 
 ```bash
-uv run python tests/urs_one_each.py --iterations 2 --guidance classical --no-pheromone
-uv run python tests/urs_one_each.py --iterations 2 --guidance field --no-pheromone
+uv run python tests/urs_one_each.py --iterations 2 --guidance classical
+uv run python tests/urs_one_each.py --iterations 2 --guidance field
 uv run python tests/urs_screening_parity.py
-uv run python tests/urs_one_each.py --ants 1 --threads 1 --iterations 2 \
-  --no-pheromone --verify-incremental-srr
+uv run python tests/urs_one_each.py --rollouts 1 --threads 1 --iterations 2 \
+  --verify-incremental-srr
 ```
 
-`--guidance field` exercises the neutral typed-field interface. Evaluate trained
-constraint interaction fields against the matched non-neural decoder on every
-benchmark composition with:
+`--guidance field` exercises the typed-field interface with a neutral field.
+Evaluate the trained policy against PRISM with its field ablated (distance-only)
+on every benchmark composition with:
 
 ```bash
 PYTHONPATH=src uv run --no-sync python test.py \
   --checkpoint pretrained/best.pt --variants all --iterations 16 \
-  --csv results/checkpoint_vs_non_neural.csv
+  --csv results/prism_vs_fields_off.csv
 ```
 
 By default, `test.py` evaluates all 110 benchmark variants using the first eight
-saved instances of each. It reports overall results plus separate `SEEN` results
-for the 15 benchmark variants in the training curriculum and `HELDOUT` results
-for the remaining 95. Both decoder paths use the same paired per-instance seed,
-candidate budget, ant count, post-bootstrap iteration count, and matched oracle
-reference. Dynamic field refinement is enabled by default. For a focused subset,
-use `--val-size 1 --variants tsp,cvrp,cvrptw`; use `--static-field` to evaluate
-one frozen field for the full solve. The report and optional CSV record the data
-split, mean objective, baseline improvement, reference gap, runtime, field mode,
-and neural evaluation count for every variant.
+saved instances of each, reporting overall results plus separate `SEEN` and
+`HELDOUT` splits. The learned policy and its fields-off ablation share the same
+paired per-instance seed, candidate budget, rollout count, post-bootstrap
+iteration count, and oracle reference, so the only difference is the learned
+field (`--baseline` selects the reference; `fields-off` is the default). Dynamic
+field refinement is enabled by default. For a focused subset, use
+`--val-size 1 --variants tsp,cvrp,cvrptw`; use `--static-field` to evaluate one
+frozen field for the full solve. The report and optional CSV record the data
+split, mean objective, field improvement, oracle gap, runtime, field mode, and
+neural evaluation count for every variant.
 
 ## Large-scale inference
 
-Run the size-10,000 inference gate with either native or learned guidance:
+Run the size-10,000 inference gate with either distance-only or learned guidance:
 
 ```bash
 uv run python tests/scale_smoke.py --n-node 10000
@@ -269,5 +293,5 @@ Training enables activation checkpointing automatically from `n=1000`, while
 inference remains checkpoint-free.
 
 The feasibility look-ahead defaults to two steps and its search penalty to
-`10.0` objective units. Configure them with
-`--feasibility-lookahead-depth` and `--feasibility-risk-penalty`.
+`10.0` objective units. Configure them with `--feasibility-lookahead-depth` and
+`--feasibility-risk-penalty`.
