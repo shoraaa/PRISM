@@ -1,19 +1,19 @@
-# PRISM: Learning to Relax Interacting Constraints for Routing Search
+# PRISM: Compositional Constraint Interaction Fields for Routing Search
 
 Routing constraints rarely act in isolation. Capacity changes which time-window
 transitions remain useful; route limits alter the value of returning to a depot;
 pickup-delivery precedence reshapes feasible neighborhoods; and these effects
 change again as the incumbent solution evolves. A binary feasibility mask can
-reject an illegal move, but it does not express the opportunity cost of spending
-several scarce resources at once.
+reject an illegal move, but it does not express how several active resources
+jointly reshape the value of otherwise feasible choices.
 
-PRISM learns this missing search signal. It represents every active constraint
-as a typed resource, constructs a continuous edge-level relaxation of its local
-pressure, and assigns state-dependent prices to the interacting resources. These
-learned constraint fields guide a sparse iterative search while a unified native
-decoder maintains the exact routing semantics. One model therefore learns how
-constraint interactions reshape promising search directions across a
-compositional family of routing problems.
+PRISM introduces **constraint interaction fields**: typed, continuous edge-level
+signals that represent how individual routing resources and their interactions
+reshape the value of candidate search moves. The fields combine analytic
+resource pressure, learned pressure corrections, live state-dependent
+modulation, and continuation-risk potential. A unified native decoder maintains
+exact routing semantics and feasibility while the learned fields provide
+continuous guidance before hard constraint violations occur.
 
 The C++ backend builds a directed `O(nK)` candidate graph with `K=64`, runs
 parallel search ants with static OpenMP scheduling, and improves solutions with
@@ -21,9 +21,10 @@ scope-restricted refinement (SRR). The neural model operates directly on this
 search graph and is refreshed whenever an accepted incumbent installs a new
 graph. Classical ACO guidance remains available as a matched search baseline.
 
-## Learned constraint relaxation
+## Constraint interaction fields
 
-For candidate edge `e` in search state `s`, PRISM uses the energy
+For candidate edge `e` in search state `s`, PRISM uses the constraint-aware
+search energy
 
 ```text
 E(e | s) = c(e)
@@ -35,28 +36,38 @@ where:
 
 - `c(e)` is the objective-aware edge cost;
 - `p_r(e)` is the analytic pressure of resource `r`;
-- `rho_r(e)` and `a_r(e)` are learned multiplicative and additive relaxations;
-- `lambda_r(s)` is the learned, live-state-coupled price of that resource; and
-- `q(e)` is a learned look-ahead feasibility risk.
+- `rho_r(e)` and `a_r(e)` are learned multiplicative and additive pressure
+  corrections;
+- `lambda_r(s)` is the learned, live-state-modulated intensity of that resource;
+  and
+- `q(e)` is a learned continuation-risk potential.
 
 The multiplicative term adapts known physical pressure, while the additive term
 represents interactions that remain informative when the analytic pressure is
 zero. Resource-token attention lets capacity, time windows, route limits,
 backhaul, pickup-delivery, and prize requirements change one another's learned
-prices. A lightweight state coupler then updates those prices at every logged
-decision without rerunning the full GNN.
+intensities. A lightweight state coupler then updates those intensities at every
+logged decision without rerunning the full GNN.
 
-The relaxation is trained at two resolutions. Exact C++ screening traces teach
-the field to predict counterfactual resource changes and binding structure;
-sparse continuation look-ahead teaches edge feasibility risk. PPO then optimizes
-the resulting search policy from accepted improvements, using event-driven SMDP
-options to carry credit across incumbent changes.
+Together, the resource-specific channels form the constraint interaction field.
+Each **resource field** describes one typed constraint over the candidate graph;
+resource-token attention makes every channel depend on the complete active
+constraint composition, and state modulation adapts it to the current partial
+solution.
+
+The field is trained at two resolutions. Exact C++ screening traces teach it to
+predict counterfactual resource changes and binding structure; sparse
+continuation look-ahead teaches the continuation-risk potential. PPO then
+optimizes the resulting search policy from accepted improvements, using
+event-driven SMDP options to carry credit across incumbent changes.
 
 ## Contributions
 
-- **Learned relaxation of interacting constraints.** PRISM replaces a single
-  hand-designed heuristic with typed edge fields and state-dependent resource
-  prices learned jointly across routing objectives and constraint compositions.
+- **Constraint interaction fields.** PRISM factorizes neural search guidance
+  into typed resource-specific fields whose values depend jointly on candidate
+  edges, active constraint composition, and live search state. This structure
+  provides continuous guidance before hard constraint violation while retaining
+  exact decoder-enforced feasibility.
 - **Compositional routing representation.** A shared resource-token model and a
   unified decoder cover capacity, time windows, route and tour limits, backhaul,
   pickup-delivery, prize quota, open routes, multiple depots, optional customers,
@@ -74,9 +85,10 @@ options to carry credit across incumbent changes.
 
 The GNN emits one field for each constraint resource. Node, edge,
 resource-token, and live-state inputs are normalized to `[0, 1]`. Active
-resource tokens attend to one another before producing edge relaxations, global
-prices, binding predictions, and live-state coupler parameters. The decoder is
-the source of truth for graph dimensions, resource scales, and active channels.
+resource tokens attend to one another before producing edge pressure
+corrections, global resource intensities, binding predictions, and live-state
+coupler parameters. The decoder is the source of truth for graph dimensions,
+resource scales, and active channels.
 
 The field is refreshed when the incumbent improves or a new candidate graph is
 installed. Stagnation ends the current SMDP option without recomputing an
@@ -160,7 +172,7 @@ uv run python generate_validation_data.py --n-node 100
 
 ## Training
 
-Train the resource-token relaxation and event-driven decoder with:
+Train the resource-token interaction fields and event-driven decoder with:
 
 ```bash
 uv run python train.py --n-node 1000 --pretrain-epochs 3 \
@@ -220,22 +232,26 @@ uv run python tests/urs_one_each.py --ants 1 --threads 1 --iterations 2 \
   --no-pheromone --verify-incremental-srr
 ```
 
-`--guidance field` exercises the neutral typed-field interface. Evaluate a
-trained relaxation against the matched non-neural decoder on every benchmark
-composition with:
+`--guidance field` exercises the neutral typed-field interface. Evaluate trained
+constraint interaction fields against the matched non-neural decoder on every
+benchmark composition with:
 
 ```bash
-PYTHONPATH=src uv run --no-sync python tests/compare_decoders.py \
+PYTHONPATH=src uv run --no-sync python test.py \
   --checkpoint pretrained/best.pt --variants all --iterations 16 \
   --csv results/checkpoint_vs_non_neural.csv
 ```
 
-Both paths use the same instance, seed, candidate budget, ant count,
-post-bootstrap iteration count, and available oracle reference. Dynamic field
-refinement is enabled by default. Use `--static-field` to evaluate one frozen
-relaxation for the full solve, or `--variants tsp,cvrp,cvrptw` for a focused
-subset. The report records objective, reference gap, runtime, field mode, and
-neural evaluation count for every variant.
+By default, `test.py` evaluates all 110 benchmark variants using the first eight
+saved instances of each. It reports overall results plus separate `SEEN` results
+for the 15 benchmark variants in the training curriculum and `HELDOUT` results
+for the remaining 95. Both decoder paths use the same paired per-instance seed,
+candidate budget, ant count, post-bootstrap iteration count, and matched oracle
+reference. Dynamic field refinement is enabled by default. For a focused subset,
+use `--val-size 1 --variants tsp,cvrp,cvrptw`; use `--static-field` to evaluate
+one frozen field for the full solve. The report and optional CSV record the data
+split, mean objective, baseline improvement, reference gap, runtime, field mode,
+and neural evaluation count for every variant.
 
 ## Large-scale inference
 

@@ -41,6 +41,10 @@ def test_registry_includes_capacity_free_vrptw_training_problem() -> None:
             "ocvrp",
             "ocvrptw",
             "pdtsp",
+            "mdocvrp",
+            "amdocvrp",
+            "mdcvrptw",
+            "mdocvrptw",
         ],
         key=len,
     )
@@ -135,6 +139,70 @@ def test_pickle_reference_uses_count_relative_to_nonzero_start(
         )
 
 
+def test_pt_reference_uses_count_relative_to_nonzero_start(
+    tmp_path: Path,
+) -> None:
+    data_path = tmp_path / "cvrp2.pt"
+    solution_path = tmp_path / "cvrp2_hgs.pt"
+    torch.save({"xy": torch.rand(3, 3, 2)}, data_path)
+    torch.save({"cost": torch.tensor([11.0, 22.0])}, solution_path)
+
+    _, reference = load_saved_data(
+        data_path,
+        "cvrp",
+        1,
+        start=1,
+        solution_path=solution_path,
+    )
+
+    assert reference == 22.0
+    with pytest.raises(ValueError, match="requested 1 references"):
+        load_saved_data(
+            data_path,
+            "cvrp",
+            1,
+            start=2,
+            solution_path=solution_path,
+        )
+
+
+def test_saved_data_rejects_short_instance_slice(tmp_path: Path) -> None:
+    data_path = tmp_path / "cvrp2.pt"
+    torch.save({"xy": torch.rand(2, 3, 2)}, data_path)
+
+    with pytest.raises(ValueError, match="requested 2 instances from index 1"):
+        load_saved_data(data_path, "cvrp", 2, start=1)
+
+
+def test_saved_problems_excludes_population_reference_constants(
+    tmp_path: Path,
+) -> None:
+    directory = tmp_path / "op"
+    directory.mkdir()
+    torch.save(torch.rand(2, 4, 3), directory / "op3.pt")
+
+    _, reference = SavedProblems(3, tmp_path).load("op", index=1)
+
+    assert reference is None
+
+
+def test_saved_problems_excludes_scalar_embedded_reference(
+    tmp_path: Path,
+) -> None:
+    directory = tmp_path / "atsp"
+    directory.mkdir()
+    distance = torch.rand(2, 3, 3)
+    distance.diagonal(dim1=1, dim2=2).zero_()
+    torch.save(
+        {"dist": distance, "optimal": torch.tensor(1.5)},
+        directory / "atsp3.pt",
+    )
+
+    _, reference = SavedProblems(3, tmp_path).load("atsp", index=1)
+
+    assert reference is None
+
+
 def test_owned_generators_cover_the_existing_training_curriculum() -> None:
     for variant in TRAIN_VARIANTS:
         problem = generated_problem(variant, 20)
@@ -163,4 +231,6 @@ def test_curriculum_exposes_tw_only_task_in_the_first_phase() -> None:
         "vrptw",
         "cvrptw",
         "ocvrptw",
+        "mdcvrptw",
+        "mdocvrptw",
     }

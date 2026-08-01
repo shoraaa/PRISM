@@ -756,6 +756,7 @@ public:
     result["depot_count"] = problem.depot_count;
     result["constraints"] = prism::constraint_names(problem.constraints);
     result["objective"] = prism::objective_name(problem.objective);
+    result["objective_scale"] = solver_.objective_scale();
     result["direction"] = prism::objective_direction(problem.objective);
     result["multi_route"] = problem.multi_route;
     result["open_route"] = problem.open_route;
@@ -847,6 +848,12 @@ public:
         {solver_.problem().node_count, prism::NODE_FEATURE_COUNT});
   }
 
+  py::array_t<float> incumbent_live_state() const {
+    return vector_copy<float>(
+        solver_.incumbent_live_state(),
+        {solver_.problem().node_count, prism::LIVE_STATE_FEATURE_COUNT});
+  }
+
   py::array_t<float> resource_features() const {
     return vector_copy<float>(
         solver_.resource_features(),
@@ -915,7 +922,7 @@ private:
 
 PYBIND11_MODULE(prism_decoder, module) {
   module.doc() =
-      "Variant-general search decoder for constraint-resolved routing fields";
+      "Variant-general decoder for compositional constraint interaction fields";
 
   module.def("set_num_threads", [](int32_t count) {
     if (count <= 0) {
@@ -980,6 +987,8 @@ PYBIND11_MODULE(prism_decoder, module) {
       .def_property_readonly("proximity", &PyDecoder::proximity)
       .def_property_readonly("edge_features", &PyDecoder::edge_features)
       .def_property_readonly("node_features", &PyDecoder::node_features)
+      .def_property_readonly("incumbent_live_state",
+                             &PyDecoder::incumbent_live_state)
       .def_property_readonly("resource_features",
                              &PyDecoder::resource_features)
       .def_property_readonly("resource_pressure",

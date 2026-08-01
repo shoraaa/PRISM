@@ -79,7 +79,9 @@ assert len(BENCHMARK_VARIANTS) == 110
 
 # VRPTW activates only the time-window resource while allowing depot-separated
 # routes. CVRPTW and OCVRPTW then teach capacity/TW and open-route/TW
-# interactions in later curriculum phases.
+# interactions in later curriculum phases. The md* entries put depot_count > 1
+# in-distribution (previously only 0/1 was ever generated), including the
+# open × multi-depot combination that was pure zero-shot before.
 TRAIN_VARIANTS = _sort_variants(
     (
         "atsp",
@@ -94,6 +96,10 @@ TRAIN_VARIANTS = _sort_variants(
         "ocvrp",
         "ocvrptw",
         "pdtsp",
+        "mdocvrp",
+        "amdocvrp",
+        "mdcvrptw",
+        "mdocvrptw",
     )
 )
 ALL_VARIANTS = _sort_variants(BENCHMARK_VARIANTS + ["vrptw"])
@@ -295,9 +301,7 @@ def generated_problem(name: str, size: int, capacity: int = 50) -> dict:
     """Generate one training problem using PRISM-owned distributions."""
     name = name.lower()
     supported = set(TRAIN_VARIANTS) | {
-        variant
-        for variant in BENCHMARK_VARIANTS
-        if "cvrp" in variant and "md" not in variant
+        variant for variant in BENCHMARK_VARIANTS if "cvrp" in variant
     }
     if name not in supported:
         raise NotImplementedError(f"no random generator for {name}")
@@ -307,7 +311,7 @@ def generated_problem(name: str, size: int, capacity: int = 50) -> dict:
     if name in {"pdtsp", "apdtsp"} and size % 2:
         size += 1
 
-    depot_count = 0 if name in {"tsp", "atsp"} else 1
+    depot_count = 0 if name in {"tsp", "atsp"} else 3 if "md" in name else 1
     node_count = size + depot_count
     data: dict[str, torch.Tensor] = {}
     if name.startswith("a"):
@@ -317,7 +321,7 @@ def generated_problem(name: str, size: int, capacity: int = 50) -> dict:
 
     if "cvrp" in name:
         demand = torch.randint(1, 10, (1, node_count)).float() / float(capacity)
-        demand[:, 0] = 0
+        demand[:, :depot_count] = 0
         if "pd" in name:
             customer_count = node_count - 1
             if customer_count % 2:
@@ -328,19 +332,30 @@ def generated_problem(name: str, size: int, capacity: int = 50) -> dict:
             ) / float(capacity)
         elif "b" in name:
             count = max(1, int(size * 0.2))
-            backhaul = torch.randperm(size)[:count] + 1
+            backhaul = torch.randperm(size)[:count] + depot_count
             demand[:, backhaul] *= -1
         data["demand"] = demand
 
         if "tw" in name:
+            # Windows are sized against the nearest depot so multi-depot
+            # instances stay individually serviceable from whichever depot a
+            # route is anchored to (identical to depot 0 when depot_count == 1).
             if "dist" in data:
-                travel_out = data["dist"][:, 0, 1:]
-                travel_back = data["dist"][:, 1:, 0]
-            else:
-                coordinates = data["xy"]
-                travel_out = travel_back = torch.linalg.vector_norm(
-                    coordinates[:, 1:] - coordinates[:, :1], dim=-1
+                matrix = data["dist"][0]
+                travel_out = matrix[:depot_count, depot_count:].amin(
+                    dim=0, keepdim=True
                 )
+                travel_back = matrix[depot_count:, :depot_count].amin(
+                    dim=1
+                ).unsqueeze(0)
+            else:
+                coordinates = data["xy"][0]
+                radial = torch.linalg.vector_norm(
+                    coordinates[depot_count:, None, :]
+                    - coordinates[None, :depot_count, :],
+                    dim=-1,
+                )
+                travel_out = travel_back = radial.amin(dim=1).unsqueeze(0)
             service = torch.full((1, size), 0.2)
             horizon = 1.0 if name.startswith("a") else 3.0
             earliest = travel_out
@@ -349,9 +364,12 @@ def generated_problem(name: str, size: int, capacity: int = 50) -> dict:
             half_width = horizon / 3 + (service / 2 - horizon / 3) * torch.rand(1, size)
             start = torch.clamp(center - half_width, 0.0, horizon)
             end = torch.clamp(center + half_width, 0.0, horizon)
-            data["service_time"] = torch.cat((torch.zeros(1, 1), service), dim=1)
-            data["tw_start"] = torch.cat((torch.zeros(1, 1), start), dim=1)
-            data["tw_end"] = torch.cat((torch.full((1, 1), horizon), end), dim=1)
+            depot_zeros = torch.zeros(1, depot_count)
+            data["service_time"] = torch.cat((depot_zeros, service), dim=1)
+            data["tw_start"] = torch.cat((depot_zeros, start), dim=1)
+            data["tw_end"] = torch.cat(
+                (torch.full((1, depot_count), horizon), end), dim=1
+            )
         if "l" in name:
             limit = 0.6 if name.startswith("a") else 3.0
             data["route_limit"] = torch.full((1,), limit)
@@ -570,23 +588,19 @@ class DatasetFinder:
 
 
 def _reference(
-    solution_path: Path | None, name: str, start: int, count: int
+    solution_path: Path | None, start: int, count: int
 ) -> float | None:
     if solution_path is None:
         return None
     if solution_path.suffix == ".pt":
         saved = torch.load(solution_path, map_location="cpu", weights_only=False)
         values = torch.as_tensor(saved["cost"]).reshape(-1)
-        # Preserve the existing evaluation contract: only these asymmetric
-        # prize variants used an instance slice; the other PT references were
-        # reported as the full saved-set mean.
-        if name in {"aop", "apctsp", "aspctsp"}:
-            values = values[start : start + count]
-            if values.numel() != count:
-                raise ValueError(
-                    f"requested {count} references from index {start}, "
-                    f"but {solution_path} contains only {values.numel()}"
-                )
+        values = values[start : start + count]
+        if values.numel() != count:
+            raise ValueError(
+                f"requested {count} references from index {start}, "
+                f"but {solution_path} contains only {values.numel()}"
+            )
         reference = float(values.float().mean())
         if not np.isfinite(reference):
             raise ValueError(f"non-finite reference in {solution_path}")
@@ -703,20 +717,27 @@ def _load_pickle_data(path: Path, name: str, start: int, count: int) -> dict:
     return result
 
 
-def _load_tensor_data(path: Path, name: str, start: int, count: int) -> tuple[dict, float | None]:
+def _load_tensor_data(
+    path: Path, name: str, start: int, count: int
+) -> tuple[dict, float | None, bool]:
     saved = torch.load(path, map_location="cpu", weights_only=False)
     embedded = None
+    embedded_is_aggregate = False
     if torch.is_tensor(saved):
         batch = saved[start : start + count].float()
         if name == "op":
-            return {"xy": batch[:, :, :2], "prize": batch[:, :, 2]}, None
+            return (
+                {"xy": batch[:, :, :2], "prize": batch[:, :, 2]},
+                None,
+                False,
+            )
         if "pctsp" in name:
             return {
                 "xy": batch[:, :, :2],
                 "prize": batch[:, :, 2],
                 "penalty": batch[:, :, -1],
-            }, None
-        return {"xy": batch}, None
+            }, None, False
+        return {"xy": batch}, None, False
 
     def sliced(key: str) -> torch.Tensor:
         return torch.as_tensor(saved[key])[start : start + count].float()
@@ -757,10 +778,18 @@ def _load_tensor_data(path: Path, name: str, start: int, count: int) -> tuple[di
         if key in saved:
             value = saved[key]
             if torch.is_tensor(value) and value.ndim:
-                value = value[start : start + count].float().mean()
+                values = value[start : start + count].float()
+                if values.shape[0] != count:
+                    raise ValueError(
+                        f"requested {count} embedded references from index "
+                        f"{start}, but {path} contains only {values.shape[0]}"
+                    )
+                value = values.mean()
+            else:
+                embedded_is_aggregate = True
             embedded = float(value)
             break
-    return result, embedded
+    return result, embedded, embedded_is_aggregate
 
 
 def load_saved_data(
@@ -770,27 +799,47 @@ def load_saved_data(
     *,
     start: int = 0,
     solution_path: Path | str | None = None,
+    allow_aggregate_reference: bool = True,
 ) -> tuple[dict, float | None]:
     """Read benchmark files into PRISM's neutral batched tensor schema."""
     path = Path(path)
     if path.suffix == ".txt":
         data, embedded = _load_txt_tsp(path, start, count)
+        embedded_is_aggregate = False
     elif path.suffix == ".pkl":
         data = _load_pickle_data(path, name, start, count)
         embedded = None
+        embedded_is_aggregate = False
     elif path.suffix == ".pt":
-        data, embedded = _load_tensor_data(path, name, start, count)
+        data, embedded, embedded_is_aggregate = _load_tensor_data(
+            path, name, start, count
+        )
     else:
         raise ValueError(f"unsupported dataset file: {path}")
+    batch_sizes = {
+        int(value.shape[0])
+        for value in data.values()
+        if torch.is_tensor(value) and value.ndim > 0
+    }
+    if batch_sizes != {count}:
+        raise ValueError(
+            f"requested {count} instances from index {start}, but {path} "
+            f"loaded batch sizes {sorted(batch_sizes)}"
+        )
     reference = _reference(
         None if solution_path is None else Path(solution_path),
-        name,
         start,
         count,
     )
-    if reference is None and embedded is None:
-        reference = _default_reference(name)
-    selected_reference = reference if reference is not None else embedded
+    selected_reference = reference
+    if (
+        selected_reference is None
+        and embedded is not None
+        and (allow_aggregate_reference or not embedded_is_aggregate)
+    ):
+        selected_reference = embedded
+    if selected_reference is None and allow_aggregate_reference:
+        selected_reference = _default_reference(name)
     if selected_reference is not None and not np.isfinite(selected_reference):
         raise ValueError(f"non-finite embedded reference in {path}")
     return data, selected_reference
@@ -815,5 +864,6 @@ class SavedProblems:
             1,
             start=index,
             solution_path=paths["solution_path"],
+            allow_aggregate_reference=False,
         )
         return decoder_problem(name, data), reference

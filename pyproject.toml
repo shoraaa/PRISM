@@ -1,7 +1,7 @@
 [project]
 name = "prism"
 version = "0.1.0"
-description = "Constraint-resolved dual fields for guided multi-constraint VRP search"
+description = "Compositional constraint interaction fields for routing search"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [

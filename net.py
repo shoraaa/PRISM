@@ -12,11 +12,36 @@ NODE_FEATURE_COUNT = prism_decoder.NODE_FEATURE_COUNT
 EDGE_FEATURE_COUNT = prism_decoder.EDGE_FEATURE_COUNT
 
 
+OBJECTIVE_TYPES = ("distance", "prize", "distance_plus_penalty")
+
+
 def _require_unit_interval(name, value):
     if not torch.isfinite(value).all():
         raise ValueError(f"{name} must contain only finite values")
     if value.numel() and (value.min() < -1e-6 or value.max() > 1.0 + 1e-6):
         raise ValueError(f"{name} must be normalized to [0, 1]")
+
+
+def _per_graph_descriptor(pyg, name, width, batch_size, reference, default=None):
+    """Resolve a per-graph conditioning tensor to shape [batch_size, width]."""
+    value = getattr(pyg, name, None)
+    if value is None:
+        if default is None:
+            value = reference.new_zeros(batch_size, width)
+        else:
+            value = reference.new_tensor(default).view(1, width).expand(
+                batch_size, -1
+            )
+    else:
+        value = value.to(reference.dtype)
+        if value.ndim == 1:
+            value = value.unsqueeze(0)
+        if value.shape[0] == 1 and batch_size != 1:
+            value = value.expand(batch_size, -1)
+        if value.shape != (batch_size, width):
+            raise ValueError(f"{name} must have shape [num_graphs, {width}]")
+    _require_unit_interval(name, value)
+    return value
 
 
 def build_decoder_data(decoder, device="cpu"):
@@ -37,6 +62,27 @@ def build_decoder_data(decoder, device="cpu"):
     ).view(1, FIELD_CHANNEL_COUNT)
     open_route = torch.tensor(
         [[float(bool(decoder.metadata["open_route"]))]],
+        dtype=torch.float32,
+        device=device,
+    )
+    objective_type = torch.zeros(1, len(OBJECTIVE_TYPES), device=device)
+    objective_type[0, OBJECTIVE_TYPES.index(decoder.metadata["objective"])] = 1.0
+    objective_scale = torch.tensor(
+        [[float(decoder.metadata["objective_scale"])]],
+        dtype=torch.float32,
+        device=device,
+    )
+    multi_route = torch.tensor(
+        [[float(bool(decoder.metadata["multi_route"]))]],
+        dtype=torch.float32,
+        device=device,
+    )
+    # Squash the raw depot count into [0, 1): 0->0, 1->0.5, 3->0.75. Gives the
+    # field a graph-level multi-depot signal that node feature is_depot (a single
+    # binary flag shared by every depot) and raw edge distances cannot convey.
+    depot_count = float(decoder.metadata["depot_count"])
+    depot_scale = torch.tensor(
+        [[depot_count / (1.0 + depot_count)]],
         dtype=torch.float32,
         device=device,
     )
@@ -79,6 +125,10 @@ def build_decoder_data(decoder, device="cpu"):
         edge_attr=edge_attr,
         active_channels=active_channels,
         open_route=open_route,
+        objective_type=objective_type,
+        objective_scale=objective_scale,
+        multi_route=multi_route,
+        depot_scale=depot_scale,
         raw_resource_pressure=raw_resource_pressure,
         objective_edge_costs=objective_edge_costs,
         resource_scales=resource_scales,
@@ -201,7 +251,8 @@ class ConstraintFieldNet(nn.Module):
             grad_checkpointing=grad_checkpointing,
         )
         # resource-type one-hot + active flag + mean/max pressure + open_route
-        descriptor_size = FIELD_CHANNEL_COUNT + 4
+        # + objective-type one-hot + objective scale + multi_route + depot scale
+        descriptor_size = FIELD_CHANNEL_COUNT + 4 + len(OBJECTIVE_TYPES) + 1 + 2
         self.resource_encoder = nn.Sequential(
             nn.Linear(descriptor_size, units),
             nn.SiLU(),
@@ -243,12 +294,12 @@ class ConstraintFieldNet(nn.Module):
             "unit_softplus_shift",
             torch.log(torch.expm1(torch.ones(()))),
         )
-        # The additive correction is a non-negative Lagrangian offset: the C++
-        # energy is multiplier * max(pressure*residual + additive, 0), so a
-        # negative additive can cancel the whole penalty to zero (the field
-        # then becomes inert). Parametrize it through softplus and shift it so
-        # it initializes near zero, i.e. a neutral additive term whose gradient
-        # is still healthy, mirroring the unit-initialized multiplicative field.
+        # The additive correction supplies learned pressure when the analytic
+        # pressure is zero. The C++ search energy uses
+        # intensity * max(pressure*residual + additive, 0); parameterize the
+        # correction through softplus and shift it to initialize near zero with
+        # a healthy gradient, alongside the unit-initialized multiplicative
+        # correction.
         self.register_buffer(
             "additive_softplus_shift",
             torch.log(torch.expm1(torch.full((), 0.01))),
@@ -299,18 +350,27 @@ class ConstraintFieldNet(nn.Module):
         if active.shape[0] != graph_embedding.shape[0]:
             raise ValueError("active_channels must have one row per graph")
 
-        open_route = getattr(pyg, "open_route", None)
-        if open_route is None:
-            open_route = active.new_zeros(graph_embedding.shape[0], 1)
-        else:
-            open_route = open_route.to(active.dtype)
-            if open_route.ndim == 1:
-                open_route = open_route.unsqueeze(-1)
-            if open_route.shape[0] == 1 and graph_embedding.shape[0] != 1:
-                open_route = open_route.expand(graph_embedding.shape[0], -1)
-            if open_route.shape != (graph_embedding.shape[0], 1):
-                raise ValueError("open_route must have one scalar per graph")
-        _require_unit_interval("open_route", open_route)
+        batch_size = graph_embedding.shape[0]
+        open_route = _per_graph_descriptor(
+            pyg, "open_route", 1, batch_size, active
+        )
+        objective_type = _per_graph_descriptor(
+            pyg,
+            "objective_type",
+            len(OBJECTIVE_TYPES),
+            batch_size,
+            active,
+            default=[1.0] + [0.0] * (len(OBJECTIVE_TYPES) - 1),
+        )
+        objective_scale = _per_graph_descriptor(
+            pyg, "objective_scale", 1, batch_size, active
+        )
+        multi_route = _per_graph_descriptor(
+            pyg, "multi_route", 1, batch_size, active
+        )
+        depot_scale = _per_graph_descriptor(
+            pyg, "depot_scale", 1, batch_size, active
+        )
 
         normalized_resources = pyg.edge_attr[:, 1 : 1 + FIELD_CHANNEL_COUNT]
         if batched:
@@ -326,16 +386,20 @@ class ConstraintFieldNet(nn.Module):
         resource_type = self.resource_types.unsqueeze(0).expand(
             graph_embedding.shape[0], -1, -1
         )
-        open_route_column = open_route.unsqueeze(1).expand(
-            -1, FIELD_CHANNEL_COUNT, -1
-        )
+        def _broadcast(column):
+            return column.unsqueeze(1).expand(-1, FIELD_CHANNEL_COUNT, -1)
+
         descriptor = torch.cat(
             (
                 resource_type,
                 active.unsqueeze(-1),
                 resource_mean.unsqueeze(-1),
                 resource_max.unsqueeze(-1),
-                open_route_column,
+                _broadcast(open_route),
+                _broadcast(objective_type),
+                _broadcast(objective_scale),
+                _broadcast(multi_route),
+                _broadcast(depot_scale),
             ),
             dim=-1,
         )

@@ -611,7 +611,7 @@ def test_default_validation_uses_all_seen_and_stratified_heldout(
         *curriculum.variants,
         *VALIDATION_HELDOUT_VARIANTS,
     ]
-    assert len(data) == 28
+    assert len(data) == 32
     assert all(item["reference_source"] == "saved" for item in data)
 
 

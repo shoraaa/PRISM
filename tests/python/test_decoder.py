@@ -246,6 +246,67 @@ def test_all_decoder_gnn_inputs_are_normalized() -> None:
     assert np.all((solver.node_features >= 0.0) & (solver.node_features <= 1.0))
 
 
+def test_incumbent_live_state_matches_transition_scales_and_timing() -> None:
+    coordinates = np.array(
+        [[0.0, 0.0], [2.0, 0.0], [4.0, 0.0], [6.0, 0.0]],
+        dtype=np.float32,
+    )
+    distance = np.linalg.norm(
+        coordinates[:, None] - coordinates[None, :], axis=-1
+    ).astype(np.float32)
+    service_time = np.array([0.0, 2.0, 2.0, 2.0], dtype=np.float32)
+    solver = prism_decoder.Decoder(
+        {
+            "name": "cvrpltw",
+            "coordinates": coordinates,
+            "distance": distance,
+            "demand": np.zeros(4, dtype=np.float32),
+            "route_limit": 20.0,
+            "tw_start": np.zeros(4, dtype=np.float32),
+            "tw_end": np.full(4, 30.0, dtype=np.float32),
+            "service_time": service_time,
+        },
+        n_ants=1,
+    )
+
+    solver.set_incumbent(np.array([0, 1, 2, 3, 0], dtype=np.int32))
+
+    channels = list(prism_decoder.FIELD_CHANNEL_NAMES)
+    live = solver.incumbent_live_state[1]
+    assert live[channels.index("time_window")] == pytest.approx(4.0 / 30.0)
+    assert live[channels.index("route_limit")] == pytest.approx(2.0 / 20.0)
+
+
+def test_incumbent_tour_state_uses_tour_limit() -> None:
+    coordinates = np.array(
+        [[0.0, 0.0], [2.0, 0.0], [4.0, 0.0], [6.0, 0.0]],
+        dtype=np.float32,
+    )
+    distance = np.linalg.norm(
+        coordinates[:, None] - coordinates[None, :], axis=-1
+    ).astype(np.float32)
+    solver = prism_decoder.Decoder(
+        {
+            "name": "tour-test",
+            "coordinates": coordinates,
+            "distance": distance,
+            "constraints": ["tour_limit"],
+            "depot_count": 1,
+            "tour_limit": 20.0,
+            "service_time": np.array(
+                [0.0, 2.0, 2.0, 2.0], dtype=np.float32
+            ),
+        },
+        n_ants=1,
+    )
+
+    solver.set_incumbent(np.array([0, 1, 2, 3, 0], dtype=np.int32))
+
+    channels = list(prism_decoder.FIELD_CHANNEL_NAMES)
+    live = solver.incumbent_live_state[1]
+    assert live[channels.index("tour_limit")] == pytest.approx(2.0 / 20.0)
+
+
 def test_resource_features_use_exported_cpp_scales() -> None:
     coordinates, distance = euclidean_problem(3, 123)
     solver = prism_decoder.Decoder(

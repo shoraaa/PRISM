@@ -137,6 +137,89 @@ def test_constraint_field_net_rejects_unnormalized_inputs() -> None:
         ConstraintFieldNet(depth=1, units=8).eval()(data)
 
 
+def test_objective_conditioning_reaches_descriptor_and_field() -> None:
+    rng = np.random.default_rng(305)
+    coordinates = rng.random((18, 2), dtype=np.float32)
+    distance = np.linalg.norm(
+        coordinates[:, None] - coordinates[None, :], axis=-1
+    ).astype(np.float32)
+    prize = np.r_[0.0, rng.uniform(0.05, 1.0, 17)].astype(np.float32)
+
+    distance_problem = prism_decoder.Decoder(
+        {"name": "tsp", "coordinates": coordinates, "distance": distance},
+        n_ants=1,
+    )
+    prize_problem = prism_decoder.Decoder(
+        {
+            "name": "op",
+            "coordinates": coordinates,
+            "distance": distance,
+            "prize": prize,
+            "tour_limit": 4.0,
+        },
+        n_ants=1,
+    )
+
+    distance_data = build_decoder_data(distance_problem)
+    prize_data = build_decoder_data(prize_problem)
+
+    # One-hot objective type and a bounded per-graph scale reach the model.
+    assert distance_data.objective_type.shape == (1, 3)
+    assert torch.equal(
+        distance_data.objective_type, torch.tensor([[1.0, 0.0, 0.0]])
+    )
+    assert torch.equal(prize_data.objective_type, torch.tensor([[0.0, 1.0, 0.0]]))
+    for data in (distance_data, prize_data):
+        assert 0.0 <= float(data.objective_scale) <= 1.0
+
+    # A shared model must produce different fields for different objectives.
+    model = ConstraintFieldNet(depth=2, units=16).eval()
+    with torch.no_grad():
+        distance_output = model(distance_data)
+        prize_output = model(prize_data)
+    assert not torch.allclose(
+        distance_output["multipliers"], prize_output["multipliers"]
+    ) or not torch.allclose(
+        distance_output["residual"].mean(0), prize_output["residual"].mean(0)
+    )
+
+
+def test_depot_conditioning_reaches_descriptor_and_field() -> None:
+    import problem_data
+
+    single = prism_decoder.Decoder(
+        problem_data.generated_problem("ocvrp", 16), n_ants=1
+    )
+    multi = prism_decoder.Decoder(
+        problem_data.generated_problem("mdocvrp", 16), n_ants=1
+    )
+    single_data = build_decoder_data(single)
+    multi_data = build_decoder_data(multi)
+
+    # The raw depot count is squashed to [0, 1): 1 -> 0.5, 3 -> 0.75.
+    assert float(single_data.depot_scale) == pytest.approx(0.5)
+    assert float(multi_data.depot_scale) == pytest.approx(0.75)
+    assert float(single_data.multi_route) == 1.0
+    assert float(multi_data.multi_route) == 1.0
+    for data in (single_data, multi_data):
+        assert 0.0 <= float(data.depot_scale) < 1.0
+
+    # Neutralizing the depot conditioning on the same graph must move the field,
+    # proving the signal reaches the shaped multipliers rather than being inert.
+    model = ConstraintFieldNet(depth=2, units=16).eval()
+    neutral_data = multi_data.clone()
+    neutral_data.depot_scale = torch.zeros(1, 1)
+    neutral_data.multi_route = torch.zeros(1, 1)
+    with torch.no_grad():
+        conditioned = model(multi_data)
+        neutral = model(neutral_data)
+    assert not torch.allclose(
+        conditioned["multipliers"], neutral["multipliers"]
+    ) or not torch.allclose(
+        conditioned["residual"].mean(0), neutral["residual"].mean(0)
+    )
+
+
 def test_resource_attention_handles_no_active_constraint_tokens() -> None:
     coordinates = np.array(
         [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]], dtype=np.float32

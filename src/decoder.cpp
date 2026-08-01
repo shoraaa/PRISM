@@ -747,6 +747,28 @@ std::vector<float> RoutingDecoder::resource_scales() const {
   return scales;
 }
 
+float RoutingDecoder::objective_scale() const {
+  // Average the objective magnitude over customer-arrival edges; depot legs are
+  // mode-specific (open/closed) and would bias the scale, so they are skipped.
+  double total = 0.0;
+  int64_t count = 0;
+  for (int32_t from = 0; from < problem_.node_count; ++from) {
+    for (int32_t edge = edge_offsets_[from]; edge < edge_offsets_[from + 1];
+         ++edge) {
+      if (edge_to_[edge] < problem_.depot_count)
+        continue;
+      total += std::abs(objective_edge_costs_[edge]);
+      ++count;
+    }
+  }
+  if (count == 0)
+    return 0.0f;
+  const double ratio =
+      (total / static_cast<double>(count)) / std::max(distance_scale_, EPS);
+  // ratio / (1 + ratio) squashes [0, inf) into [0, 1) without a hard clamp.
+  return static_cast<float>(ratio / (1.0 + ratio));
+}
+
 float RoutingDecoder::analytic_resource_pressure(int32_t from, int32_t to,
                                              int32_t channel) const {
   const float travel = problem_.dist(from, to);
@@ -896,7 +918,7 @@ RoutingDecoder::live_state_features(const State &state) const {
   result[static_cast<int32_t>(FieldChannel::ROUTE_LIMIT)] =
       unit(state.route_distance / route_scale);
   result[static_cast<int32_t>(FieldChannel::TOUR_LIMIT)] =
-      unit(state.current_time / tour_scale);
+      unit(state.route_distance / tour_scale);
   result[static_cast<int32_t>(FieldChannel::BACKHAUL_ORDER)] =
       state.route_has_backhaul ? 1.0f : 0.0f;
   result[static_cast<int32_t>(FieldChannel::PICKUP_DELIVERY)] =
@@ -1449,6 +1471,10 @@ void RoutingDecoder::build_model_features() {
     coordinate_scale = std::max({max_x - min_x, max_y - min_y, EPS});
   }
   const float capacity_scale = std::max(problem_.capacity, EPS);
+  const float route_scale =
+      resource_scale(static_cast<int32_t>(FieldChannel::ROUTE_LIMIT));
+  const float tour_scale =
+      resource_scale(static_cast<int32_t>(FieldChannel::TOUR_LIMIT));
   int32_t pair_count = 0;
   for (int32_t node = 0; node < n; ++node) {
     pair_count += problem_.delivery_of_pickup[node] >= 0 ? 1 : 0;
@@ -1517,12 +1543,16 @@ void RoutingDecoder::build_model_features() {
       features[17] = unit(static_cast<double>(std::max(open, 0)) /
                           std::max(pair_count, 1));
       features[18] = unit(distance / distance_scale_);
+      const float state_time = time + problem_.service_time[node];
       float *live = incumbent_live_state_.data() +
                     static_cast<size_t>(node) * LIVE_STATE_FEATURE_COUNT;
       live[static_cast<int32_t>(FieldChannel::CAPACITY)] = 1.0f - features[14];
-      live[static_cast<int32_t>(FieldChannel::TIME_WINDOW)] = features[15];
-      live[static_cast<int32_t>(FieldChannel::ROUTE_LIMIT)] = features[18];
-      live[static_cast<int32_t>(FieldChannel::TOUR_LIMIT)] = features[15];
+      live[static_cast<int32_t>(FieldChannel::TIME_WINDOW)] =
+          unit(state_time / time_scale_);
+      live[static_cast<int32_t>(FieldChannel::ROUTE_LIMIT)] =
+          unit(distance / route_scale);
+      live[static_cast<int32_t>(FieldChannel::TOUR_LIMIT)] =
+          unit(distance / tour_scale);
       live[static_cast<int32_t>(FieldChannel::BACKHAUL_ORDER)] =
           backhaul ? 1.0f : 0.0f;
       live[static_cast<int32_t>(FieldChannel::PICKUP_DELIVERY)] = features[17];
@@ -1533,7 +1563,7 @@ void RoutingDecoder::build_model_features() {
         if (!field_channel_active(channel))
           live[channel] = 0.0f;
       }
-      time += problem_.service_time[node];
+      time = state_time;
       previous = node;
     }
     float backward = depot >= 0 && !problem_.open_route

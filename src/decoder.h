@@ -216,6 +216,9 @@ public:
   const std::vector<float> &proximity() const { return proximity_; }
   const std::vector<float> &edge_features() const { return edge_features_; }
   const std::vector<float> &node_features() const { return node_features_; }
+  const std::vector<float> &incumbent_live_state() const {
+    return incumbent_live_state_;
+  }
   const std::vector<float> &resource_features() const {
     return resource_features_;
   }
@@ -226,6 +229,10 @@ public:
     return objective_edge_costs_;
   }
   std::vector<float> resource_scales() const;
+  // Bounded per-graph magnitude of the objective edge cost relative to the
+  // distance scale, in [0, 1). Gives the field the raw objective scale that
+  // per-edge normalization hides, so the multiplier can calibrate its units.
+  float objective_scale() const;
   const Solution &best_solution() const { return best_solution_; }
 
 private:
