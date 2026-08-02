@@ -980,7 +980,17 @@ def test_runtime_battery_resource_enforces_reset_and_exports_dynamic_rows() -> N
         solver.metadata["resource_count"],
         prism_decoder.RESOURCE_DESCRIPTOR_DIM,
     )
+    assert [row["operator"] for row in solver.metadata["resources"][:7]] == [
+        "capacity",
+        "time_window",
+        "route_limit",
+        "tour_limit",
+        "backhaul_order",
+        "pickup_delivery",
+        "prize_quota",
+    ]
     assert solver.metadata["resources"][-1]["name"] == "battery"
+    assert solver.metadata["resources"][-1]["operator"] == "affine_accumulator"
     assert solver.metadata["field_channel_mask"][-1] == 1
     coordinate_only = dict(problem)
     coordinate_only.pop("distance")

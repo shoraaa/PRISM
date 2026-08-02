@@ -85,8 +85,8 @@ live partial solution.
 
 ### Runtime resource algebra
 
-The decoder accepts a runtime `resources` registry in addition to the seven
-canonical compatibility rows. A declarative row names an operator primitive,
+The decoder uses one `resources` registry for compiled constraint kernels and
+declarative kernels alike. A declarative row names an operator primitive,
 its state dimension and direction, an extension input, reset events, scale, and
 the phase at which lower or upper bounds are checked. The first supported
 primitive is a scalar affine accumulator; it covers resources such as energy,
@@ -117,9 +117,9 @@ drives construction masks, incumbent validation, resource labels, pressure
 features, and live state. Each row also produces a 32-dimensional descriptor
 from algebraic properties (operator family, bound type, check phase, direction,
 scope, reset form, input coupling, scale, and tightness); names and registry
-positions are excluded. Resource tensors grow with the registry, while the
-canonical seven rows remain at their historical indices so the distance-only
-control path retains exact behavior.
+positions are excluded. Resource tensors grow with the registry, while field
+channels retain their model indices so the distance-only control path retains
+exact behavior.
 
 Native execution requires an explicit normalized schema. `constraints`,
 `objective`, `depot_count`, `multi_route`, and `open_route` must be declared;
@@ -128,7 +128,7 @@ name-only inputs are rejected. `prism_decoder.normalize_problem_schema(problem)`
 exposes the exact normalized dictionary and fills only schema-independent
 numeric defaults. `problem_data.py` owns benchmark-name-to-schema conversion.
 
-The canonical constraints are registered as compiled kernels with their schema
+Constraints are registered as compiled kernels with their schema
 name, stable field-channel slot, resource operator, and search capabilities
 (route/solution state, ordering, reversal sensitivity, and relations). The
 decoder selects its active kernel set from the declared `constraints`; generic
@@ -136,7 +136,7 @@ operators consult those capabilities instead of variant-name lists. The kernel
 bodies remain specialized native code so capacity, time windows,
 pickup-delivery, backhaul, and multi-depot search retain their existing speed
 and exact behavior. Algebra-declared resources append generic `extend + bound`
-kernels after the seven stable compatibility rows.
+kernels to the same registry after the seven model field rows.
 
 Candidate construction is itself schema-driven, so it extends to a new resource
 with no per-variant tuning. In the default `schema` mode, native admission ranks

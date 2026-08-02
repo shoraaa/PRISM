@@ -10,7 +10,8 @@
 namespace prism {
 
 static constexpr int32_t FIELD_CHANNEL_COUNT = 7;
-static constexpr int32_t CANONICAL_CONSTRAINT_COUNT = 8;
+static constexpr int32_t CONSTRAINT_KERNEL_COUNT = 8;
+static constexpr int32_t RESOURCE_KERNEL_COUNT = 8;
 static constexpr int32_t LIVE_STATE_FEATURE_COUNT = FIELD_CHANNEL_COUNT;
 static constexpr int32_t NODE_FEATURE_COUNT = 24;
 static constexpr int32_t EDGE_FEATURE_COUNT = 11;
@@ -34,13 +35,13 @@ enum class FieldChannel : uint8_t {
 };
 
 enum class ResourceOperator : uint8_t {
-  CANONICAL_CAPACITY,
-  CANONICAL_TIME_WINDOW,
-  CANONICAL_ROUTE_LIMIT,
-  CANONICAL_TOUR_LIMIT,
-  CANONICAL_BACKHAUL_ORDER,
-  CANONICAL_PICKUP_DELIVERY,
-  CANONICAL_PRIZE_QUOTA,
+  CAPACITY,
+  TIME_WINDOW,
+  ROUTE_LIMIT,
+  TOUR_LIMIT,
+  BACKHAUL_ORDER,
+  PICKUP_DELIVERY,
+  PRIZE_QUOTA,
   AFFINE_ACCUMULATOR,
 };
 
@@ -53,9 +54,9 @@ enum class BoundCheck : uint8_t { TRANSITION, ROUTE_END, SOLUTION_END };
 // never calls Python and never performs string lookup.
 struct ResourceSpec {
   std::string name;
-  // Canonical rows remain present, even when their constraint is not
-  // active, so v1 tensor/channel ordering stays losslessly aligned. Runtime
-  // schema rows are always active and append after those compatibility rows.
+  // Compiled constraint rows and declarative rows share this representation.
+  // Inactive constraint rows remain present so tensor positions are stable
+  // within the current model contract.
   bool active = true;
   ResourceOperator op = ResourceOperator::AFFINE_ACCUMULATOR;
   ResourceDirection direction = ResourceDirection::FORWARD;
@@ -75,9 +76,6 @@ struct ResourceSpec {
   std::vector<float> node_values;
   std::vector<uint8_t> reset_nodes;
 
-  bool is_canonical() const {
-    return op != ResourceOperator::AFFINE_ACCUMULATOR;
-  }
 };
 
 enum class Objective : uint8_t {
@@ -98,7 +96,7 @@ enum Constraint : uint32_t {
 };
 
 // Capabilities describe semantic properties needed by generic search
-// operators. They are registered once with each canonical compiled kernel,
+// operators. They are registered once with each compiled constraint kernel,
 // instead of being reconstructed from variant names or ad-hoc flag lists.
 enum ConstraintCapability : uint32_t {
   KERNEL_ROUTE_STATE = 1u << 0,
@@ -113,16 +111,24 @@ struct ConstraintKernelSpec {
   const char *schema_name;
   // VISIT_ALL has no learned resource row and therefore uses -1.
   int32_t field_channel;
-  const char *resource_name;
   ResourceOperator resource_operator;
   uint32_t capabilities;
 };
 
-const std::array<ConstraintKernelSpec, CANONICAL_CONSTRAINT_COUNT> &
+struct ResourceKernelSpec {
+  ResourceOperator op;
+  const char *name;
+  int32_t field_channel;
+};
+
+const std::array<ConstraintKernelSpec, CONSTRAINT_KERNEL_COUNT> &
 constraint_kernel_registry();
+const std::array<ResourceKernelSpec, RESOURCE_KERNEL_COUNT> &
+resource_kernel_registry();
 const ConstraintKernelSpec *constraint_kernel(Constraint constraint);
 const ConstraintKernelSpec *field_channel_kernel(int32_t channel);
 const ConstraintKernelSpec *constraint_kernel(const std::string &schema_name);
+const ResourceKernelSpec &resource_kernel(ResourceOperator op);
 
 struct Problem {
   std::string name;
@@ -154,9 +160,8 @@ struct Problem {
   std::vector<int32_t> delivery_of_pickup;
   std::vector<int32_t> pickup_of_delivery;
 
-  // Empty for the inferred input contract. RoutingDecoder materializes the seven
-  // canonical compatibility rows, marks them from `constraints`, then appends
-  // explicit algebra rows.
+  // RoutingDecoder materializes declared constraint kernels and then appends
+  // explicit resource rows using the same ResourceSpec/kernel contract.
   std::vector<ResourceSpec> resources;
 
   bool has(Constraint constraint) const;
@@ -387,7 +392,7 @@ private:
     float current_time = 0.0f;
     float distance = 0.0f;
     float collected_prize = 0.0f;
-    std::vector<float> algebra_state;
+    std::vector<float> resource_state;
     int32_t off_graph_edges = 0;
   };
 
@@ -396,7 +401,9 @@ private:
   uint32_t active_kernel_capabilities_ = 0;
   std::array<uint8_t, FIELD_CHANNEL_COUNT> active_field_channels_{};
   std::vector<ResourceSpec> resources_;
-  std::array<int32_t, FIELD_CHANNEL_COUNT> canonical_resource_index_{};
+  std::vector<int32_t> active_resource_indices_;
+  std::vector<int32_t> scalar_resource_indices_;
+  std::array<int32_t, FIELD_CHANNEL_COUNT> field_resource_index_{};
   CandidateConfig candidate_config_;
   SearchConfig search_config_;
   int32_t n_rollouts_;
@@ -448,15 +455,17 @@ private:
                               const float *edge_additive) const;
   void build_model_features();
   bool field_channel_active(int32_t channel) const;
-  int32_t canonical_resource_index(FieldChannel channel) const;
+  int32_t field_resource_index(FieldChannel channel) const;
   const ResourceSpec &resource(int32_t index) const;
   void build_resource_registry();
   void build_constraint_kernel_set();
   void build_resource_descriptors();
   float resource_state_feature(const State &state, int32_t resource) const;
-  bool algebra_transition_feasible(const State &state, int32_t next,
-                                   int32_t resource,
-                                   float *next_value = nullptr) const;
+  bool resource_transition_feasible(const State &state, int32_t next,
+                                    int32_t resource,
+                                    float *next_value = nullptr,
+                                    bool force_route_end = false) const;
+  bool resource_terminal_feasible(const State &state, int32_t resource) const;
   void validate_guidance(const float *edge_field,
                          const float *edge_additive,
                          const float *multipliers,

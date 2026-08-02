@@ -902,9 +902,11 @@ public:
       py::dict row;
       row["name"] = kernel->schema_name;
       row["field_channel"] = kernel->field_channel;
-      row["resource"] = kernel->resource_name == nullptr
-                            ? py::none()
-                            : py::cast(kernel->resource_name);
+      row["resource"] =
+          kernel->field_channel < 0
+              ? py::none()
+              : py::cast(
+                    prism::resource_kernel(kernel->resource_operator).name);
       py::list capabilities;
       if ((kernel->capabilities & prism::KERNEL_ROUTE_STATE) != 0)
         capabilities.append("route_state");
@@ -969,7 +971,7 @@ public:
       row["name"] = resource.name;
       row["active"] = resource.active;
       row["state_dim"] = resource.state_dim;
-      row["canonical"] = resource.is_canonical();
+      row["operator"] = prism::resource_kernel(resource.op).name;
       resource_rows.append(std::move(row));
     }
     result["resources"] = std::move(resource_rows);
