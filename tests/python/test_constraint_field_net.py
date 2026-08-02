@@ -21,6 +21,7 @@ from net import (  # noqa: E402
     load_constraint_field_state_dict,
 )
 from train import (  # noqa: E402
+    _neutral_guidance,
     replay_decision_logp_from_cpp_batch_trace,
     replay_logp_from_cpp_batch_trace,
 )
@@ -59,6 +60,13 @@ def test_constraint_field_net_uses_normalized_decoder_contract() -> None:
     assert output["feasibility_logits"].shape == (edge_count,)
     assert output["feasibility_risk"].shape == (edge_count,)
     assert output["value_context"].shape == (1, 16)
+    assert output["candidate_quota"].shape == (1, channel_count)
+    assert output["candidate_quota_logits"].shape == (1, channel_count + 1)
+    assert torch.allclose(
+        output["candidate_quota"].sum(dim=1)
+        + torch.softmax(output["candidate_quota_logits"], dim=1)[:, -1],
+        torch.ones(1),
+    )
     assert model.value(output, 0.5).shape == (1,)
     assert torch.equal(model.value(output, 0.5), torch.zeros(1))
     assert torch.all(
@@ -76,26 +84,22 @@ def test_constraint_field_net_uses_normalized_decoder_contract() -> None:
     assert torch.all(field_multipliers[~active] == 0.0)
 
 
-def test_legacy_checkpoint_keeps_zero_initialized_value_head() -> None:
+def test_v2_checkpoint_loader_is_strict_and_rejects_v1_identity() -> None:
     original = ConstraintFieldNet(depth=1, units=8)
-    legacy = {
+    incomplete_v2 = {
         key: value
         for key, value in original.state_dict().items()
         if not key.startswith("value_head.")
     }
     restored = ConstraintFieldNet(depth=1, units=8)
 
-    upgraded = load_constraint_field_state_dict(restored, legacy)
-
-    assert upgraded is True
-    assert torch.equal(
-        restored.value_head.weight,
-        torch.zeros_like(restored.value_head.weight),
-    )
-    assert torch.equal(
-        restored.value_head.bias,
-        torch.zeros_like(restored.value_head.bias),
-    )
+    with pytest.raises(RuntimeError, match="v2 checkpoint"):
+        load_constraint_field_state_dict(restored, incomplete_v2)
+    v1 = dict(original.state_dict())
+    v1["resource_types"] = torch.eye(prism_decoder.FIELD_CHANNEL_COUNT)
+    with pytest.raises(RuntimeError, match="v1 checkpoint"):
+        load_constraint_field_state_dict(restored, v1)
+    assert load_constraint_field_state_dict(restored, original.state_dict()) is False
 
 
 def test_python_dimensions_come_from_cpp_extension() -> None:
@@ -140,6 +144,77 @@ def test_constraint_field_net_rejects_unnormalized_inputs() -> None:
 
     with pytest.raises(ValueError, match="normalized to \\[0, 1\\]"):
         ConstraintFieldNet(depth=1, units=8).eval()(data)
+
+
+def test_typed_field_accepts_unseen_runtime_resource_without_new_weights() -> None:
+    coordinates = np.array(
+        [[0.0, 0.0], [0.8, 0.0], [0.4, 0.0]], dtype=np.float32
+    )
+    distance = np.linalg.norm(
+        coordinates[:, None] - coordinates[None, :], axis=-1
+    ).astype(np.float32)
+
+    def make(resource_name: str):
+        return prism_decoder.Decoder(
+            {
+                "name": "cvrp",
+                "coordinates": coordinates,
+                "distance": distance,
+                "constraints": [],
+                "multi_route": False,
+                "resources": [
+                    {
+                        "name": resource_name,
+                        "operator": "affine_accumulator",
+                        "initial": 1.0,
+                        "scale": 1.0,
+                        "increment": {
+                            "edge_attribute": "distance",
+                            "coefficient": -1.0,
+                        },
+                        "bounds": [{"lower": 0.0}],
+                    }
+                ],
+            },
+            search_config={"classical_behavior": False},
+            n_rollouts=1,
+        )
+
+    battery = make("battery")
+    renamed = make("fuel_remaining")
+    graph = build_decoder_data(battery)
+    renamed_graph = build_decoder_data(renamed)
+    assert torch.equal(graph.resource_descriptors, renamed_graph.resource_descriptors)
+
+    model = ConstraintFieldNet(depth=1, units=8).eval()
+    with torch.no_grad():
+        output = model(graph)
+        renamed_output = model(renamed_graph)
+    resource_count = battery.metadata["resource_count"]
+    assert output["residual"].shape == (battery.metadata["edge_count"], resource_count)
+    assert output["multipliers"].shape == (1, resource_count + 1)
+    assert output["coupler_weights"].shape == (
+        1,
+        resource_count + 1,
+        resource_count,
+    )
+    assert torch.equal(output["residual"], renamed_output["residual"])
+    assert torch.equal(output["multipliers"], renamed_output["multipliers"])
+    battery.set_incumbent(np.array([0, 2, 0], dtype=np.int32))
+    graph = build_decoder_data(battery)
+    with torch.no_grad():
+        output = model(graph)
+    scales = graph.resource_scales.unsqueeze(0)
+    traced = battery.sample_traced(
+        edge_field=(output["residual"] * scales).numpy(),
+        edge_additive=(output["additive"] * scales).numpy(),
+        multipliers=output["multipliers"][0].numpy(),
+        coupler_weights=output["coupler_weights"][0].numpy(),
+        coupler_bias=output["coupler_bias"][0].numpy(),
+        edge_risk=output["feasibility_risk"].numpy(),
+    )
+    assert all(solution["feasible"] for solution in traced["solutions"])
+    assert traced["trace"]["live_state"].shape[1] == resource_count
 
 
 def test_objective_conditioning_reaches_descriptor_and_field() -> None:
@@ -271,6 +346,11 @@ def test_model_output_drives_field_decoder_iteration() -> None:
         n_rollouts=4,
     )
     decoder.seed(3002)
+    with pytest.raises(ValueError, match="requires a feasible installed incumbent"):
+        decode_iteration(decoder, ConstraintFieldNet(depth=2, units=16).eval())
+    incumbent = decoder.sample_greedy(**_neutral_guidance(decoder))
+    assert incumbent["feasible"]
+    decoder.set_incumbent(incumbent["route"])
     solution, _ = decode_iteration(
         decoder, ConstraintFieldNet(depth=2, units=16).eval()
     )
@@ -301,18 +381,9 @@ def test_cpp_trace_replays_exact_state_dependent_policy() -> None:
     decoder.seed(3003)
     model = ConstraintFieldNet(depth=2, units=16).eval()
 
-    initial_graph = build_decoder_data(decoder)
-    with torch.no_grad():
-        initial = model(initial_graph)
-    initial_scales = initial_graph.resource_scales.unsqueeze(0)
-    decoder.solve(
-        1,
-        edge_field=(initial["residual"] * initial_scales).detach().numpy(),
-        edge_additive=(initial["additive"] * initial_scales).detach().numpy(),
-        multipliers=initial["multipliers"][0].detach().numpy(),
-        coupler_weights=initial["coupler_weights"][0].detach().numpy(),
-        coupler_bias=initial["coupler_bias"][0].detach().numpy(),
-    )
+    incumbent = decoder.sample_greedy(**_neutral_guidance(decoder))
+    assert incumbent["feasible"]
+    decoder.set_incumbent(incumbent["route"])
 
     graph = build_decoder_data(decoder)
     with torch.no_grad():

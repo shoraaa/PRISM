@@ -28,12 +28,13 @@ def test_all_benchmarks_are_partitioned_into_training_splits() -> None:
     variants = decoder_evaluation.selected_variants("all")
 
     assert len(variants) == 110
+    seen = len(decoder_evaluation.SEEN_VARIANTS)
     assert sum(
         decoder_evaluation.variant_split(name) == "seen" for name in variants
-    ) == 15
+    ) == seen
     assert sum(
         decoder_evaluation.variant_split(name) == "heldout" for name in variants
-    ) == 95
+    ) == 110 - seen
 
 
 def test_instance_data_preserves_batch_dimension() -> None:

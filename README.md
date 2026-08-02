@@ -83,27 +83,92 @@ live partial solution.
 
 ## Architecture
 
+### Runtime resource algebra
+
+The decoder accepts a runtime `resources` registry in addition to the seven
+canonical compatibility rows. A declarative row names an operator primitive,
+its state dimension and direction, an extension input, reset events, scale, and
+the phase at which lower or upper bounds are checked. The first supported
+primitive is a scalar affine accumulator; it covers resources such as energy,
+fuel, emissions, and driver-hour budgets without a Python callback in the hot
+loop:
+
+```python
+problem["node_attributes"] = {"charger": charger_mask}
+problem["resources"] = [{
+    "name": "battery",
+    "operator": "affine_accumulator",
+    "state_dim": 1,
+    "direction": "forward",
+    "scope": "route",
+    "initial": {"scalar": "battery_capacity"},
+    "scale": {"scalar": "battery_capacity"},
+    "increment": {"edge_attribute": "distance", "coefficient": -1.0},
+    "reset": {
+        "node_attribute": "charger",
+        "value": {"scalar": "battery_capacity"},
+    },
+    "bounds": [{"lower": 0.0, "check": "transition"}],
+}]
+```
+
+The binding resolves named arrays once, and native `extend + bound` replay then
+drives construction masks, incumbent validation, resource labels, pressure
+features, and live state. Each row also produces a 32-dimensional descriptor
+from algebraic properties (operator family, bound type, check phase, direction,
+scope, reset form, input coupling, scale, and tightness); names and registry
+positions are excluded. Resource tensors grow with the registry, while the
+canonical seven rows remain at their historical indices so the distance-only
+control path retains exact behavior.
+
+Candidate construction is itself schema-driven, so it extends to a new resource
+with no per-variant tuning. In the default `schema` mode, native admission ranks
+edges by a registry-derived relevance (consumption and reset signals from each
+row's `extend + bound`) and fills the remaining budget by distance. The
+per-resource allocation is a uniform equal-share prior over the active rows plus
+an implicit geometric slot -- a single variant-agnostic rule, not a table of
+hand-tuned quotas -- so a freshly declared resource is covered before its quota
+head has ever been trained. `--learned-candidate-quotas` lets the typed
+multinomial policy (trained with the same winner-gated PPO return) *reweight*
+that allocation rather than enable it; the schema neighborhood is present either
+way. `--candidate-mode geometric` is an explicit ablation that drops the resource
+channels and keeps only the k-d-tree distance neighborhood plus the required
+depot overlay. Because the fields-off baseline shares the same candidate mode as
+the field, field-on-vs-off stays a clean ablation of the field alone. The more
+invasive learned edge-scorer stage remains gated on the documented
+known-resource noninferiority criterion rather than silently changing topology.
+
 ### Compositional field network
 
-The GNN emits one field for each constraint resource plus the objective weight.
+The GNN emits one field for each registry resource plus the objective weight.
 Node, edge, resource-token, and live-state inputs are normalized to `[0, 1]`;
 the decoder is the source of truth for graph dimensions, resource scales, and
 active channels. Active resource tokens attend to one another before producing
 per-edge resource fields, global resource intensities, a state-conditioned
 objective weight, binding predictions, and live-state coupler parameters. The
-field is refreshed when the incumbent improves or a new candidate graph is
+decoder first installs one objective-only greedy incumbent, so the network's
+first input already contains incumbent route positions, forward/backward resource
+state, and incumbent-edge indicators. The neural policy does not participate in
+initial construction; it starts with perturbation and SRR from that incumbent.
+The field is refreshed when the incumbent improves or a new candidate graph is
 installed; stagnation ends the current SMDP option without recomputing an
 identical graph, while the state coupler keeps responding to load, time, route
 progress, and other live variables at each stochastic choice.
+
+The token encoder consumes the native algebra descriptor rather than a
+constraint-identity one-hot. Field, multiplier, quota, and token-to-token state
+coupler heads are shared across rows, so appending a resource adds no model
+parameter. This is a clean `typed_resource_v2` checkpoint boundary: v1 identity
+checkpoints are rejected and must be retrained.
 
 ### Guaranteed-feasible action space
 
 A unified native decoder covers capacity, time windows, route and tour limits,
 backhaul, pickup-delivery, prize quota, open routes, multiple depots, optional
 customers, and symmetric or asymmetric costs. It enforces every hard constraint
-during construction and refinement, so the learned policy only ever chooses
-among feasible moves and can express continuous preference *before* a violation
-would occur.
+during greedy construction and refinement, so the learned policy only chooses
+among feasible perturbation/refinement moves and can express continuous
+preference *before* a violation would occur.
 
 ### Reinforcement learning
 
@@ -198,10 +263,11 @@ Set `--pretrain-epochs 0` to begin joint PPO training immediately. The aliases
 `--pretraining-epochs`, `--pretraining-lr`, and `--pretraining-aux-scale` are
 equivalent, and all settings are stored in checkpoints and W&B configuration.
 
-Training uses an epoch-local balanced schedule. Every eligible routing
-composition appears before another receives an extra rollout, and each PPO
-accumulation group contains distinct variants. The curriculum first learns
-individual resource effects and then introduces increasingly rich interactions.
+Training uses an epoch-local balanced schedule over `--variants` (the current
+training variants by default). Every selected routing composition appears before
+another receives an extra rollout, and each PPO accumulation group contains
+distinct variants. Add `--curriculum` to phase those variants by resource count;
+without it, every selected variant is eligible from epoch 0.
 
 Temporal credit is controlled by `--temporal-credit-weight` (default `0.1`). Set
 it to `0` for the local-POMO ablation. The optional critic can be enabled with,
@@ -216,32 +282,31 @@ Monte Carlo continuation credit.
 
 ## Validation and checkpoint selection
 
-Validation covers the 16 training variants and a fixed 16-variant held-out
-manifest stratified by objective, pickup-delivery structure, symmetry, depot
-count, and number of interacting constraints. Missing entries fail validation
-unless `--allow-missing-validation` is selected. Validation inherits
-`--n-rollouts` by default; use `--val-n-rollouts` to give it a separate rollout
-budget.
+Validation covers exactly the same `--variants` selected for training, with no
+seen/held-out split. Missing entries fail validation unless
+`--allow-missing-validation` is selected. Validation inherits `--n-rollouts` by
+default; use `--val-n-rollouts` to give it a separate rollout budget.
 
 PRISM is scored against an **ablation of itself**: before epoch 0 it evaluates
 the identical decoder and search with the field ablated to pure distance
 (`E = c(e)`), i.e. *PRISM without fields* (`--baseline fields-off`, the default).
-Reported quality is **gap to saved oracle references** (`--gap-reference oracle`,
-the default); reference-less variants drop out of the gap rather than falling
-back to the ablation. W&B records per-variant objective, feasibility, oracle gap,
-and paired field-improvement, together with `val_summary/macro_gap`,
+Reported quality uses each aligned saved oracle reference when available. Before
+training, instances without a saved oracle are solved once by the hand-tuned
+classical-proximity decoder under the matched validation budget, and that result
+is cached as their reference. The fields-off ablation remains a separate paired
+comparison rather than becoming the fallback reference. W&B records per-variant
+objective, feasibility, oracle-or-classical reference gap, and paired field
+improvement, together with `val_summary/macro_gap`,
 `val_summary/macro_improvement`, and `val_summary/macro_score`.
 
-Checkpoint selection is lexicographic: worst-variant feasibility, overall
-feasibility, paired-baseline coverage, variant-macro gap-to-oracle, and finally
-variant-macro field improvement. Feasibility across the full compositional family
-is the prior gate; the quality choice is then driven by gap to the oracle
-references. Because gap-to-oracle only covers variants that ship an oracle
-solution, field improvement over the fields-off ablation remains the tiebreaker
-so oracle-less variants still influence selection.
+`best.pt` is selected solely by the lowest variant-macro reference gap: average
+the normalized per-instance gaps within each variant, then give every variant
+equal weight. Feasibility and paired fields-off improvement remain logged
+diagnostics but do not enter checkpoint ranking.
 
-The hand-tuned classical-proximity ranking is retained only as a diagnostic
-(`--baseline classical`); it is not part of the reported comparison.
+The hand-tuned classical-proximity ranking is used as the cached reference only
+where a saved oracle is unavailable. `--baseline classical` can also select it
+as the paired comparison instead of the default fields-off ablation.
 
 ## Evaluation
 

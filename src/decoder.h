@@ -13,6 +13,7 @@ static constexpr int32_t FIELD_CHANNEL_COUNT = 7;
 static constexpr int32_t LIVE_STATE_FEATURE_COUNT = FIELD_CHANNEL_COUNT;
 static constexpr int32_t NODE_FEATURE_COUNT = 24;
 static constexpr int32_t EDGE_FEATURE_COUNT = 11;
+static constexpr int32_t RESOURCE_DESCRIPTOR_DIM = 32;
 // One learned multiplier slot beyond the resource channels carries the
 // state-conditioned objective weight w_obj applied to the objective edge cost,
 // so the objective enters the search energy through a learned coefficient
@@ -29,6 +30,53 @@ enum class FieldChannel : uint8_t {
   BACKHAUL_ORDER = 4,
   PICKUP_DELIVERY = 5,
   PRIZE_QUOTA = 6,
+};
+
+enum class ResourceOperator : uint8_t {
+  LEGACY_CAPACITY,
+  LEGACY_TIME_WINDOW,
+  LEGACY_ROUTE_LIMIT,
+  LEGACY_TOUR_LIMIT,
+  LEGACY_BACKHAUL_ORDER,
+  LEGACY_PICKUP_DELIVERY,
+  LEGACY_PRIZE_QUOTA,
+  AFFINE_ACCUMULATOR,
+};
+
+enum class ResourceDirection : uint8_t { FORWARD, BACKWARD, BIDIRECTIONAL };
+enum class ResourceScope : uint8_t { ROUTE, TOUR, SOLUTION };
+enum class BoundCheck : uint8_t { TRANSITION, ROUTE_END, SOLUTION_END };
+
+// Runtime resource row. Named input references from the Python algebra schema
+// are resolved into dense arrays once in the binding, so the hot decoder path
+// never calls Python and never performs string lookup.
+struct ResourceSpec {
+  std::string name;
+  // Canonical legacy rows remain present, even when their constraint is not
+  // active, so v1 tensor/channel ordering stays losslessly aligned. Runtime
+  // schema rows are always active and append after those compatibility rows.
+  bool active = true;
+  ResourceOperator op = ResourceOperator::AFFINE_ACCUMULATOR;
+  ResourceDirection direction = ResourceDirection::FORWARD;
+  ResourceScope scope = ResourceScope::ROUTE;
+  BoundCheck bound_check = BoundCheck::TRANSITION;
+  int32_t state_dim = 1;
+  float initial = 0.0f;
+  float scale = 1.0f;
+  float lower = -std::numeric_limits<float>::infinity();
+  float upper = std::numeric_limits<float>::infinity();
+  float edge_coefficient = 0.0f;
+  float node_coefficient = 0.0f;
+  bool edge_uses_distance = false;
+  bool reset_at_depot = false;
+  float reset_value = 0.0f;
+  std::vector<float> edge_values;
+  std::vector<float> node_values;
+  std::vector<uint8_t> reset_nodes;
+
+  bool is_legacy() const {
+    return op != ResourceOperator::AFFINE_ACCUMULATOR;
+  }
 };
 
 enum class Objective : uint8_t {
@@ -78,21 +126,27 @@ struct Problem {
   std::vector<int32_t> delivery_of_pickup;
   std::vector<int32_t> pickup_of_delivery;
 
+  // Empty for the legacy input contract. RoutingDecoder materializes the seven
+  // canonical compatibility rows, marks them from `constraints`, then appends
+  // explicit algebra rows.
+  std::vector<ResourceSpec> resources;
+
   bool has(Constraint constraint) const;
   float dist(int32_t from, int32_t to) const;
   int32_t customer_count() const;
   void validate() const;
 };
 
+// SCHEMA (default) builds the neighborhood from the schema-derived
+// candidate_resource_relevance, so any declared resource gets coverage without
+// per-variant tuning; when no learned quota is installed it uses a uniform
+// equal-share prior over active resources. GEOMETRIC is an explicit ablation
+// that drops every resource channel and keeps only the distance neighborhood.
+enum class CandidateMode : uint8_t { SCHEMA, GEOMETRIC };
+
 struct CandidateConfig {
   int32_t max_candidates = 64;
-  int32_t geometric_quota = 32;
-  int32_t time_window_quota = 12;
-  int32_t capacity_quota = 8;
-  int32_t backhaul_quota = 8;
-  int32_t pickup_delivery_quota = 8;
-  int32_t route_limit_quota = 8;
-  int32_t prize_quota = 8;
+  CandidateMode candidate_mode = CandidateMode::SCHEMA;
 
   float gamma_unit = 1.0f;
   float gamma_wait = 1.0f;
@@ -201,6 +255,7 @@ public:
   ResourceEvaluation
   evaluate_resources(const std::vector<int32_t> &route) const;
   void set_incumbent(const std::vector<int32_t> &route);
+  void set_candidate_resource_quotas(const std::vector<float> &quotas);
   std::vector<uint8_t> mask(const std::vector<int32_t> &prefix) const;
 
   const Problem &problem() const { return problem_; }
@@ -224,6 +279,22 @@ public:
   }
   const std::vector<float> &resource_pressure() const {
     return resource_pressure_;
+  }
+  const std::vector<float> &resource_events() const {
+    return resource_events_;
+  }
+  int32_t resource_count() const {
+    return static_cast<int32_t>(resources_.size());
+  }
+  int32_t multiplier_count() const { return resource_count() + 1; }
+  int32_t objective_multiplier() const { return resource_count(); }
+  int32_t live_state_feature_count() const { return resource_count(); }
+  const std::vector<ResourceSpec> &resources() const { return resources_; }
+  const std::vector<float> &resource_descriptors() const {
+    return resource_descriptors_;
+  }
+  const std::vector<float> &candidate_resource_quotas() const {
+    return candidate_resource_quotas_;
   }
   const std::vector<float> &objective_edge_costs() const {
     return objective_edge_costs_;
@@ -278,10 +349,13 @@ private:
     float current_time = 0.0f;
     float distance = 0.0f;
     float collected_prize = 0.0f;
+    std::vector<float> algebra_state;
     int32_t off_graph_edges = 0;
   };
 
   Problem problem_;
+  std::vector<ResourceSpec> resources_;
+  std::array<int32_t, FIELD_CHANNEL_COUNT> legacy_resource_index_{};
   CandidateConfig candidate_config_;
   SearchConfig search_config_;
   int32_t n_rollouts_;
@@ -302,6 +376,9 @@ private:
   std::vector<float> node_features_;
   std::vector<float> resource_features_;
   std::vector<float> resource_pressure_;
+  std::vector<float> resource_events_;
+  std::vector<float> resource_descriptors_;
+  std::vector<float> candidate_resource_quotas_;
   std::vector<float> objective_edge_costs_;
   std::vector<float> incumbent_live_state_;
   std::vector<int32_t> edge_offsets_;
@@ -313,16 +390,31 @@ private:
                              std::vector<float> *edge_field = nullptr,
                              std::vector<float> *edge_additive = nullptr,
                              std::vector<float> *edge_risk = nullptr);
-  std::vector<int32_t> rank_by_metric(int32_t from, int metric,
-                                      int32_t limit) const;
+  std::vector<int32_t> rank_by_distance(int32_t from, int32_t limit) const;
   float resource_proximity(int32_t from, int32_t to, int metric) const;
   float classical_proximity(int32_t from, int32_t to) const;
   float objective_edge_cost(int32_t from, int32_t to) const;
   float resource_scale(int32_t channel) const;
+  float runtime_resource_scale(int32_t resource) const;
   float analytic_resource_pressure(int32_t from, int32_t to,
                                    int32_t channel) const;
+  float runtime_resource_pressure(int32_t from, int32_t to,
+                                  int32_t resource) const;
+  float candidate_resource_relevance(int32_t from, int32_t to,
+                                     int32_t resource) const;
+  double resource_field_value(int32_t from, int32_t to, int32_t edge,
+                              int32_t channel, const float *edge_field,
+                              const float *edge_additive) const;
   void build_model_features();
   bool field_channel_active(int32_t channel) const;
+  int32_t legacy_resource_index(FieldChannel channel) const;
+  const ResourceSpec &resource(int32_t index) const;
+  void build_resource_registry();
+  void build_resource_descriptors();
+  float resource_state_feature(const State &state, int32_t resource) const;
+  bool algebra_transition_feasible(const State &state, int32_t next,
+                                   int32_t resource,
+                                   float *next_value = nullptr) const;
   void validate_guidance(const float *edge_field,
                          const float *edge_additive,
                          const float *multipliers,
@@ -330,10 +422,8 @@ private:
                          const float *coupler_bias,
                          const float *edge_risk,
                          float risk_penalty) const;
-  std::array<float, LIVE_STATE_FEATURE_COUNT>
-  live_state_features(const State &state) const;
-  std::array<float, LIVE_STATE_FEATURE_COUNT>
-  incumbent_state_features(int32_t current) const;
+  std::vector<float> live_state_features(const State &state) const;
+  std::vector<float> incumbent_state_features(int32_t current) const;
   bool incumbent_prefix_state(int32_t current, State &state) const;
   double coupled_multiplier(int32_t channel, const float *multipliers,
                             const float *coupler_weights,

@@ -97,6 +97,7 @@ def test_search_configuration_is_exposed() -> None:
     )
 
     assert solver.metadata["max_candidates"] == 12
+    assert solver.metadata["candidate_strategy"] == "distance"
     assert solver.metadata["search"] == {
         "min_changed_edges": 5,
         "max_perturb_attempts": 20,
@@ -109,10 +110,61 @@ def test_search_configuration_is_exposed() -> None:
     }
 
 
+def test_candidate_graph_uses_only_kd_tree_distance_and_is_incumbent_stable(
+) -> None:
+    coordinates = np.array(
+        [[0.0, 0.0], [1.0, 0.0], [2.0, 0.0], [100.0, 0.0]],
+        dtype=np.float32,
+    )
+    solver = prism_decoder.Decoder(
+        {
+            "name": "tsp",
+            "coordinates": coordinates,
+            "constraints": ["visit_all", "pickup_delivery"],
+            "pickup_delivery_pairs": np.array([[1, 3]], dtype=np.int32),
+        },
+        candidate_config={"max_candidates": 1},
+        n_rollouts=1,
+    )
+
+    initial_edges = solver.edge_index.copy()
+    assert np.array_equal(initial_edges[:, initial_edges[0] == 0], [[0], [1]])
+    assert np.array_equal(initial_edges[:, initial_edges[0] == 1], [[1], [0]])
+
+    # Neither the far pickup-delivery pair nor an incumbent edge is allowed to
+    # override the purely spatial neighbourhood.
+    solver.set_incumbent(np.array([0, 2, 1, 3], dtype=np.int32))
+    assert np.array_equal(solver.edge_index, initial_edges)
+
+
+def test_candidate_graph_keeps_required_depot_overlay() -> None:
+    coordinates = np.array(
+        [[100.0, 100.0], [0.0, 0.0], [1.0, 0.0], [2.0, 0.0]],
+        dtype=np.float32,
+    )
+    solver = prism_decoder.Decoder(
+        {
+            "name": "cvrp",
+            "coordinates": coordinates,
+            "demand": np.array([0.0, 0.4, 0.4, 0.4], dtype=np.float32),
+            "capacity": 0.8,
+        },
+        candidate_config={"max_candidates": 2},
+        n_rollouts=1,
+    )
+
+    for customer in range(1, 4):
+        destinations = solver.edge_index[1, solver.edge_index[0] == customer]
+        assert 0 in destinations
+    assert np.array_equal(
+        solver.edge_index[1, solver.edge_index[0] == 0], np.array([1, 2, 3])
+    )
+
+
 @pytest.mark.parametrize(
     "variant", ["cvrp", "cvrpb", "cvrpl", "cvrptw", "pctsp"]
 )
-def test_o1_screening_resources_match_full_evaluation_and_search(
+def test_incremental_screening_resources_match_full_evaluation_and_search(
     variant: str,
 ) -> None:
     problem = generated_problem(variant, 50 if variant == "pctsp" else 30, 20)
@@ -134,7 +186,7 @@ def test_o1_screening_resources_match_full_evaluation_and_search(
     verified_solver = make_solver(True)
     traced = verified_solver.sample_traced()
 
-    if variant in {"cvrp", "cvrpl", "pctsp"}:
+    if variant in {"cvrp", "cvrpl", "cvrptw", "pctsp"}:
         assert traced["trace"]["screening_fast_evaluations"] > 0
     assert traced["trace"]["screening_verification_failures"] == 0
     if variant == "cvrp":
@@ -518,6 +570,74 @@ def test_additive_field_guides_zero_pressure_edge() -> None:
     assert guided["route"][1] == guided_solver.edge_index[1, chosen_edge]
 
 
+def test_srr_aggregate_comparison_uses_the_same_edge_energy() -> None:
+    rng = np.random.default_rng(1)
+    size = 18
+    coordinates = rng.random((size, 2), dtype=np.float32)
+    distance = np.linalg.norm(
+        coordinates[:, None] - coordinates[None, :], axis=-1
+    ).astype(np.float32)
+    demand = np.r_[0.0, rng.uniform(0.03, 0.12, size - 1)].astype(np.float32)
+    problem = {
+        "name": "cvrp",
+        "coordinates": coordinates,
+        "distance": distance,
+        "demand": demand,
+        "capacity": 0.35,
+    }
+    bootstrap = prism_decoder.Decoder(problem, n_rollouts=4)
+    bootstrap.seed(9001)
+    incumbent = bootstrap.solve(1)["route"]
+
+    def make_solver() -> prism_decoder.Decoder:
+        solver = prism_decoder.Decoder(
+            problem,
+            search_config={"classical_behavior": False},
+            n_rollouts=1,
+        )
+        solver.seed(7001)
+        solver.set_incumbent(incumbent)
+        return solver
+
+    ordinary_solver = make_solver()
+    shape = (
+        ordinary_solver.metadata["edge_count"],
+        prism_decoder.FIELD_CHANNEL_COUNT,
+    )
+    field = rng.uniform(0.0, 2.0, shape).astype(np.float32)
+    additive = rng.uniform(0.0, 0.2, shape).astype(np.float32)
+    risk = rng.uniform(0.0, 0.3, shape[0]).astype(np.float32)
+    multipliers = np.zeros(prism_decoder.MULTIPLIER_COUNT, dtype=np.float32)
+    multipliers[0] = 1.3
+    multipliers[prism_decoder.FIELD_CHANNEL_COUNT] = 0.8
+    risk_penalty = 0.7
+    ordinary = ordinary_solver.sample_greedy(
+        edge_field=field,
+        edge_additive=additive,
+        multipliers=multipliers,
+        edge_risk=risk,
+        risk_penalty=risk_penalty,
+    )
+
+    # Scaling every term in E(e|s) by the same positive constant preserves all
+    # greedy edge rankings and SRR aggregate comparisons. This catches either
+    # reintroducing analytic_pressure * edge_field in SRR or omitting the
+    # objective multiplier there: both break the common scale and change moves.
+    scale = 25.0
+    scaled = make_solver().sample_greedy(
+        edge_field=field,
+        edge_additive=additive,
+        multipliers=multipliers * scale,
+        edge_risk=risk,
+        risk_penalty=risk_penalty * scale,
+    )
+
+    assert ordinary["srr_moves"] > 0
+    assert scaled["srr_moves"] == ordinary["srr_moves"]
+    assert np.array_equal(scaled["route"], ordinary["route"])
+    assert scaled["objective"] == ordinary["objective"]
+
+
 def test_lookahead_risk_labels_and_avoids_time_window_dead_end() -> None:
     distance = np.array(
         [
@@ -688,3 +808,176 @@ def test_large_coordinate_problem_keeps_sparse_candidate_storage() -> None:
 
     # Customers have at most K edges; the depot keeps its mandatory overlay.
     assert solver.metadata["edge_count"] <= (size - 1) * 65
+
+
+def test_runtime_battery_resource_enforces_reset_and_exports_dynamic_rows() -> None:
+    coordinates = np.array(
+        [[0.0, 0.0], [0.8, 0.0], [0.4, 0.0]], dtype=np.float32
+    )
+    distance = np.linalg.norm(
+        coordinates[:, None] - coordinates[None, :], axis=-1
+    ).astype(np.float32)
+    problem = {
+        "name": "cvrp",
+        "coordinates": coordinates,
+        "distance": distance,
+        "constraints": [],
+        "multi_route": False,
+        "node_attributes": {
+            "charging_station": np.array([0.0, 0.0, 1.0], dtype=np.float32)
+        },
+        "resources": [
+            {
+                "name": "battery",
+                "operator": "affine_accumulator",
+                "initial": 1.2,
+                "scale": 1.2,
+                "increment": {
+                    "edge_attribute": "distance",
+                    "coefficient": -1.0,
+                },
+                "reset": {
+                    "node_attribute": "charging_station",
+                    "value": 1.2,
+                },
+                "bounds": [{"lower": 0.0, "check": "transition"}],
+            }
+        ],
+    }
+    solver = prism_decoder.Decoder(problem, n_rollouts=1)
+
+    assert solver.metadata["resource_count"] == prism_decoder.FIELD_CHANNEL_COUNT + 1
+    assert solver.metadata["multiplier_count"] == solver.metadata["resource_count"] + 1
+    assert solver.resource_features.shape[1] == solver.metadata["resource_count"]
+    assert solver.resource_descriptors.shape == (
+        solver.metadata["resource_count"],
+        prism_decoder.RESOURCE_DESCRIPTOR_DIM,
+    )
+    assert solver.metadata["resources"][-1]["name"] == "battery"
+    assert solver.metadata["field_channel_mask"][-1] == 1
+    coordinate_only = dict(problem)
+    coordinate_only.pop("distance")
+    coordinate_solver = prism_decoder.Decoder(coordinate_only, n_rollouts=1)
+    assert coordinate_solver.resource_features.shape[1] == solver.metadata[
+        "resource_count"
+    ]
+
+    depleted = solver.evaluate(np.array([0, 1, 0], dtype=np.int32))
+    recharged = solver.evaluate(np.array([0, 1, 2, 0], dtype=np.int32))
+    assert not depleted["feasible"]
+    assert "battery" in depleted["error"]
+    assert recharged["feasible"]
+    labels = solver.evaluate_resources(np.array([0, 1, 0], dtype=np.int32))
+    assert labels["violation"].shape == (solver.metadata["resource_count"],)
+    assert labels["violation"][-1] > 0.0
+
+
+def test_typed_candidate_quota_admits_reset_edge_behind_distance_gate() -> None:
+    coordinates = np.array(
+        [[0.0, 0.0], [1.0, 0.0], [1.1, 0.0], [3.0, 0.0]],
+        dtype=np.float32,
+    )
+    distance = np.linalg.norm(
+        coordinates[:, None] - coordinates[None, :], axis=-1
+    ).astype(np.float32)
+    solver = prism_decoder.Decoder(
+        {
+            "name": "cvrp",
+            "coordinates": coordinates,
+            "distance": distance,
+            "constraints": [],
+            "multi_route": False,
+            "node_attributes": {
+                "charging_station": np.array(
+                    [0.0, 0.0, 0.0, 1.0], dtype=np.float32
+                )
+            },
+            "resources": [
+                {
+                    "name": "battery",
+                    "operator": "affine_accumulator",
+                    "initial": 10.0,
+                    "scale": 10.0,
+                    "increment": {
+                        "edge_attribute": "distance",
+                        "coefficient": -1.0,
+                    },
+                    "reset": {
+                        "node_attribute": "charging_station",
+                        "value": 10.0,
+                    },
+                    "bounds": [{"lower": 0.0}],
+                }
+            ],
+        },
+        candidate_config={"max_candidates": 2},
+        n_rollouts=1,
+    )
+    incumbent = np.array([0, 1, 2, 3, 0], dtype=np.int32)
+    solver.set_incumbent(incumbent)
+
+    def neighbors(node: int) -> set[int]:
+        start, end = solver.edge_offsets[node : node + 2]
+        return set(solver.edge_index[1, start:end].tolist())
+
+    assert neighbors(1) == {0, 2}
+    quotas = np.zeros(solver.metadata["resource_count"], dtype=np.float32)
+    quotas[-1] = 1.0
+    solver.set_candidate_resource_quotas(quotas)
+    solver.set_incumbent(incumbent)
+    assert neighbors(1) == {0, 3}
+    assert solver.metadata["candidate_strategy"] == "typed_resource_quota"
+
+
+def test_schema_mode_admits_resource_candidate_without_learned_quota() -> None:
+    """The schema-derived neighborhood covers a resource-relevant node with no
+    learned quota and no per-variant tuning; the geometric ablation drops it."""
+    coordinates = np.array(
+        [[5.0, 0.0], [0.0, 0.0], [0.1, 0.0], [0.2, 0.0], [0.3, 0.0], [10.0, 0.0]],
+        dtype=np.float32,
+    )
+    distance = np.linalg.norm(
+        coordinates[:, None] - coordinates[None, :], axis=-1
+    ).astype(np.float32)
+    problem = {
+        "name": "cvrp",
+        "coordinates": coordinates,
+        "distance": distance,
+        "constraints": [],
+        "demand": np.zeros(6, dtype=np.float32),
+        "capacity": 1.0,
+        "node_attributes": {
+            "charging": np.array([0, 0, 0, 0, 0, 1.0], dtype=np.float32)
+        },
+        "resources": [
+            {
+                "name": "battery",
+                "operator": "affine_accumulator",
+                "initial": 100.0,
+                "scale": 100.0,
+                "increment": {"edge_attribute": "distance", "coefficient": -1.0},
+                "reset": {"node_attribute": "charging", "value": 100.0},
+                "bounds": [{"lower": 0.0}],
+            }
+        ],
+    }
+
+    def neighbors(solver, node: int) -> set[int]:
+        start, end = solver.edge_offsets[node : node + 2]
+        return set(solver.edge_index[1, start:end].tolist())
+
+    schema = prism_decoder.Decoder(
+        problem, candidate_config={"max_candidates": 3}, n_rollouts=1
+    )
+    geometric = prism_decoder.Decoder(
+        problem,
+        candidate_config={"max_candidates": 3, "candidate_mode": "geometric"},
+        n_rollouts=1,
+    )
+    # Node 5 is the farthest node (highest battery pressure) but not among node
+    # 1's nearest neighbours. Schema mode reserves it via the uniform equal-share
+    # prior; geometric mode fills purely by distance and excludes it.
+    assert 5 in neighbors(schema, 1)
+    assert 5 not in neighbors(geometric, 1)
+    assert schema.metadata["candidate_strategy"] == "uniform_schema"
+    assert geometric.metadata["candidate_strategy"] == "distance"

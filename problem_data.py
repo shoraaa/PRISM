@@ -82,6 +82,21 @@ assert len(BENCHMARK_VARIANTS) == 110
 # interactions in later curriculum phases. The md* entries put depot_count > 1
 # in-distribution (previously only 0/1 was ever generated), including the
 # open × multi-depot combination that was pure zero-shot before.
+#
+# Every FieldChannel must fire in training: capacity (cvrp*), time_windows
+# (*tw), tour_limit (op), pickup_delivery (pdtsp), prize_quota (pctsp) were
+# already covered, but route_limit and backhaul_order had no training variant at
+# all -- their learned field channel + multiplier received zero gradient and
+# emitted noise on any *l / *bp instance at inference. cvrpl and cvrpbp are the
+# base problems that activate those two channels (both need capacity, so their
+# minimal form is two-resource). Unlike URS, which leaves route_limit/backhaul
+# to hand-coded stepwise feasibility masks, PRISM learns the channel geometry;
+# that only works if the channel is exercised, so it must be trained rather than
+# heuristically special-cased. Each of the two channels is given a closed and an
+# open training context (cvrpl/ocvrpl, cvrpbp/ocvrpbp) so every field channel
+# appears in >=2 training problems -- open routes change the route_limit return
+# term and the backhaul-ordering regime, so a single closed base would tie the
+# channel to one context.
 TRAIN_VARIANTS = _sort_variants(
     (
         "atsp",
@@ -92,6 +107,10 @@ TRAIN_VARIANTS = _sort_variants(
         "pctsp",
         "cvrp",
         "cvrpb",
+        "cvrpl",
+        "cvrpbp",
+        "ocvrpl",
+        "ocvrpbp",
         "cvrptw",
         "ocvrp",
         "ocvrptw",
@@ -107,6 +126,9 @@ ALL_VARIANTS = _sort_variants(BENCHMARK_VARIANTS + ["vrptw"])
 # Fixed validation coverage across objective type, pickup-delivery, symmetry,
 # depot count, and one/two/three-resource VRP compositions.  The order is
 # deliberately interleaved so smaller --val-heldout slices remain diverse.
+# mdcvrpbp keeps a held-out probe on the now-trained backhaul_order channel
+# (base cvrpbp is in TRAIN_VARIANTS) so its zero-shot composition is measured;
+# the route_limit channel stays probed by acvrpl / mdcvrpl / *ltw.
 VALIDATION_HELDOUT_VARIANTS = (
     "aop",
     "pdcvrp",
@@ -116,7 +138,7 @@ VALIDATION_HELDOUT_VARIANTS = (
     "amdcvrp",
     "spctsp",
     "apdcvrp",
-    "cvrpl",
+    "mdcvrpbp",
     "acvrpl",
     "mdcvrpl",
     "amdcvrpl",

@@ -6,9 +6,11 @@ from __future__ import annotations
 import argparse
 import copy
 import gc
+import math
 import random
 import sys
 import time
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -29,13 +31,15 @@ if str(SRC) not in sys.path:
 import prism_decoder
 from net import (
     ConstraintFieldNet,
+    MODEL_SCHEMA,
     build_decoder_data,
     load_constraint_field_state_dict,
 )
 from problem_data import (
+    ALL_VARIANTS,
     DEFAULT_DATASET_DIR,
     SavedProblems,
-    VALIDATION_HELDOUT_VARIANTS,
+    TRAIN_VARIANTS,
     VariantCurriculum,
     generated_problem,
 )
@@ -60,6 +64,8 @@ class OptionStep:
     temporal_advantage: float = 0.0
     old_value: float = 0.0
     value_target: Optional[float] = None
+    quota_counts: Optional[torch.Tensor] = None
+    old_quota_logp: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -140,7 +146,7 @@ def replay_decision_logp_from_cpp_batch_trace(
     additive = output["additive"][global_edge]
     scales = graph.resource_scales.to(device)
     objective = graph.objective_edge_costs.to(device)[global_edge]
-    channels = prism_decoder.FIELD_CHANNEL_COUNT
+    channels = output["active_channels"].shape[-1]
     multiplier = model.couple(output, states)
     field_multiplier = multiplier[:, :channels]
     objective_weight = multiplier[:, channels]
@@ -215,7 +221,7 @@ def _guidance_numpy(
         # Zero the resource-field intensities but keep the objective weight
         # (slot FIELD_CHANNEL_COUNT) so neutral guidance is the plain objective.
         multipliers = multipliers.clone()
-        multipliers[: prism_decoder.FIELD_CHANNEL_COUNT] = 0.0
+        multipliers[:-1] = 0.0
     scales = graph.resource_scales.unsqueeze(0)
     return {
         "edge_field": (output["residual"] * scales).detach().cpu().numpy(),
@@ -229,12 +235,12 @@ def _guidance_numpy(
 
 
 def _neutral_guidance(decoder) -> dict:
-    channels = prism_decoder.FIELD_CHANNEL_COUNT
-    multipliers = prism_decoder.MULTIPLIER_COUNT
+    channels = int(decoder.metadata["resource_count"])
+    multipliers = int(decoder.metadata["multiplier_count"])
     # Zero resource intensities but set the objective weight (final slot) to 1,
     # so neutral guidance reduces the energy to the plain objective edge cost.
     multiplier_values = np.zeros(multipliers, dtype=np.float32)
-    multiplier_values[prism_decoder.FIELD_CHANNEL_COUNT] = 1.0
+    multiplier_values[channels] = 1.0
     return {
         "edge_field": np.ones(
             (decoder.metadata["edge_count"], channels), dtype=np.float32
@@ -244,7 +250,7 @@ def _neutral_guidance(decoder) -> dict:
         ),
         "multipliers": multiplier_values,
         "coupler_weights": np.zeros(
-            (multipliers, prism_decoder.LIVE_STATE_FEATURE_COUNT),
+            (multipliers, channels),
             dtype=np.float32,
         ),
         "coupler_bias": np.zeros(multipliers, dtype=np.float32),
@@ -270,6 +276,55 @@ def _canonical_cost(solution: dict) -> float:
     return -value if solution["direction"] == "maximize" else value
 
 
+def _best_feasible_solution(
+    solutions: list[dict], *, context: str
+) -> tuple[dict, int]:
+    best: dict = {"feasible": False}
+    winner = -1
+    for rollout, solution in enumerate(solutions):
+        if _better(solution, best):
+            best = solution
+            winner = rollout
+    if winner < 0:
+        errors = sorted(
+            {
+                str(solution.get("error", "unknown construction failure"))
+                for solution in solutions
+            }
+        )
+        detail = "; ".join(errors[:3])
+        raise RuntimeError(f"{context} failed: no feasible rollout ({detail})")
+    return best, winner
+
+
+def _construction_rewards(
+    solutions: list[dict], infeasible_penalty: float
+) -> np.ndarray:
+    """Return scale-free POMO rewards for an incumbent-free construction batch."""
+    feasible_costs = np.asarray(
+        [
+            _canonical_cost(solution)
+            for solution in solutions
+            if solution["feasible"]
+        ],
+        dtype=np.float32,
+    )
+    if feasible_costs.size == 0:
+        return np.full(len(solutions), -float(infeasible_penalty), dtype=np.float32)
+    scale = max(float(np.mean(np.abs(feasible_costs))), 1e-6)
+    center = float(np.mean(feasible_costs))
+    rewards = np.empty(len(solutions), dtype=np.float32)
+    feasible_rewards = (center - feasible_costs) / scale
+    feasible_floor = float(feasible_rewards.min())
+    for rollout, solution in enumerate(solutions):
+        rewards[rollout] = (
+            (center - _canonical_cost(solution)) / scale
+            if solution["feasible"]
+            else feasible_floor - float(infeasible_penalty)
+        )
+    return rewards
+
+
 def _gain(incumbent: dict, candidate: dict, infeasible_penalty: float) -> float:
     if not candidate["feasible"]:
         return -float(infeasible_penalty)
@@ -282,9 +337,13 @@ def _gain(incumbent: dict, candidate: dict, infeasible_penalty: float) -> float:
 def setup_decoder(
     problem: dict, args: argparse.Namespace, deterministic: bool = False
 ):
+    """Create an empty decoder; the caller supplies the bootstrap policy."""
     decoder = prism_decoder.Decoder(
         problem,
-        candidate_config={"max_candidates": args.candidates},
+        candidate_config={
+            "max_candidates": args.candidates,
+            "candidate_mode": getattr(args, "candidate_mode", "schema"),
+        },
         search_config={
             "classical_behavior": False,
             "use_srr": True,
@@ -298,15 +357,7 @@ def setup_decoder(
     decoder.seed(
         args.seed if deterministic else args.seed + random.randrange(1 << 30)
     )
-    if deterministic:
-        incumbent = decoder.sample_greedy(**_neutral_guidance(decoder))
-        if incumbent["feasible"]:
-            decoder.set_incumbent(incumbent["route"])
-    else:
-        incumbent = decoder.solve(1, **_neutral_guidance(decoder))
-    if not incumbent["feasible"]:
-        raise RuntimeError(f"bootstrap failed: {incumbent['error']}")
-    return decoder, incumbent
+    return decoder
 
 
 def _resource_deltas(decoder, incumbent: dict, solutions: list[dict]) -> np.ndarray:
@@ -321,6 +372,21 @@ def _resource_deltas(decoder, incumbent: dict, solutions: list[dict]) -> np.ndar
         binding = np.asarray(evaluation["binding"], dtype=np.float32)
         violation = np.asarray(evaluation["violation"], dtype=np.float32)
         labels.append(np.clip(binding - base_binding + violation, 0.0, 1.0))
+    return np.stack(labels)
+
+
+def _construction_resource_targets(decoder, solutions: list[dict]) -> np.ndarray:
+    """Resource supervision for the incumbent-free construction transition."""
+    channels = int(decoder.metadata["resource_count"])
+    labels = []
+    for solution in solutions:
+        if not solution["feasible"]:
+            labels.append(np.ones(channels, dtype=np.float32))
+            continue
+        evaluation = decoder.evaluate_resources(solution["route"])
+        binding = np.asarray(evaluation["binding"], dtype=np.float32)
+        violation = np.asarray(evaluation["violation"], dtype=np.float32)
+        labels.append(np.clip(binding + violation, 0.0, 1.0))
     return np.stack(labels)
 
 
@@ -396,20 +462,135 @@ def collect_instance_rollout(
     risk_penalty: float = 0.0,
 ) -> InstanceRollout:
     model.train()
-    decoder, incumbent = setup_decoder(problem, args)
+    decoder = setup_decoder(problem, args)
     steps: list[OptionStep] = []
     emissions = 0
     improvements = 0
     neural_seconds = 0.0
     decoder_seconds = 0.0
-    last_solutions = [incumbent]
+    last_solutions: list[dict] = []
     outcomes: list[OptionOutcome] = []
     cached_version = -1
     cached_graph = None
     cached_output = None
     cached_guidance = None
     cached_binding = None
+    cached_quota_counts = None
+    cached_quota_logp = None
+    cached_quota_fractions = None
     iteration = 0
+
+    # Construct the first solution with the field policy itself. This remains a
+    # traced PPO transition so initial construction is learned rather than a
+    # hand-designed state silently injected before policy optimization.
+    graph = build_decoder_data(decoder, args.device)
+    neural_start = time.perf_counter()
+    with torch.no_grad():
+        old_output = model(graph)
+    neural_seconds += time.perf_counter() - neural_start
+    guidance = _guidance_numpy(
+        old_output,
+        graph,
+        field_enabled=field_enabled,
+        risk_penalty=risk_penalty,
+    )
+    decoder_start = time.perf_counter()
+    bootstrap_batch = decoder.sample_traced(**guidance)
+    decoder_seconds += time.perf_counter() - decoder_start
+    bootstrap_solutions = list(bootstrap_batch["solutions"])
+    incumbent, bootstrap_winner = _best_feasible_solution(
+        bootstrap_solutions, context="model bootstrap"
+    )
+    bootstrap_trace = bootstrap_batch["trace"]
+    if field_enabled and args.rl_weight != 0.0:
+        with torch.no_grad():
+            bootstrap_logp, bootstrap_rollouts, bootstrap_decisions = (
+                replay_decision_logp_from_cpp_batch_trace(
+                    bootstrap_trace,
+                    graph,
+                    old_output,
+                    model,
+                    args.beta,
+                    field_enabled=field_enabled,
+                    risk_penalty=risk_penalty,
+                )
+            )
+    else:
+        bootstrap_logp = torch.empty(0, device=args.device)
+        bootstrap_rollouts = torch.empty(0, dtype=torch.long, device=args.device)
+        bootstrap_decisions = torch.zeros(
+            args.n_rollouts, dtype=torch.long, device=args.device
+        )
+    bootstrap_resource_target = None
+    if bootstrap_trace["screened_edges"].size == 0:
+        bootstrap_resource_target = torch.as_tensor(
+            _construction_resource_targets(decoder, bootstrap_solutions),
+            dtype=torch.float32,
+            device=args.device,
+        )
+    bootstrap_binding = torch.as_tensor(
+        decoder.evaluate_resources(incumbent["route"])["binding"],
+        dtype=torch.float32,
+        device=args.device,
+    )
+    bootstrap_rewards = torch.as_tensor(
+        _construction_rewards(bootstrap_solutions, args.infeasible_penalty),
+        dtype=torch.float32,
+        device=args.device,
+    )
+    if args.reward_clip > 0.0:
+        bootstrap_rewards = bootstrap_rewards.clamp(
+            -args.reward_clip, args.reward_clip
+        )
+    bootstrap_rewards -= args.neural_call_cost
+    with torch.no_grad():
+        bootstrap_value = float(model.value(old_output, 0.0).reshape(-1)[0])
+    bootstrap_step = OptionStep(
+        graph=graph,
+        trace=bootstrap_trace,
+        old_logp=bootstrap_logp.detach(),
+        decisions=bootstrap_decisions.detach(),
+        rewards=torch.zeros(args.n_rollouts, device=args.device),
+        resource_delta=bootstrap_resource_target,
+        binding_target=bootstrap_binding,
+        duration=0,
+        decision_rollouts=bootstrap_rollouts.detach(),
+        field_enabled=field_enabled,
+        risk_penalty=risk_penalty,
+        search_progress=0.0,
+    )
+    if getattr(args, "learned_candidate_quotas", False) and field_enabled:
+        quota_policy = torch.distributions.Multinomial(
+            total_count=args.candidates,
+            logits=old_output["candidate_quota_logits"][0],
+        )
+        quota_counts = quota_policy.sample()
+        bootstrap_step.quota_counts = quota_counts.detach()
+        bootstrap_step.old_quota_logp = quota_policy.log_prob(
+            quota_counts
+        ).detach()
+        decoder.set_candidate_resource_quotas(
+            (quota_counts[:-1] / float(args.candidates))
+            .detach()
+            .cpu()
+            .numpy()
+            .astype(np.float32)
+        )
+    decoder.set_incumbent(incumbent["route"])
+    steps.append(bootstrap_step)
+    last_solutions = bootstrap_solutions
+    outcomes.append(
+        OptionOutcome(
+            [bootstrap_step],
+            bootstrap_rewards,
+            1,
+            transition_reward=float(bootstrap_rewards[bootstrap_winner]),
+            old_value=bootstrap_value,
+            transition_step=bootstrap_step,
+            winner_rollout=bootstrap_winner,
+        )
+    )
+    emissions = 1
 
     while iteration < args.search_iterations:
         version = int(decoder.graph_version)
@@ -436,6 +617,23 @@ def collect_instance_rollout(
             cached_output = old_output
             cached_guidance = guidance
             cached_binding = binding_target
+            if (
+                getattr(args, "learned_candidate_quotas", False)
+                and field_enabled
+            ):
+                quota_policy = torch.distributions.Multinomial(
+                    total_count=args.candidates,
+                    logits=old_output["candidate_quota_logits"][0],
+                )
+                cached_quota_counts = quota_policy.sample()
+                cached_quota_logp = quota_policy.log_prob(cached_quota_counts)
+                cached_quota_fractions = (
+                    cached_quota_counts[:-1] / float(args.candidates)
+                ).detach().cpu().numpy().astype(np.float32)
+            else:
+                cached_quota_counts = None
+                cached_quota_logp = None
+                cached_quota_fractions = None
             emissions += 1
         else:
             graph = cached_graph
@@ -520,6 +718,12 @@ def collect_instance_rollout(
                 _gain(option_incumbent, iteration_best, 0.0), 0.0
             )
             if normalized_gain > args.improvement_epsilon:
+                if cached_quota_fractions is not None:
+                    decoder.set_candidate_resource_quotas(
+                        cached_quota_fractions
+                    )
+                    step.quota_counts = cached_quota_counts.detach()
+                    step.old_quota_logp = cached_quota_logp.detach()
                 decoder.set_incumbent(iteration_best["route"])
                 incumbent = iteration_best
                 improvements += 1
@@ -742,7 +946,7 @@ def _binding_loss(
 def _price_loss(
     model: ConstraintFieldNet, step: OptionStep, output: dict
 ) -> torch.Tensor:
-    channels = prism_decoder.FIELD_CHANNEL_COUNT
+    channels = output["active_channels"].shape[-1]
     active = output["active_channels"][0].bool()
     if not active.any():
         return output["multipliers"].sum() * 0.0
@@ -782,6 +986,7 @@ def _detached_output(
         "coupler_weights",
         "coupler_bias",
         "value_context",
+        "candidate_quota_logits",
     ):
         value = output[key]
         if value.requires_grad:
@@ -798,6 +1003,7 @@ def _step_loss(
     args: argparse.Namespace,
     rl_weight: float,
     auxiliary_scale: float,
+    imitation_scale: float,
     class_weights: Optional[dict[str, torch.Tensor]] = None,
     adv_scale: Optional[torch.Tensor] = None,
     temporal_adv_scale: Optional[torch.Tensor] = None,
@@ -939,6 +1145,34 @@ def _step_loss(
         temporal_policy_signal = zero
         temporal_advantage_abs = zero
 
+    quota_rl_loss = zero
+    quota_ratio = zero
+    quota_entropy = zero
+    if (
+        temporal_enabled
+        and step.quota_counts is not None
+        and step.old_quota_logp is not None
+    ):
+        counts = step.quota_counts.to(output["candidate_quota_logits"].device)
+        quota_policy = torch.distributions.Multinomial(
+            total_count=int(counts.sum().item()),
+            logits=output["candidate_quota_logits"][0],
+        )
+        quota_logp = quota_policy.log_prob(counts)
+        old_quota_logp = step.old_quota_logp.to(quota_logp.device)
+        quota_ratio = torch.exp(quota_logp - old_quota_logp)
+        quota_advantage = quota_logp.new_tensor(step.temporal_advantage)
+        if temporal_adv_scale is not None:
+            quota_advantage = quota_advantage / temporal_adv_scale
+        clipped_quota_ratio = torch.clamp(
+            quota_ratio, 1 - args.ppo_clip, 1 + args.ppo_clip
+        )
+        quota_rl_loss = -torch.minimum(
+            quota_ratio * quota_advantage,
+            clipped_quota_ratio * quota_advantage,
+        )
+        quota_entropy = quota_policy.entropy()
+
     critic_loss = zero
     value_prediction = zero
     value_target = zero
@@ -963,15 +1197,27 @@ def _step_loss(
         None if class_weights is None else class_weights["binding"],
     )
     price = _price_loss(model, step, output)
-    auxiliary = (
+    # Feasibility predicts hard dead-ends from the decoder's own lookahead.  Its
+    # labels are state-dependent while this legacy head is edge-only, so the
+    # post-warm-start scale defaults to zero; it remains available as an ablation.
+    feasibility_aux = args.feasibility_weight * feasibility
+    # Dual/binding/price regress the *ranking* (field_r, lambda_r) onto analytic
+    # per-constraint resource pressure and binding indicators -- they teach the
+    # network to imitate a hand-authored heuristic. Optimizing them ties each
+    # channel's meaning to a formula every new constraint would have to supply,
+    # which is exactly what blocks constraint generalization. They are therefore
+    # a warm-start signal only: imitation_scale defaults to zero once PPO begins,
+    # so the reported model's ranking is shaped purely by search reward.
+    imitation = (
         args.dual_weight * dual
-        + args.feasibility_weight * feasibility
         + args.binding_weight * binding
         + args.price_weight * price
     )
     loss = (
         rl_weight * rl_loss
-        + auxiliary_scale * auxiliary
+        + rl_weight * temporal_credit_weight * quota_rl_loss
+        + auxiliary_scale * feasibility_aux
+        + imitation_scale * imitation
         + float(getattr(args, "value_loss_weight", 0.0)) * critic_loss
         - args.entropy_weight * entropy
     )
@@ -993,6 +1239,9 @@ def _step_loss(
             "rl_score_proxy": rl_score_proxy.detach(),
             "policy_signal": policy_signal.detach(),
             "temporal_policy_signal": temporal_policy_signal.detach(),
+            "quota_rl_loss": quota_rl_loss.detach(),
+            "quota_ratio": quota_ratio.detach(),
+            "quota_entropy": quota_entropy.detach(),
             "reward_std": reward_std.detach(),
             "advantage_abs": advantage_abs.detach(),
             "temporal_advantage_abs": temporal_advantage_abs.detach(),
@@ -1004,8 +1253,10 @@ def _step_loss(
             "feasibility_loss": feasibility.detach(),
             "binding_loss": binding.detach(),
             "price_loss": price.detach(),
-            "auxiliary_loss": auxiliary.detach(),
+            "auxiliary_loss": (feasibility_aux + imitation).detach(),
             "auxiliary_scale": float(auxiliary_scale),
+            "imitation_loss": imitation.detach(),
+            "imitation_scale": float(imitation_scale),
             "feasibility_labels": float(risk_labels.numel()),
             "feasibility_positive_rate": (
                 risk_labels.mean().detach() if risk_labels.numel() else 0.0
@@ -1045,6 +1296,12 @@ def ppo_update(
     rl_weight = 0.0 if pretraining else args.rl_weight
     auxiliary_scale = (
         args.pretrain_aux_scale if pretraining else args.aux_rl_scale
+    )
+    # Auxiliary heads warm-start during an explicitly requested pretraining
+    # phase, then switch off for RL by default so the converged field is trained
+    # by search reward rather than state-aliased or hand-authored targets.
+    imitation_scale = (
+        args.pretrain_aux_scale if pretraining else args.imitation_rl_scale
     )
     class_weights = _rollout_class_weights(steps)
     # Batch-pooled advantage scale: centre each option, pool the residuals over
@@ -1100,6 +1357,7 @@ def ppo_update(
                         args,
                         rl_weight,
                         auxiliary_scale,
+                        imitation_scale,
                         class_weights,
                         adv_scale,
                         temporal_adv_scale,
@@ -1140,6 +1398,7 @@ def ppo_update(
                         args,
                         rl_weight,
                         auxiliary_scale,
+                        imitation_scale,
                         class_weights,
                         adv_scale,
                         temporal_adv_scale,
@@ -1230,6 +1489,45 @@ def train_instance_ppo(
     return rollout.average_cost, rollout.best_cost, metrics
 
 
+def _training_variant_schedule(
+    curriculum: VariantCurriculum,
+    args: argparse.Namespace,
+    epoch: int,
+) -> list[str]:
+    """Return the epoch schedule, with curriculum phasing only when requested."""
+    # Without --curriculum, make progress equal to 1.0 so every selected
+    # variant is eligible from epoch 0. Keeping epoch in both arguments retains
+    # deterministic epoch-local reshuffling. Validation never uses this phase
+    # filter; it always covers args.variants directly.
+    schedule_epochs = args.epochs if args.curriculum else epoch + 1
+    eligible = curriculum.eligible(epoch, schedule_epochs) or curriculum.variants
+    group_size = min(args.grad_accum_variants, len(eligible))
+    return curriculum.schedule(
+        epoch,
+        schedule_epochs,
+        args.steps_per_epoch,
+        group_size,
+    )
+
+
+def _training_accumulation_size(
+    curriculum: VariantCurriculum,
+    args: argparse.Namespace,
+    epoch: int,
+) -> int:
+    """Return rollout instances pooled into one PPO optimizer update.
+
+    Variant diversity and optimizer batch size are separate concerns.  In
+    particular, a single-variant run still needs more than one independently
+    generated instance per update; capping this value by the number of eligible
+    variants silently reduced CVRP-only training to batch size one.
+    """
+    del curriculum, epoch
+    if args.grad_accum_variants < 1:
+        raise ValueError("rollouts_per_update must be at least one")
+    return min(args.grad_accum_variants, args.steps_per_epoch)
+
+
 def train_epoch(
     model: ConstraintFieldNet,
     optimizer: torch.optim.Optimizer,
@@ -1237,6 +1535,7 @@ def train_epoch(
     epoch: int,
     args: argparse.Namespace,
     curriculum: VariantCurriculum,
+    ema: Optional["WeightEMA"] = None,
 ) -> tuple[int, float, float, float, float, dict[str, float]]:
     """Accumulate mixed-variant rollouts before each optimizer update."""
     logger = get_logger()
@@ -1252,15 +1551,11 @@ def train_epoch(
     started = time.perf_counter()
     completed = 0
     variant_counts: dict[str, int] = {}
-    variant_schedule = curriculum.schedule(
-        epoch,
-        args.epochs,
-        args.steps_per_epoch,
-        args.grad_accum_variants,
-    )
+    variant_schedule = _training_variant_schedule(curriculum, args, epoch)
+    accumulation_size = _training_accumulation_size(curriculum, args, epoch)
     progress = tqdm(total=args.steps_per_epoch, desc="Epoch", leave=True)
     while completed < args.steps_per_epoch:
-        group = min(args.grad_accum_variants, args.steps_per_epoch - completed)
+        group = min(accumulation_size, args.steps_per_epoch - completed)
         rollouts = []
         field_enabled = epoch >= args.pretrain_epochs
         risk_penalty = (
@@ -1285,6 +1580,8 @@ def train_epoch(
             neural_seconds += rollout.neural_seconds
             decoder_seconds += rollout.decoder_seconds
         metrics = ppo_update(model, optimizer, rollouts, args, epoch)
+        if ema is not None:
+            ema.update(model)
         ppo_seconds += metrics.get("ppo_seconds", 0.0)
         ppo_forward_seconds += metrics.get("ppo_forward_seconds", 0.0)
         ppo_backward_seconds += metrics.get("ppo_backward_seconds", 0.0)
@@ -1299,6 +1596,7 @@ def train_epoch(
                 if name
                 not in {
                     "auxiliary_scale",
+                    "imitation_scale",
                     "ppo_reuse_passes",
                     "ppo_clipping_active",
                 }
@@ -1370,12 +1668,8 @@ def infer_instance(
     problem: dict,
     args: argparse.Namespace,
 ) -> tuple[float, dict, dict[str, float]]:
-    # Inference must use the decoder's real stochastic n-rollout ILS (solve), the
-    # same search regime training optimises. The old deterministic single-rollout
-    # greedy loop stalls at the first local optimum -- its gap is flat from a
-    # handful of iterations and ~2-10x worse than solve -- so it made the field
-    # look untrainable (no field can move a stalled greedy descent). solve is
-    # near-optimal (~0-3%) and the field's contribution is visible there.
+    # Bootstrap from a rollout batch: learned inference uses the model field,
+    # while fields-off uses the identical decoder with neutral objective energy.
     if args.search_iterations < 1:
         raise ValueError("search_iterations must be positive")
     if model is None:
@@ -1398,55 +1692,69 @@ def infer_instance(
         # this baseline differ only by the learned field, so the comparison is a
         # clean ablation of PRISM's own guidance rather than a neural-vs-heuristic
         # contest.
-        decoder = prism_decoder.Decoder(
-            problem,
-            candidate_config={"max_candidates": args.candidates},
-            search_config={
-                "classical_behavior": False,
-                "use_srr": True,
-                "feasibility_lookahead_depth": getattr(
-                    args, "feasibility_lookahead_depth", 2
-                ),
-            },
-            n_rollouts=args.n_rollouts,
-            beta=args.beta,
+        decoder = setup_decoder(problem, args, deterministic=True)
+        initial = list(decoder.sample(**_neutral_guidance(decoder)))
+        incumbent, _winner = _best_feasible_solution(
+            initial, context="fields-off bootstrap"
         )
-        decoder.seed(args.seed)
+        decoder.set_incumbent(incumbent["route"])
         best = decoder.solve(
             args.search_iterations, **_neutral_guidance(decoder)
         )
         return _canonical_cost(best), best, {"emissions": 0.0}
 
-    decoder = prism_decoder.Decoder(
-        problem,
-        candidate_config={"max_candidates": args.candidates},
-        search_config={
-            "classical_behavior": False,
-            "use_srr": True,
-            "feasibility_lookahead_depth": getattr(
-                args, "feasibility_lookahead_depth", 2
-            ),
-        },
-        n_rollouts=args.n_rollouts,
-        beta=args.beta,
-    )
-    decoder.seed(args.seed)
+    decoder = setup_decoder(problem, args, deterministic=True)
     model.eval()
     dynamic = not getattr(args, "static_field", False)
     risk_penalty = args.feasibility_risk_penalty
 
-    def _refresh_guidance() -> dict:
+    def _refresh_guidance() -> tuple[dict, int]:
         graph = build_decoder_data(decoder, args.device)
         output = model(graph)
-        return _guidance_numpy(output, graph, risk_penalty=risk_penalty)
+        evaluations = 1
+        if getattr(args, "learned_candidate_quotas", False):
+            decoder.set_candidate_resource_quotas(
+                output["candidate_quota"][0].detach().cpu().numpy()
+            )
+            decoder.set_incumbent(decoder.best_solution["route"])
+            graph = build_decoder_data(decoder, args.device)
+            output = model(graph)
+            evaluations += 1
+        return (
+            _guidance_numpy(output, graph, risk_penalty=risk_penalty),
+            evaluations,
+        )
 
     neural_seconds = 0.0
     decoder_seconds = 0.0
     net_evals = 0
 
+    # Let the model construct the initial incumbent from the empty graph. The
+    # installed winner then rebuilds the graph before refinement guidance is
+    # evaluated, so no edge-aligned tensor is reused across graph versions.
     start = time.perf_counter()
-    guidance = _refresh_guidance()
+    initial_graph = build_decoder_data(decoder, args.device)
+    initial_output = model(initial_graph)
+    initial_guidance = _guidance_numpy(
+        initial_output, initial_graph, risk_penalty=risk_penalty
+    )
     net_evals += 1
+    neural_seconds += time.perf_counter() - start
+    start = time.perf_counter()
+    initial_solutions = list(decoder.sample(**initial_guidance))
+    decoder_seconds += time.perf_counter() - start
+    incumbent, _winner = _best_feasible_solution(
+        initial_solutions, context="model bootstrap"
+    )
+    if getattr(args, "learned_candidate_quotas", False):
+        decoder.set_candidate_resource_quotas(
+            initial_output["candidate_quota"][0].detach().cpu().numpy()
+        )
+    decoder.set_incumbent(incumbent["route"])
+
+    start = time.perf_counter()
+    guidance, refresh_evals = _refresh_guidance()
+    net_evals += refresh_evals
     neural_seconds += time.perf_counter() - start
 
     if not dynamic:
@@ -1466,8 +1774,8 @@ def infer_instance(
         for _ in range(max(args.search_iterations - 1, 0)):
             if int(decoder.graph_version) != version:
                 start = time.perf_counter()
-                guidance = _refresh_guidance()
-                net_evals += 1
+                guidance, refresh_evals = _refresh_guidance()
+                net_evals += refresh_evals
                 neural_seconds += time.perf_counter() - start
                 version = int(decoder.graph_version)
             start = time.perf_counter()
@@ -1499,6 +1807,25 @@ def _validation_rank(
 
 
 CHECKPOINT_RANK_METRIC = "variant_macro_oracle_or_classical_gap_v1"
+
+
+def _parse_variants(value: str) -> list[str]:
+    """Parse the variants shared by training and validation."""
+    if value == "train":
+        return list(TRAIN_VARIANTS)
+    if value == "all":
+        return list(ALL_VARIANTS)
+    variants = [name.strip() for name in value.split(",") if name.strip()]
+    if not variants:
+        raise argparse.ArgumentTypeError("--variants selected no variants")
+    unknown = sorted(set(variants) - set(ALL_VARIANTS))
+    if unknown:
+        raise argparse.ArgumentTypeError(
+            "unknown variants: " + ", ".join(unknown)
+        )
+    if len(set(variants)) != len(variants):
+        raise argparse.ArgumentTypeError("--variants contains duplicates")
+    return variants
 
 
 def cache_classical_references(
@@ -1550,16 +1877,9 @@ def validation(
     average_costs = []
     best_costs = []
     gaps = []
-    split_gaps: dict[str, list[float]] = {"seen": [], "heldout": []}
     variant_gaps: dict[str, list[float]] = {}
     baseline_improvements = []
-    split_baseline_improvements: dict[str, list[float]] = {
-        "seen": [],
-        "heldout": [],
-    }
     variant_baseline_improvements: dict[str, list[float]] = {}
-    split_totals: dict[str, int] = {"seen": 0, "heldout": 0}
-    split_feasible: dict[str, int] = {"seen": 0, "heldout": 0}
     variant_totals: dict[str, int] = {}
     variant_feasible: dict[str, int] = {}
     variant_objectives: dict[str, list[float]] = {}
@@ -1569,9 +1889,7 @@ def validation(
             model, item["problem"], validation_args
         )
         collector.add_dict(metrics)
-        split = item["split"]
         variant = item["variant"]
-        split_totals[split] = split_totals.get(split, 0) + 1
         variant_totals[variant] = variant_totals.get(variant, 0) + 1
 
         best_cost = _canonical_cost(best)
@@ -1587,7 +1905,6 @@ def validation(
 
         average_costs.append(average)
         best_costs.append(best_cost)
-        split_feasible[split] = split_feasible.get(split, 0) + 1
         variant_feasible[variant] = variant_feasible.get(variant, 0) + 1
         variant_objectives.setdefault(variant, []).append(
             float(best["objective"])
@@ -1599,14 +1916,12 @@ def validation(
             if np.isfinite(baseline_objective):
                 improvement = -_gap(best, baseline_objective)
                 baseline_improvements.append(improvement)
-                split_baseline_improvements[split].append(improvement)
                 variant_baseline_improvements.setdefault(variant, []).append(
                     improvement
                 )
         if item["reference"] is not None:
             gap = _gap(best, item["reference"])
             gaps.append(gap)
-            split_gaps[split].append(gap)
             variant_gaps.setdefault(variant, []).append(gap)
     result = collector.get_all_means()
     total = len(dataset)
@@ -1625,31 +1940,6 @@ def validation(
             sum(item.get("reference_source") == "classical" for item in dataset)
         ),
     )
-    for split, split_total in split_totals.items():
-        feasible_count = split_feasible.get(split, 0)
-        result[f"{split}_instances"] = float(split_total)
-        result[f"{split}_feasible_instances"] = float(feasible_count)
-        result[f"{split}_feasibility_rate"] = (
-            feasible_count / split_total if split_total else 0.0
-        )
-        values = split_gaps[split]
-        result[f"{split}_gap_instances"] = float(len(values))
-        result[f"{split}_gap_coverage"] = (
-            len(values) / split_total if split_total else 0.0
-        )
-        if values:
-            result[f"{split}_gap"] = float(np.mean(values))
-        baseline_values = split_baseline_improvements[split]
-        result[f"{split}_baseline_improvement_instances"] = float(
-            len(baseline_values)
-        )
-        result[f"{split}_baseline_improvement_coverage"] = (
-            len(baseline_values) / split_total if split_total else 0.0
-        )
-        if baseline_values:
-            result[f"{split}_baseline_improvement_percent"] = float(
-                np.mean(baseline_values)
-            )
     for variant, variant_total in variant_totals.items():
         feasible_count = variant_feasible.get(variant, 0)
         prefix = f"variants/{variant}"
@@ -1738,68 +2028,113 @@ def validation(
     )
 
 
-def build_validation_data(
-    args: argparse.Namespace, curriculum: VariantCurriculum
-) -> list[dict]:
+def build_validation_data(args: argparse.Namespace) -> list[dict]:
     if args.val_size < 1:
         raise ValueError("val_size must be at least one instance per problem")
-    if args.val_seen is not None and args.val_seen < 0:
-        raise ValueError("val_seen must be nonnegative or None")
-    if args.val_heldout < 0:
-        raise ValueError("val_heldout must be nonnegative")
     saved = SavedProblems(args.n_node, args.dataset_dir)
-    seen = (
-        curriculum.variants
-        if args.val_seen is None
-        else curriculum.variants[: args.val_seen]
-    )
-    heldout_set = set(curriculum.held_out)
-    heldout_candidates = [
-        variant
-        for variant in VALIDATION_HELDOUT_VARIANTS
-        if variant in heldout_set
-    ]
-    heldout_candidates.extend(
-        variant
-        for variant in curriculum.held_out
-        if variant not in set(heldout_candidates)
-    )
-    heldout = heldout_candidates[: args.val_heldout]
     dataset = []
     logger = get_logger()
     missing = []
-    for split, variants in (("seen", seen), ("heldout", heldout)):
-        for variant in variants:
-            for index in range(args.val_size):
-                try:
-                    problem, reference = saved.load(variant, index=index)
-                except Exception as exc:  # missing data dir/file for this variant
-                    missing.append((variant, index, str(exc)))
-                    continue
-                reference_source = "saved" if reference is not None else "classical"
-                dataset.append(
-                    {
-                        "variant": variant,
-                        "instance_index": index,
-                        "split": split,
-                        "problem": problem,
-                        "reference": reference,
-                        "reference_source": reference_source,
-                    }
-                )
+    for variant in args.variants:
+        for index in range(args.val_size):
+            try:
+                problem, reference = saved.load(variant, index=index)
+            except Exception as exc:  # missing data dir/file for this variant
+                missing.append((variant, index, str(exc)))
+                continue
+            reference_source = "saved" if reference is not None else "classical"
+            dataset.append(
+                {
+                    "variant": variant,
+                    "instance_index": index,
+                    "problem": problem,
+                    "reference": reference,
+                    "reference_source": reference_source,
+                }
+            )
     if missing:
         details = "; ".join(
             f"{variant}[{index}]: {error}"
             for variant, index, error in missing[:5]
         )
         message = (
-            f"missing {len(missing)} validation instances from the fixed "
-            f"manifest ({details})"
+            f"missing {len(missing)} validation instances selected by "
+            f"--variants ({details})"
         )
         if not getattr(args, "allow_missing_validation", False):
             raise RuntimeError(message)
         logger.warning(message)
     return dataset
+
+
+class WeightEMA:
+    """Polyak (exponential moving average) shadow of the model parameters.
+
+    The online weights random-walk within the converged basin every PPO step,
+    and the validation macro-gap -- being the cost of a discrete search over the
+    field -- is a jagged function of those weights, so the raw val curve jitters
+    with no trend. Evaluating and checkpointing a slowly-moving average of the
+    weights turns that jitter into a near-monotone descent and makes best.pt a
+    meaningful selection rather than the luckiest noise trough. Buffers are not
+    tracked (the field net carries no running statistics); only parameters move.
+    """
+
+    def __init__(self, model: ConstraintFieldNet, decay: float) -> None:
+        if not 0.0 < decay < 1.0:
+            raise ValueError("EMA decay must be in (0, 1)")
+        self.decay = float(decay)
+        self.shadow = {
+            name: param.detach().clone()
+            for name, param in model.named_parameters()
+        }
+
+    @torch.no_grad()
+    def update(self, model: ConstraintFieldNet) -> None:
+        for name, param in model.named_parameters():
+            self.shadow[name].mul_(self.decay).add_(
+                param.detach(), alpha=1.0 - self.decay
+            )
+
+    @contextmanager
+    def applied(self, model: ConstraintFieldNet):
+        """Temporarily swap the EMA weights into the model, then restore."""
+        backup = {
+            name: param.detach().clone()
+            for name, param in model.named_parameters()
+        }
+        try:
+            with torch.no_grad():
+                for name, param in model.named_parameters():
+                    param.copy_(self.shadow[name])
+            yield
+        finally:
+            with torch.no_grad():
+                for name, param in model.named_parameters():
+                    param.copy_(backup[name])
+
+    def state_dict(self) -> dict[str, torch.Tensor]:
+        return {name: tensor.clone() for name, tensor in self.shadow.items()}
+
+    def load_state_dict(self, state: dict[str, torch.Tensor]) -> None:
+        for name, tensor in self.shadow.items():
+            if name in state:
+                tensor.copy_(state[name].to(tensor.device))
+
+
+def _epoch_lr(args: argparse.Namespace, epoch: int) -> float:
+    """Learning rate for an epoch, honouring the pretrain phase and schedule."""
+    if epoch < args.pretrain_epochs:
+        return args.pretrain_lr
+    if getattr(args, "lr_schedule", "constant") != "cosine":
+        return args.lr
+    # Cosine anneal from args.lr to args.lr_min across the post-pretrain epochs
+    # so late updates shrink toward zero and the val curve settles instead of
+    # wandering. The final epoch lands at lr_min.
+    span = max(args.epochs - args.pretrain_epochs - 1, 1)
+    progress = min(max(epoch - args.pretrain_epochs, 0), span) / span
+    return args.lr_min + 0.5 * (args.lr - args.lr_min) * (
+        1.0 + math.cos(math.pi * progress)
+    )
 
 
 def save_checkpoint(
@@ -1813,15 +2148,19 @@ def save_checkpoint(
     validation_rank: Optional[tuple[float, ...]] = None,
     best_validation_rank: Optional[tuple[float, ...]] = None,
     global_step: int = 0,
-    validation_manifest: Optional[tuple[tuple[str, int, str, str], ...]] = None,
+    validation_manifest: Optional[tuple[tuple[str, int, str], ...]] = None,
+    ema_state: Optional[dict[str, torch.Tensor]] = None,
 ) -> None:
     payload = {
+        "model_schema": MODEL_SCHEMA,
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "epoch": epoch,
         "config": vars(args),
         "global_step": int(global_step),
     }
+    if ema_state is not None:
+        payload["ema_state_dict"] = ema_state
     if val_gap is not None:
         payload["val_gap"] = val_gap
     if validation_rank is not None:
@@ -1867,6 +2206,25 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--n-node", type=int, default=100)
     parser.add_argument(
+        "--variants",
+        "--variant",
+        type=_parse_variants,
+        default=list(TRAIN_VARIANTS),
+        metavar="NAMES",
+        help=(
+            "Comma-separated variants used for both training and validation; "
+            "also accepts 'train' (default set) or 'all'"
+        ),
+    )
+    parser.add_argument(
+        "--curriculum",
+        action="store_true",
+        help=(
+            "Phase the selected --variants by resource count. By default all "
+            "selected variants train from epoch 0."
+        ),
+    )
+    parser.add_argument(
         "--val-size",
         type=int,
         default=8,
@@ -1882,7 +2240,41 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--capacity", type=int, default=50)
-    parser.add_argument("--candidates", type=int, default=64)
+    parser.add_argument("--candidates", type=int, default=32)
+    parser.add_argument(
+        "--candidate-mode",
+        choices=["schema", "geometric"],
+        default="geometric",
+        help=(
+            "Candidate-graph construction. 'schema' (default) admits resource "
+            "candidates by the schema-derived relevance, using a uniform "
+            "equal-share prior over active resources when no learned quota is "
+            "installed, so any declared resource is covered without per-variant "
+            "tuning. 'geometric' is an explicit ablation that keeps only the "
+            "distance neighborhood. Currently geometric show more consistent improvement."
+        ),
+    )
+    parser.add_argument(
+        "--learned-candidate-quotas",
+        action="store_true",
+        help=(
+            "Let the typed multinomial quota policy reweight the schema "
+            "candidate allocation (schema mode only). Without it the allocation "
+            "stays at the uniform equal-share prior; with it the learned "
+            "fractions replace that prior. No effect under --candidate-mode "
+            "geometric."
+        ),
+    )
+    parser.add_argument(
+        "--typed-noninferiority-margin",
+        type=float,
+        default=0.25,
+        help=(
+            "Maximum allowed known-resource macro degradation in percentage "
+            "points before a typed-neighborhood checkpoint can become best.pt "
+            "(default: 0.25)."
+        ),
+    )
     parser.add_argument("--n-rollouts", type=int, default=32)
     parser.add_argument(
         "--val-n-rollouts",
@@ -1893,10 +2285,26 @@ def parse_args() -> argparse.Namespace:
             "--n-rollouts)"
         ),
     )
-    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--steps-per-epoch", type=int, default=32)
-    parser.add_argument("--grad-accum-variants", type=int, default=4)
-    parser.add_argument("--search-iterations", type=int, default=16)
+    parser.add_argument(
+        "--rollouts-per-update",
+        "--grad-accum-variants",
+        dest="grad_accum_variants",
+        type=int,
+        default=4,
+        help=(
+            "Independently generated problem rollouts pooled into each PPO "
+            "optimizer update (default: 4). The legacy "
+            "--grad-accum-variants spelling is retained as an alias."
+        ),
+    )
+    parser.add_argument(
+        "--search-iterations",
+        type=int,
+        default=16,
+        help="post-bootstrap perturbation/SRR iterations (default: 16)",
+    )
     parser.add_argument(
         "--static-field",
         action="store_true",
@@ -1951,10 +2359,13 @@ def parse_args() -> argparse.Namespace:
         "--pretraining-epochs",
         dest="pretrain_epochs",
         type=int,
-        default=3,
+        default=0,
         help=(
-            "Number of auxiliary-only epochs before PPO starts; use 0 to "
-            "disable the pretraining phase (default: 3)"
+            "Number of auxiliary-only epochs before PPO starts. Default 0: the "
+            "field is trained purely from search reward from epoch 0, with no "
+            "analytic-pressure warm start, so a new constraint needs no "
+            "hand-authored supervision. Set >0 to enable the heuristic-imitation "
+            "warm start as an ablation."
         ),
     )
     parser.add_argument(
@@ -1962,7 +2373,7 @@ def parse_args() -> argparse.Namespace:
         "--pretraining-lr",
         dest="pretrain_lr",
         type=float,
-        default=1e-4,
+        default=1e-5,
         help="Optimizer learning rate during auxiliary pretraining",
     )
     parser.add_argument(
@@ -1978,7 +2389,22 @@ def parse_args() -> argparse.Namespace:
         "--aux-rl-scale",
         type=float,
         default=0.1,
-        help="Auxiliary-loss scale after PPO fine-tuning starts",
+        help=(
+            "Scale on the edge-only feasibility auxiliary after PPO starts "
+            "(default: 0.1). Its lookahead labels depend on live route state "
+        ),
+    )
+    parser.add_argument(
+        "--imitation-rl-scale",
+        type=float,
+        default=0.0,
+        help=(
+            "Scale on the heuristic-imitation auxiliaries (dual/binding/price) "
+            "after PPO starts. Default 0.0: the ranking (field_r, lambda_r) is "
+            "trained purely from search reward, so no per-constraint analytic "
+            "pressure target is needed and new constraints generalize without "
+            "hand-authored supervision. Set >0 only to ablate that choice."
+        ),
     )
     parser.add_argument("--dual-weight", type=float, default=1.0)
     parser.add_argument("--feasibility-weight", type=float, default=1.0)
@@ -1986,13 +2412,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--price-weight",
         type=float,
-        default=0.0,
+        default=0.25,
         help=(
-            "Weight of the multiplier->binding-indicator supervision. Default 0:"
+            "Weight of the multiplier->binding-indicator supervision. Default 0.25:"
             " pinning multipliers to the binding (feasibility) target injects"
-            " harmful ranking distortion (the penalty prices nothing in the"
-            " objective-gated SRR), measured net-negative on distance variants."
-            " Let RL shape the multipliers from search progress instead."
         ),
     )
     parser.add_argument(
@@ -2030,6 +2453,36 @@ def parse_args() -> argparse.Namespace:
         "--feasibility-risk-penalty", type=float, default=10.0
     )
     parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument(
+        "--lr-schedule",
+        dest="lr_schedule",
+        choices=("constant", "cosine"),
+        default="cosine",
+        help=(
+            "Post-pretrain learning-rate schedule (default: cosine). Cosine "
+            "anneals lr->lr-min so late PPO updates stop random-walking away "
+            "from a useful policy; use 'constant' for the legacy behaviour."
+        ),
+    )
+    parser.add_argument(
+        "--lr-min",
+        dest="lr_min",
+        type=float,
+        default=0.0,
+        help="Floor learning rate for --lr-schedule cosine (default: 0.0)",
+    )
+    parser.add_argument(
+        "--val-ema-decay",
+        dest="val_ema_decay",
+        type=float,
+        default=0.0,
+        help=(
+            "If >0, keep an exponential moving average of the weights (decay "
+            "per optimizer update) and run validation + save best.pt from it. "
+            "Smooths the jagged val macro-gap into a near-monotone curve. "
+            "Typical: 0.99. Default 0.0 disables (unchanged behaviour)"
+        ),
+    )
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument(
         "--smallvram",
@@ -2050,32 +2503,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--threads", type=int, default=None)
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument(
-        "--val-seen",
-        type=int,
-        default=None,
-        help="Number of training variants to validate (default: all)",
-    )
-    parser.add_argument(
-        "--val-heldout",
-        type=int,
-        default=16,
-        help="Number of variants from the fixed stratified held-out manifest",
-    )
-    parser.add_argument(
         "--allow-missing-validation",
         action="store_true",
-        help="Warn and continue instead of requiring the complete manifest",
-    )
-    parser.add_argument(
-        "--gap-reference",
-        choices=["oracle", "oracle-or-baseline"],
-        default="oracle",
-        help=(
-            "Reference for the reported gap%%. 'oracle' (default) measures gap"
-            " only against saved oracle references and excludes reference-less"
-            " items (matches test.py). 'oracle-or-baseline' falls back to the"
-            " captured baseline as the reference for items without an oracle."
-        ),
+        help="Warn and continue when a selected validation instance is missing",
     )
     parser.add_argument(
         "--baseline",
@@ -2116,6 +2546,8 @@ def main() -> None:
         raise ValueError("temporal_credit_weight must be nonnegative")
     if args.value_loss_weight < 0.0:
         raise ValueError("value_loss_weight must be nonnegative")
+    if args.typed_noninferiority_margin < 0.0:
+        raise ValueError("typed_noninferiority_margin must be nonnegative")
     if args.smallvram is None:
         args.smallvram = (
             torch.version.hip is not None
@@ -2139,7 +2571,9 @@ def main() -> None:
             config=vars(args),
         )
 
-    curriculum = VariantCurriculum.default(args.seed)
+    curriculum = VariantCurriculum(
+        list(args.variants), random.Random(args.seed), args.seed
+    )
     model = ConstraintFieldNet(
         grad_checkpointing=args.grad_checkpointing,
         gate_multipliers_by_binding=args.gate_multipliers_by_binding,
@@ -2152,6 +2586,10 @@ def main() -> None:
         checkpoint = torch.load(
             args.resume, map_location=args.device, weights_only=False
         )
+        if checkpoint.get("model_schema") != MODEL_SCHEMA:
+            raise RuntimeError(
+                "resume checkpoint is not a typed-resource v2 checkpoint"
+            )
         upgraded = load_constraint_field_state_dict(
             model, checkpoint["model_state_dict"]
         )
@@ -2173,27 +2611,52 @@ def main() -> None:
             checkpoint.get("global_step", start_epoch * args.steps_per_epoch)
         )
 
+    ema = (
+        WeightEMA(model, args.val_ema_decay)
+        if args.val_ema_decay and args.val_ema_decay > 0.0
+        else None
+    )
+    if ema is not None and checkpoint is not None:
+        stored_ema = checkpoint.get("ema_state_dict")
+        if stored_ema is not None:
+            ema.load_state_dict(stored_ema)
+        else:
+            logger.warning(
+                "resumed checkpoint has no EMA state; seeding the EMA shadow "
+                "from the online weights"
+            )
+
     args.save_dir.mkdir(parents=True, exist_ok=True)
     validation_data = (
-        [] if args.skip_validation else build_validation_data(args, curriculum)
+        [] if args.skip_validation else build_validation_data(args)
     )
+    cached_classical_references = (
+        cache_classical_references(validation_data, args)
+        if validation_data
+        else 0
+    )
+    if cached_classical_references:
+        logger.info(
+            f"Cached {cached_classical_references} classical references for "
+            "validation instances without saved oracle references"
+        )
     validation_manifest = tuple(
         (
             item["variant"],
             int(item["instance_index"]),
-            item["split"],
+            item["reference_source"],
         )
         for item in validation_data
     )
-    best_validation_rank = (float("inf"),) * 5
+    best_validation_rank = (float("inf"),)
     if checkpoint is not None:
         stored_rank = checkpoint.get("best_validation_rank")
         if (
             checkpoint.get("checkpoint_rank_metric")
-            == "variant_macro_score"
+            == CHECKPOINT_RANK_METRIC
             and checkpoint.get("validation_manifest") == validation_manifest
             and stored_rank is not None
-            and len(stored_rank) == 5
+            and len(stored_rank) == 1
         ):
             best_validation_rank = tuple(float(value) for value in stored_rank)
         elif stored_rank is not None:
@@ -2211,11 +2674,11 @@ def main() -> None:
             None,
             validation_data,
             args,
-            capture_classical_baseline=True,
+            capture_paired_baseline=True,
         )
         logger.log_baseline(baseline_gap)
     for epoch in range(start_epoch, args.epochs):
-        phase_lr = args.pretrain_lr if epoch < args.pretrain_epochs else args.lr
+        phase_lr = _epoch_lr(args, epoch)
         for group in optimizer.param_groups:
             group["lr"] = phase_lr
         (
@@ -2225,14 +2688,37 @@ def main() -> None:
             _decoder_time,
             epoch_time,
             epoch_timing,
-        ) = train_epoch(model, optimizer, global_step, epoch, args, curriculum)
+        ) = train_epoch(
+            model, optimizer, global_step, epoch, args, curriculum, ema=ema
+        )
         val_best = 0.0
         val_gap = None
         val_metrics = {}
         validation_rank = None
         if validation_data:
-            val_average, val_best, val_gap, val_metrics = validation(
-                model, validation_data, args
+            # Evaluate and select the checkpoint from the EMA weights (when
+            # enabled) so the reported curve and best.pt track the smoothed
+            # model rather than the jittery online one. A fresh context per use
+            # -- ema.applied() is single-entry.
+            def _eval_context():
+                return ema.applied(model) if ema is not None else nullcontext()
+
+            with _eval_context():
+                val_average, val_best, val_gap, val_metrics = validation(
+                    model, validation_data, args
+                )
+            typed_gate_pass = (
+                not args.learned_candidate_quotas
+                or (
+                    val_metrics.get("feasibility_rate", 0.0) == 1.0
+                    and val_metrics.get(
+                        "macro_baseline_improvement_percent", float("-inf")
+                    )
+                    >= -float(args.typed_noninferiority_margin)
+                )
+            )
+            val_metrics["typed_neighborhood_gate_pass"] = float(
+                typed_gate_pass
             )
             logger.log_validation(
                 val_average,
@@ -2244,20 +2730,21 @@ def main() -> None:
                 step=global_step,
             )
             validation_rank = _validation_rank(val_metrics, val_gap)
-            if validation_rank < best_validation_rank:
+            if typed_gate_pass and validation_rank < best_validation_rank:
                 best_validation_rank = validation_rank
-                save_checkpoint(
-                    model,
-                    optimizer,
-                    epoch,
-                    args,
-                    args.save_dir / "best.pt",
-                    val_gap,
-                    validation_rank=validation_rank,
-                    best_validation_rank=best_validation_rank,
-                    global_step=global_step,
-                    validation_manifest=validation_manifest,
-                )
+                with _eval_context():
+                    save_checkpoint(
+                        model,
+                        optimizer,
+                        epoch,
+                        args,
+                        args.save_dir / "best.pt",
+                        val_gap,
+                        validation_rank=validation_rank,
+                        best_validation_rank=best_validation_rank,
+                        global_step=global_step,
+                        validation_manifest=validation_manifest,
+                    )
         logger.log_epoch_summary(
             epoch,
             train_cost,
@@ -2275,6 +2762,8 @@ def main() -> None:
                 )
             )
         logger.log_metrics(epoch_timing, prefix="time/", step=global_step)
+        # last.pt stores the online weights (resume-correct with the optimizer
+        # state) plus the EMA shadow so a resumed run keeps averaging.
         save_checkpoint(
             model,
             optimizer,
@@ -2286,6 +2775,7 @@ def main() -> None:
             best_validation_rank=best_validation_rank,
             global_step=global_step,
             validation_manifest=validation_manifest,
+            ema_state=ema.state_dict() if ema is not None else None,
         )
         gc.collect()
         if torch.cuda.is_available():

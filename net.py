@@ -1,3 +1,5 @@
+import math
+
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -8,11 +10,13 @@ import prism_decoder
 
 FIELD_CHANNEL_COUNT = prism_decoder.FIELD_CHANNEL_COUNT
 LIVE_STATE_FEATURE_COUNT = prism_decoder.LIVE_STATE_FEATURE_COUNT
+RESOURCE_DESCRIPTOR_DIM = prism_decoder.RESOURCE_DESCRIPTOR_DIM
 NODE_FEATURE_COUNT = prism_decoder.NODE_FEATURE_COUNT
 EDGE_FEATURE_COUNT = prism_decoder.EDGE_FEATURE_COUNT
 
 
 OBJECTIVE_TYPES = ("distance", "prize", "distance_plus_penalty")
+MODEL_SCHEMA = "typed_resource_v2"
 
 
 def _require_unit_interval(name, value):
@@ -59,7 +63,8 @@ def build_decoder_data(decoder, device="cpu"):
         decoder.metadata["field_channel_mask"],
         dtype=torch.float32,
         device=device,
-    ).view(1, FIELD_CHANNEL_COUNT)
+    ).view(1, -1)
+    resource_count = active_channels.shape[1]
     open_route = torch.tensor(
         [[float(bool(decoder.metadata["open_route"]))]],
         dtype=torch.float32,
@@ -89,6 +94,15 @@ def build_decoder_data(decoder, device="cpu"):
     raw_resource_pressure = torch.as_tensor(
         decoder.resource_pressure, dtype=torch.float32, device=device
     )
+    resource_features = torch.as_tensor(
+        decoder.resource_features, dtype=torch.float32, device=device
+    )
+    resource_events = torch.as_tensor(
+        decoder.resource_events, dtype=torch.float32, device=device
+    )
+    resource_descriptors = torch.as_tensor(
+        decoder.resource_descriptors, dtype=torch.float32, device=device
+    ).view(1, resource_count, RESOURCE_DESCRIPTOR_DIM)
     objective_edge_costs = torch.as_tensor(
         decoder.objective_edge_costs, dtype=torch.float32, device=device
     )
@@ -114,11 +128,20 @@ def build_decoder_data(decoder, device="cpu"):
     if not torch.isfinite(objective_edge_costs).all():
         raise ValueError("objective_edge_costs must contain only finite values")
     if (
-        resource_scales.shape != (FIELD_CHANNEL_COUNT,)
+        resource_scales.shape != (resource_count,)
         or not torch.isfinite(resource_scales).all()
         or torch.any(resource_scales <= 0.0)
     ):
         raise ValueError("resource_scales must be finite and strictly positive")
+    if resource_features.shape != (edge_attr.shape[0], resource_count):
+        raise ValueError("resource_features must have shape [E, resource_count]")
+    if raw_resource_pressure.shape != resource_features.shape:
+        raise ValueError("raw_resource_pressure must match resource_features")
+    if resource_events.shape != resource_features.shape:
+        raise ValueError("resource_events must match resource_features")
+    _require_unit_interval("resource_features", resource_features)
+    _require_unit_interval("resource_events", resource_events)
+    _require_unit_interval("resource_descriptors", resource_descriptors)
     return Data(
         x=x,
         edge_index=edge_index,
@@ -130,6 +153,9 @@ def build_decoder_data(decoder, device="cpu"):
         multi_route=multi_route,
         depot_scale=depot_scale,
         raw_resource_pressure=raw_resource_pressure,
+        resource_features=resource_features,
+        resource_events=resource_events,
+        resource_descriptors=resource_descriptors,
         objective_edge_costs=objective_edge_costs,
         resource_scales=resource_scales,
         edge_offsets=edge_offsets,
@@ -138,10 +164,28 @@ def build_decoder_data(decoder, device="cpu"):
 
 
 @torch.no_grad()
-def decode_iteration(decoder, model, device="cpu", risk_penalty=10.0):
-    """Run one model refresh and one decoder iteration on the current graph."""
+def decode_iteration(
+    decoder,
+    model,
+    device="cpu",
+    risk_penalty=10.0,
+    learned_candidate_quotas=False,
+):
+    """Run one model-guided perturbation on an installed incumbent graph."""
+    if not decoder.best_solution["feasible"]:
+        raise ValueError(
+            "decode_iteration requires a feasible installed incumbent; "
+            "greedily bootstrap and call decoder.set_incumbent() first"
+        )
     graph = build_decoder_data(decoder, device=device)
     output = model(graph)
+    if learned_candidate_quotas:
+        decoder.set_candidate_resource_quotas(
+            output["candidate_quota"][0].detach().cpu().numpy()
+        )
+        decoder.set_incumbent(decoder.best_solution["route"])
+        graph = build_decoder_data(decoder, device=device)
+        output = model(graph)
     scales = graph.resource_scales.unsqueeze(0)
     edge_field = (output["residual"] * scales).detach().cpu().numpy()
     multipliers = output["multipliers"][0].detach().cpu().numpy()
@@ -212,13 +256,13 @@ class EmbNet(nn.Module):
             GNNLayer(self.units, self.act_fn, self.agg_fn) for _ in range(self.depth)
         ])
         
-    def forward(self, x, edge_index, edge_attr):
+    def forward(self, x, edge_index, edge_attr, return_nodes=False):
         w = edge_attr
         x = self.v_lin0(x)
         x = self.act_fn(x)
         w = self.e_lin0(w)
         w = self.act_fn(w)
-        
+
         for layer in self.layers:
             if self.grad_checkpointing and self.training:
                 x, w = torch.utils.checkpoint.checkpoint(
@@ -226,6 +270,10 @@ class EmbNet(nn.Module):
                 )
             else:
                 x, w = layer(x, w, edge_index)
+        # Node embeddings x feed the refinement policy (CaR-style shared
+        # encoder); the field net keeps consuming only the edge embeddings w.
+        if return_nodes:
+            return w, x
         return w
 
 class ConstraintFieldNet(nn.Module):
@@ -257,9 +305,12 @@ class ConstraintFieldNet(nn.Module):
             agg_fn=agg_fn,
             grad_checkpointing=grad_checkpointing,
         )
-        # resource-type one-hot + active flag + mean/max pressure + open_route
-        # + objective-type one-hot + objective scale + multi_route + depot scale
-        descriptor_size = FIELD_CHANNEL_COUNT + 4 + len(OBJECTIVE_TYPES) + 1 + 2
+        # Algebra-derived type descriptor + active flag + mean/max pressure +
+        # graph context. No resource name or registry position reaches the
+        # token encoder, so the same weights apply to appended schema rows.
+        descriptor_size = (
+            RESOURCE_DESCRIPTOR_DIM + 4 + len(OBJECTIVE_TYPES) + 1 + 2
+        )
         self.resource_encoder = nn.Sequential(
             nn.Linear(descriptor_size, units),
             nn.SiLU(),
@@ -270,6 +321,7 @@ class ConstraintFieldNet(nn.Module):
             units, attention_heads, batch_first=True
         )
         self.edge_projection = nn.Linear(units, units)
+        self.resource_edge_projection = nn.Linear(2, units)
         self.token_projection = nn.Linear(units, units)
         self.graph_projection = nn.Linear(units, units)
         self.field_head = nn.Linear(units, 1)
@@ -277,14 +329,17 @@ class ConstraintFieldNet(nn.Module):
         self.feasibility_head = nn.Linear(units, 1)
         self.multiplier_head = nn.Linear(units, 1)
         self.binding_head = nn.Linear(units, 1)
-        self.coupler_head = nn.Linear(units, LIVE_STATE_FEATURE_COUNT)
+        self.candidate_quota_head = nn.Linear(units, 1)
+        self.distance_quota_head = nn.Linear(units, 1)
+        self.coupler_query_head = nn.Linear(units, units)
+        self.coupler_key_head = nn.Linear(units, units)
         self.coupler_bias_head = nn.Linear(units, 1)
         # Objective multiplier slot (w_obj): a learned, state-conditioned weight
         # on the objective edge cost. It lets the objective enter the search
         # energy through a learned coefficient instead of a hard unit term, and
         # is appended as multiplier slot FIELD_CHANNEL_COUNT.
         self.objective_multiplier_head = nn.Linear(units, 1)
-        self.objective_coupler_head = nn.Linear(units, LIVE_STATE_FEATURE_COUNT)
+        self.objective_coupler_query_head = nn.Linear(units, units)
         self.objective_coupler_bias_head = nn.Linear(units, 1)
         self.value_head = nn.Linear(units + 1, 1)
         nn.init.zeros_(self.field_head.weight)
@@ -292,9 +347,19 @@ class ConstraintFieldNet(nn.Module):
         nn.init.zeros_(self.additive_head.weight)
         nn.init.zeros_(self.additive_head.bias)
         nn.init.zeros_(self.feasibility_head.weight)
-        nn.init.constant_(self.feasibility_head.bias, -4.0)
-        nn.init.zeros_(self.coupler_head.weight)
-        nn.init.zeros_(self.coupler_head.bias)
+        # Bias the untrained risk head to ~0 predicted risk so it starts neutral in
+        # the search energy, like every other zero-init head. The head is a uniform
+        # sigmoid(bias) at init (zero weight), and that risk is multiplied by
+        # risk_penalty (default 10) inside the SRR/construction energy; at the old
+        # bias -4 that injected a spurious ~0.18/edge term that measurably distorted
+        # the ranking (e.g. saved TSP +0.01% neutral -> +0.54%), so an untrained
+        # model started *below* its own fields-off baseline and could not win in a
+        # single epoch. sigmoid(-9) * 10 ~= 1e-3 is negligible, and because the
+        # feasibility loss is BCE-with-logits the head still learns real dead-end
+        # risk from this low prior (gradient ~ sigmoid(z) - target, not vanishing).
+        nn.init.constant_(self.feasibility_head.bias, -9.0)
+        nn.init.zeros_(self.coupler_query_head.weight)
+        nn.init.zeros_(self.coupler_query_head.bias)
         nn.init.zeros_(self.coupler_bias_head.weight)
         nn.init.zeros_(self.coupler_bias_head.bias)
         # w_obj initializes to 1.0: softplus(unit_softplus_shift) * 2*sigmoid(0),
@@ -302,17 +367,14 @@ class ConstraintFieldNet(nn.Module):
         # search reward moves it.
         nn.init.zeros_(self.objective_multiplier_head.weight)
         nn.init.zeros_(self.objective_multiplier_head.bias)
-        nn.init.zeros_(self.objective_coupler_head.weight)
-        nn.init.zeros_(self.objective_coupler_head.bias)
+        nn.init.zeros_(self.objective_coupler_query_head.weight)
+        nn.init.zeros_(self.objective_coupler_query_head.bias)
         nn.init.zeros_(self.objective_coupler_bias_head.weight)
         nn.init.zeros_(self.objective_coupler_bias_head.bias)
         # A zero value is the neutral bootstrap for old checkpoints and makes
         # enabling temporal credit leave the field policy unchanged initially.
         nn.init.zeros_(self.value_head.weight)
         nn.init.zeros_(self.value_head.bias)
-        self.register_buffer(
-            "resource_types", torch.eye(FIELD_CHANNEL_COUNT)
-        )
         self.register_buffer(
             "unit_softplus_shift",
             torch.log(torch.expm1(torch.ones(()))),
@@ -329,7 +391,7 @@ class ConstraintFieldNet(nn.Module):
         )
 
     def _field_channel(
-        self, edge_projection, token_projection, edge_batch
+        self, edge_projection, token_projection, resource_edge, edge_batch
     ):
         token = (
             token_projection
@@ -337,7 +399,7 @@ class ConstraintFieldNet(nn.Module):
             else token_projection[edge_batch]
         )
         interaction = torch.tanh(
-            edge_projection + token
+            edge_projection + token + resource_edge
         )
         return (
             self.field_head(interaction).squeeze(-1),
@@ -351,10 +413,9 @@ class ConstraintFieldNet(nn.Module):
         if active.ndim == 1:
             active = active.unsqueeze(0)
         _require_unit_interval("active_channels", active)
-        if active.shape[-1] != FIELD_CHANNEL_COUNT:
-            raise ValueError(
-                f"active_channels must end in {FIELD_CHANNEL_COUNT} channels"
-            )
+        resource_count = active.shape[-1]
+        if resource_count < FIELD_CHANNEL_COUNT:
+            raise ValueError("resource registry must include canonical rows")
 
         edge_embedding = self.emb_net(
             pyg.x, pyg.edge_index, pyg.edge_attr
@@ -395,7 +456,14 @@ class ConstraintFieldNet(nn.Module):
             pyg, "depot_scale", 1, batch_size, active
         )
 
-        normalized_resources = pyg.edge_attr[:, 1 : 1 + FIELD_CHANNEL_COUNT]
+        normalized_resources = pyg.resource_features
+        if normalized_resources.shape != (edge_embedding.shape[0], resource_count):
+            raise ValueError(
+                "resource_features must have shape [num_edges, resource_count]"
+            )
+        resource_events = pyg.resource_events
+        if resource_events.shape != normalized_resources.shape:
+            raise ValueError("resource_events must match resource_features")
         if batched:
             resource_mean = gnn.global_mean_pool(
                 normalized_resources, edge_batch
@@ -406,11 +474,22 @@ class ConstraintFieldNet(nn.Module):
         else:
             resource_mean = normalized_resources.mean(dim=0, keepdim=True)
             resource_max = normalized_resources.amax(dim=0, keepdim=True)
-        resource_type = self.resource_types.unsqueeze(0).expand(
-            graph_embedding.shape[0], -1, -1
-        )
+        resource_type = pyg.resource_descriptors
+        if resource_type.ndim == 2:
+            resource_type = resource_type.unsqueeze(0)
+        if resource_type.shape != (
+            batch_size,
+            resource_count,
+            RESOURCE_DESCRIPTOR_DIM,
+        ):
+            raise ValueError(
+                "resource_descriptors must have shape "
+                "[num_graphs, resource_count, RESOURCE_DESCRIPTOR_DIM]"
+            )
+        _require_unit_interval("resource_descriptors", resource_type)
+
         def _broadcast(column):
-            return column.unsqueeze(1).expand(-1, FIELD_CHANNEL_COUNT, -1)
+            return column.unsqueeze(1).expand(-1, resource_count, -1)
 
         descriptor = torch.cat(
             (
@@ -442,11 +521,20 @@ class ConstraintFieldNet(nn.Module):
         projected_tokens = self.token_projection(tokens)
         raw_channels = []
         additive_channels = []
-        for channel in range(FIELD_CHANNEL_COUNT):
+        for channel in range(resource_count):
             token = (
                 projected_tokens[:, channel]
                 if batched
                 else projected_tokens[0, channel]
+            )
+            resource_edge = self.resource_edge_projection(
+                torch.stack(
+                    (
+                        normalized_resources[:, channel],
+                        resource_events[:, channel],
+                    ),
+                    dim=1,
+                )
             )
             if (
                 self.emb_net.grad_checkpointing
@@ -457,12 +545,13 @@ class ConstraintFieldNet(nn.Module):
                     self._field_channel,
                     projected_edges,
                     token,
+                    resource_edge,
                     edge_batch,
                     use_reentrant=False,
                 )
             else:
                 raw, additive_channel = self._field_channel(
-                    projected_edges, token, edge_batch
+                    projected_edges, token, resource_edge, edge_batch
                 )
             raw_channels.append(raw)
             additive_channels.append(additive_channel)
@@ -491,19 +580,41 @@ class ConstraintFieldNet(nn.Module):
         if self.gate_multipliers_by_binding:
             multipliers = multipliers * torch.sigmoid(binding_logits)
         multipliers = multipliers * active
-        coupler_weights = self.coupler_head(state) * active.unsqueeze(-1)
+        coupler_queries = self.coupler_query_head(state)
+        coupler_keys = self.coupler_key_head(tokens)
+        coupler_weights = torch.einsum(
+            "bru,bsu->brs", coupler_queries, coupler_keys
+        ) / (coupler_queries.shape[-1] ** 0.5)
+        coupler_weights = (
+            coupler_weights
+            * active.unsqueeze(-1)
+            * active.unsqueeze(1)
+        )
         coupler_bias = self.coupler_bias_head(state).squeeze(-1) * active
         # Append the always-on objective multiplier slot (w_obj) so the guidance
-        # arrays carry MULTIPLIER_COUNT = FIELD_CHANNEL_COUNT + 1 entries. The
+        # arrays carry multiplier_count = resource_count + 1 entries. The
         # objective weight is graph-level and is not gated by active channels.
         objective_multiplier = F.softplus(
             self.objective_multiplier_head(graph_state).squeeze(-1)
             + self.unit_softplus_shift
         )
-        objective_coupler_weights = self.objective_coupler_head(graph_state)
+        objective_coupler_query = self.objective_coupler_query_head(graph_state)
+        objective_coupler_weights = torch.einsum(
+            "bu,bsu->bs", objective_coupler_query, coupler_keys
+        ) / (objective_coupler_query.shape[-1] ** 0.5)
+        objective_coupler_weights = objective_coupler_weights * active
         objective_coupler_bias = self.objective_coupler_bias_head(
             graph_state
         ).squeeze(-1)
+        resource_quota_logits = self.candidate_quota_head(state).squeeze(-1)
+        resource_quota_logits = resource_quota_logits.masked_fill(
+            ~active.bool(), torch.finfo(resource_quota_logits.dtype).min
+        )
+        distance_quota_logit = self.distance_quota_head(graph_state)
+        candidate_quota_logits = torch.cat(
+            (resource_quota_logits, distance_quota_logit), dim=1
+        )
+        candidate_quota = torch.softmax(candidate_quota_logits, dim=1)
         multipliers = torch.cat(
             (multipliers, objective_multiplier.unsqueeze(1)), dim=1
         )
@@ -523,6 +634,8 @@ class ConstraintFieldNet(nn.Module):
             "raw_residual": raw_residual,
             "coupler_weights": coupler_weights,
             "coupler_bias": coupler_bias,
+            "candidate_quota_logits": candidate_quota_logits,
+            "candidate_quota": candidate_quota[:, :-1],
             "value_context": graph_state,
             "active_channels": active,
         }
@@ -530,15 +643,15 @@ class ConstraintFieldNet(nn.Module):
     def couple(self, output, live_state, graph_index=None):
         """Apply the same cheap state modulation evaluated by the C++ decoder."""
         _require_unit_interval("live_state", live_state)
-        if live_state.shape[-1] != LIVE_STATE_FEATURE_COUNT:
-            raise ValueError(
-                f"live_state must end in {LIVE_STATE_FEATURE_COUNT} features"
-            )
         base = output["multipliers"]
         weights = output["coupler_weights"]
         bias = output["coupler_bias"]
         if weights.ndim != 3:
             raise ValueError("coupler_weights must have shape [B, C, S]")
+        if live_state.shape[-1] != weights.shape[-1]:
+            raise ValueError(
+                "live_state width must match the runtime resource registry"
+            )
         graph_count = weights.shape[0]
         if graph_index is None:
             if graph_count != 1:
@@ -580,30 +693,194 @@ class ConstraintFieldNet(nn.Module):
         return self.value_head(torch.cat((context, progress), dim=-1)).squeeze(-1)
 
 
+def _sinusoidal_positions(length, units, device, dtype):
+    """Plain sinusoidal PE over route position.
+
+    A first, cheap stand-in for CaR's cyclic positional encoding. Route order is
+    what distinguishes an improvement policy from the order-agnostic field, so
+    even this simple version is load-bearing; swap in the cyclic variant later.
+    """
+    position = torch.arange(length, device=device, dtype=dtype).unsqueeze(1)
+    div = torch.exp(
+        torch.arange(0, units, 2, device=device, dtype=dtype)
+        * (-math.log(10000.0) / units)
+    )
+    pe = torch.zeros(length, units, device=device, dtype=dtype)
+    pe[:, 0::2] = torch.sin(position * div)
+    pe[:, 1::2] = torch.cos(position * div[: pe[:, 1::2].shape[1]])
+    return pe
+
+
+class RefinementDecoder(nn.Module):
+    """Learned remove-and-reinsert refinement operator (CaR Path A).
+
+    Replaces the hand-designed C++ perturb / scope_restricted_refine move
+    generator with a neural policy: given the current incumbent as an ordered
+    sequence, a *ruin* head selects rm_num customers to remove and a *recreate*
+    head sequentially chooses a reinsertion gap for each. The C++ decoder stays
+    the feasibility+cost oracle (`evaluate`), so the policy only proposes routes;
+    it never has to re-derive the resource algebra.
+
+    The encoder is shared with ConstraintFieldNet via `emb_net` (CaR's
+    unified_encoder), so construction/field and refinement reuse one node
+    representation.
+    """
+
+    def __init__(
+        self,
+        units=32,
+        rm_num=3,
+        emb_net=None,
+        depth=12,
+        act_fn="silu",
+        agg_fn="mean",
+        grad_checkpointing=False,
+    ):
+        super().__init__()
+        self.units = units
+        self.rm_num = rm_num
+        if emb_net is None:
+            emb_net = EmbNet(
+                depth=depth,
+                feats=NODE_FEATURE_COUNT,
+                edge_feats=EDGE_FEATURE_COUNT,
+                units=units,
+                act_fn=act_fn,
+                agg_fn=agg_fn,
+                grad_checkpointing=grad_checkpointing,
+            )
+        self.emb_net = emb_net
+        # Live resource state has a graph-dependent width (resource_count). We
+        # summarize it to a fixed 3-dim [mean, max, spread] per node so the same
+        # weights apply to any registry. TODO: condition on resource_descriptors
+        # like ConstraintFieldNet to keep per-resource identity.
+        self.state_proj = nn.Linear(3, units)
+        self.pos_proj = nn.Linear(units, units)
+        self.route_attention = nn.MultiheadAttention(
+            units, 4 if units % 4 == 0 else 1, batch_first=True
+        )
+        self.route_norm = nn.LayerNorm(units)
+        # Ruin head: per-route-position removal logit.
+        self.remove_head = nn.Sequential(
+            nn.Linear(units, units), nn.SiLU(), nn.Linear(units, 1)
+        )
+        # Recreate head: score inserting node h_node into gap (h_u, h_v).
+        self.insert_head = nn.Sequential(
+            nn.Linear(3 * units, units), nn.SiLU(), nn.Linear(units, 1)
+        )
+
+    def encode_nodes(self, graph, live_state):
+        """Graph-level node embeddings [N, units] -- route-order independent.
+
+        The GNN is the expensive part and does not depend on route order, so it
+        runs exactly once per step and is reused for both ruin and every
+        reinsertion (previously re-run rm_num+1 times).
+        """
+        _, node_emb = self.emb_net(
+            graph.x, graph.edge_index, graph.edge_attr, return_nodes=True
+        )
+        summary = torch.stack(
+            (
+                live_state.mean(dim=1),
+                live_state.amax(dim=1),
+                live_state.amax(dim=1) - live_state.amin(dim=1),
+            ),
+            dim=1,
+        )  # [N, 3]
+        return node_emb + self.state_proj(summary)  # [N, units]
+
+    def route_context(self, node_h, route):
+        """Order-aware per-position embeddings for one route (cheap: PE + MHA)."""
+        seq = node_h[route]  # [L, units]
+        pe = _sinusoidal_positions(
+            seq.shape[0], self.units, seq.device, seq.dtype
+        )
+        seq = seq + self.pos_proj(pe)
+        attended, _ = self.route_attention(
+            seq.unsqueeze(0), seq.unsqueeze(0), seq.unsqueeze(0)
+        )
+        return self.route_norm(seq + attended.squeeze(0))  # [L, units]
+
+    def forward(self, graph, route, live_state, depot_count, greedy=False):
+        """Propose one refined route.
+
+        Returns (new_route: list[int], logp: scalar tensor, entropy: scalar
+        tensor). Feasibility/cost are NOT checked here -- pass new_route to
+        decoder.evaluate() and reward accordingly.
+        """
+        route = torch.as_tensor(route, device=graph.x.device).long()
+        node_h = self.encode_nodes(graph, live_state)  # [N, units], once
+        seq = self.route_context(node_h, route)  # [L, units]
+        route_list = route.tolist()
+
+        # ---- Ruin: sample rm_num distinct customer positions ----
+        is_customer = route >= depot_count  # depots are never removed
+        remove_logits = self.remove_head(seq).squeeze(-1)  # [L]
+        remove_logits = remove_logits.masked_fill(~is_customer, float("-inf"))
+        logp = seq.new_zeros(())
+        entropy = seq.new_zeros(())
+        removed_positions = []
+        n_remove = min(self.rm_num, int(is_customer.sum().item()))
+        for _ in range(n_remove):
+            # Fresh mask each step: mutating a tensor already captured by an
+            # earlier masked_fill breaks autograd (version-counter error).
+            taken = torch.zeros_like(is_customer)
+            if removed_positions:
+                taken[removed_positions] = True
+            logits = remove_logits.masked_fill(taken, float("-inf"))
+            dist = torch.distributions.Categorical(logits=logits)
+            pos = logits.argmax() if greedy else dist.sample()
+            logp = logp + dist.log_prob(pos)
+            entropy = entropy + dist.entropy()
+            removed_positions.append(int(pos.item()))
+
+        removed_nodes = [route_list[p] for p in removed_positions]
+        partial = [
+            n for i, n in enumerate(route_list) if i not in set(removed_positions)
+        ]
+
+        # ---- Recreate: sequentially reinsert each removed node into a gap ----
+        # Gap endpoints reuse the cached node embeddings directly, so no GNN or
+        # attention pass runs inside this loop. (Trade-off: gap scoring loses
+        # full-route context vs re-encoding; add it back if reinsertion quality
+        # is the bottleneck.)
+        for node in removed_nodes:
+            partial_t = torch.as_tensor(partial, device=graph.x.device).long()
+            gap_h = node_h[partial_t]  # [P, units]
+            gaps = gap_h.shape[0] - 1
+            u = gap_h[:-1]
+            v = gap_h[1:]
+            node_e = node_h[node].expand(gaps, -1)
+            gap_score = self.insert_head(
+                torch.cat((node_e, u, v), dim=-1)
+            ).squeeze(-1)  # [gaps]
+            dist = torch.distributions.Categorical(logits=gap_score)
+            gap = gap_score.argmax() if greedy else dist.sample()
+            logp = logp + dist.log_prob(gap)
+            entropy = entropy + dist.entropy()
+            partial.insert(int(gap.item()) + 1, node)
+
+        return partial, logp, entropy
+
+
 def load_constraint_field_state_dict(
     model: ConstraintFieldNet, state_dict: dict
 ) -> bool:
-    """Load current or pre-value-head checkpoints without hiding other drift.
+    """Strictly load a typed-resource (v2) checkpoint.
 
-    Returns ``True`` when a legacy checkpoint was upgraded by retaining the
-    value head's zero initialization.
+    V1 checkpoints contain the identity ``resource_types`` buffer and fixed
+    seven-wide coupler heads. Silently upgrading those weights would undermine
+    the descriptor-only claim, so the boundary is intentionally clean.
     """
-    incompatible = model.load_state_dict(state_dict, strict=False)
-    allowed_missing = {
-        "value_head.weight",
-        "value_head.bias",
-        "objective_multiplier_head.weight",
-        "objective_multiplier_head.bias",
-        "objective_coupler_head.weight",
-        "objective_coupler_head.bias",
-        "objective_coupler_bias_head.weight",
-        "objective_coupler_bias_head.bias",
-    }
-    missing = set(incompatible.missing_keys)
-    unexpected = set(incompatible.unexpected_keys)
-    if unexpected or missing - allowed_missing:
+    if "resource_types" in state_dict:
         raise RuntimeError(
-            "incompatible ConstraintFieldNet checkpoint: "
-            f"missing={sorted(missing)} unexpected={sorted(unexpected)}"
+            "incompatible ConstraintFieldNet v1 checkpoint: typed-resource "
+            "v2 requires retraining"
         )
-    return bool(missing)
+    try:
+        model.load_state_dict(state_dict, strict=True)
+    except RuntimeError as error:
+        raise RuntimeError(
+            "incompatible ConstraintFieldNet v2 checkpoint"
+        ) from error
+    return False

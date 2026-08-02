@@ -234,14 +234,12 @@ SequenceSummary query_sequence(const Problem &problem,
 }
 
 enum Metric : int {
-  METRIC_GEOMETRIC,
   METRIC_TIME_WINDOW,
   METRIC_CAPACITY,
   METRIC_BACKHAUL,
   METRIC_PICKUP_DELIVERY,
   METRIC_ROUTE_LIMIT,
   METRIC_PRIZE,
-  METRIC_COMBINED,
 };
 
 uint64_t splitmix64(uint64_t value) {
@@ -357,6 +355,39 @@ void Problem::validate() const {
       }
     }
   }
+  for (const ResourceSpec &resource : resources) {
+    if (resource.name.empty())
+      throw std::invalid_argument("resource name must not be empty");
+    if (resource.state_dim != 1) {
+      throw std::invalid_argument(
+          "resource algebra v1 currently requires state_dim == 1");
+    }
+    if (!std::isfinite(resource.initial) || !std::isfinite(resource.scale) ||
+        resource.scale <= 0.0f || std::isnan(resource.lower) ||
+        std::isnan(resource.upper) || resource.lower > resource.upper ||
+        !std::isfinite(resource.edge_coefficient) ||
+        !std::isfinite(resource.node_coefficient) ||
+        !std::isfinite(resource.reset_value)) {
+      throw std::invalid_argument("invalid resource algebra scalar");
+    }
+    if (!resource.edge_values.empty() && resource.edge_values.size() != n * n)
+      throw std::invalid_argument(
+          "resource edge values must have shape (node_count, node_count)");
+    if (!resource.node_values.empty() && resource.node_values.size() != n)
+      throw std::invalid_argument(
+          "resource node values must have shape (node_count,)");
+    if (!resource.reset_nodes.empty() && resource.reset_nodes.size() != n)
+      throw std::invalid_argument(
+          "resource reset flags must have shape (node_count,)");
+    for (float value : resource.edge_values) {
+      if (!std::isfinite(value))
+        throw std::invalid_argument("resource edge values must be finite");
+    }
+    for (float value : resource.node_values) {
+      if (!std::isfinite(value))
+        throw std::invalid_argument("resource node values must be finite");
+    }
+  }
   for (int32_t node = 0; node < node_count; ++node) {
     if (!std::isfinite(demand[node]) || !finite_nonnegative(prize[node]) ||
         !finite_nonnegative(penalty[node]) ||
@@ -370,15 +401,6 @@ void Problem::validate() const {
 void CandidateConfig::validate() const {
   if (max_candidates <= 0 || max_candidates > 64) {
     throw std::invalid_argument("max_candidates must be in [1, 64]");
-  }
-  const int32_t quotas[] = {
-      geometric_quota,       time_window_quota, capacity_quota, backhaul_quota,
-      pickup_delivery_quota, route_limit_quota, prize_quota,
-  };
-  for (int32_t quota : quotas) {
-    if (quota < 0) {
-      throw std::invalid_argument("candidate quotas must be non-negative");
-    }
   }
   const float weights[] = {
       gamma_unit,     gamma_wait,       gamma_time_warp, gamma_load_fit,
@@ -539,7 +561,142 @@ RoutingDecoder::RoutingDecoder(Problem problem, CandidateConfig candidate_config
       }
     }
   }
+  build_resource_registry();
+  build_resource_descriptors();
   build_candidate_graph({});
+}
+
+void RoutingDecoder::build_resource_registry() {
+  resources_.clear();
+  legacy_resource_index_.fill(-1);
+  const auto add_legacy = [&](FieldChannel channel, ResourceOperator op,
+                              const char *name, bool active) {
+    ResourceSpec spec;
+    spec.name = name;
+    spec.active = active;
+    spec.op = op;
+    spec.scale = resource_scale(static_cast<int32_t>(channel));
+    const int32_t index = static_cast<int32_t>(resources_.size());
+    resources_.push_back(std::move(spec));
+    legacy_resource_index_[static_cast<int32_t>(channel)] = index;
+  };
+  add_legacy(FieldChannel::CAPACITY, ResourceOperator::LEGACY_CAPACITY,
+             "capacity", problem_.has(CAPACITY));
+  add_legacy(FieldChannel::TIME_WINDOW, ResourceOperator::LEGACY_TIME_WINDOW,
+             "time_window", problem_.has(TIME_WINDOWS));
+  add_legacy(FieldChannel::ROUTE_LIMIT, ResourceOperator::LEGACY_ROUTE_LIMIT,
+             "route_limit", problem_.has(ROUTE_LIMIT));
+  add_legacy(FieldChannel::TOUR_LIMIT, ResourceOperator::LEGACY_TOUR_LIMIT,
+             "tour_limit", problem_.has(TOUR_LIMIT));
+  add_legacy(FieldChannel::BACKHAUL_ORDER,
+             ResourceOperator::LEGACY_BACKHAUL_ORDER, "backhaul_order",
+             problem_.has(BACKHAUL_ORDER));
+  add_legacy(FieldChannel::PICKUP_DELIVERY,
+             ResourceOperator::LEGACY_PICKUP_DELIVERY, "pickup_delivery",
+             problem_.has(PICKUP_DELIVERY));
+  add_legacy(FieldChannel::PRIZE_QUOTA, ResourceOperator::LEGACY_PRIZE_QUOTA,
+             "prize_quota", problem_.has(PRIZE_QUOTA));
+
+  for (const ResourceSpec &spec : problem_.resources) {
+    if (std::any_of(resources_.begin(), resources_.end(),
+                    [&](const ResourceSpec &existing) {
+                      return existing.name == spec.name;
+                    })) {
+      throw std::invalid_argument("duplicate resource name: " + spec.name);
+    }
+    resources_.push_back(spec);
+  }
+}
+
+int32_t RoutingDecoder::legacy_resource_index(FieldChannel channel) const {
+  return legacy_resource_index_[static_cast<int32_t>(channel)];
+}
+
+const ResourceSpec &RoutingDecoder::resource(int32_t index) const {
+  if (index < 0 || index >= resource_count())
+    throw std::out_of_range("resource index is out of range");
+  return resources_[index];
+}
+
+void RoutingDecoder::build_resource_descriptors() {
+  resource_descriptors_.assign(
+      static_cast<size_t>(resource_count()) * RESOURCE_DESCRIPTOR_DIM, 0.0f);
+  const auto squash = [](double value) {
+    value = std::max(value, 0.0);
+    return static_cast<float>(value / (1.0 + value));
+  };
+  for (int32_t index = 0; index < resource_count(); ++index) {
+    const ResourceSpec &spec = resources_[index];
+    float *descriptor = resource_descriptors_.data() +
+                        static_cast<size_t>(index) * RESOURCE_DESCRIPTOR_DIM;
+    switch (spec.op) {
+    case ResourceOperator::AFFINE_ACCUMULATOR:
+    case ResourceOperator::LEGACY_CAPACITY:
+    case ResourceOperator::LEGACY_ROUTE_LIMIT:
+    case ResourceOperator::LEGACY_TOUR_LIMIT:
+    case ResourceOperator::LEGACY_PRIZE_QUOTA:
+      descriptor[0] = 1.0f;
+      descriptor[20] = 1.0f;
+      break;
+    case ResourceOperator::LEGACY_TIME_WINDOW:
+      descriptor[1] = 1.0f;
+      descriptor[21] = 1.0f;
+      break;
+    case ResourceOperator::LEGACY_BACKHAUL_ORDER:
+      descriptor[2] = 1.0f;
+      descriptor[22] = 1.0f;
+      break;
+    case ResourceOperator::LEGACY_PICKUP_DELIVERY:
+      descriptor[3] = 1.0f;
+      descriptor[22] = 1.0f;
+      break;
+    }
+    const bool has_lower = std::isfinite(spec.lower) ||
+                           spec.op == ResourceOperator::LEGACY_PRIZE_QUOTA;
+    const bool has_upper = std::isfinite(spec.upper) ||
+                           spec.op == ResourceOperator::LEGACY_CAPACITY ||
+                           spec.op == ResourceOperator::LEGACY_TIME_WINDOW ||
+                           spec.op == ResourceOperator::LEGACY_ROUTE_LIMIT ||
+                           spec.op == ResourceOperator::LEGACY_TOUR_LIMIT;
+    descriptor[has_lower && has_upper ? 7 : has_lower ? 5 : has_upper ? 6 : 4] =
+        1.0f;
+    descriptor[8 + static_cast<int32_t>(spec.bound_check)] = 1.0f;
+    descriptor[11 + static_cast<int32_t>(spec.direction)] = 1.0f;
+    descriptor[14 + static_cast<int32_t>(spec.scope)] = 1.0f;
+    const bool event_reset = !spec.reset_nodes.empty();
+    descriptor[event_reset ? 19 : spec.reset_at_depot ? 18 : 17] = 1.0f;
+    descriptor[23] = !spec.node_values.empty() ? 1.0f : 0.0f;
+    descriptor[24] =
+        (spec.edge_uses_distance || !spec.edge_values.empty()) ? 1.0f : 0.0f;
+    descriptor[25] = spec.op == ResourceOperator::LEGACY_PICKUP_DELIVERY ? 1.0f
+                                                                         : 0.0f;
+    descriptor[26] = spec.edge_coefficient >= 0.0f &&
+                             spec.node_coefficient >= 0.0f
+                         ? 1.0f
+                         : 0.0f;
+    descriptor[27] = spec.edge_coefficient <= 0.0f &&
+                             spec.node_coefficient <= 0.0f
+                         ? 1.0f
+                         : 0.0f;
+    descriptor[28] = squash(spec.state_dim);
+    descriptor[29] = squash(std::log1p(
+        spec.scale / std::max<double>(distance_scale_, EPS)));
+    double magnitude = 0.0;
+    if (spec.edge_uses_distance)
+      magnitude += std::abs(spec.edge_coefficient) * distance_scale_;
+    for (float value : spec.edge_values)
+      magnitude += std::abs(value * spec.edge_coefficient);
+    for (float value : spec.node_values)
+      magnitude += std::abs(value * spec.node_coefficient);
+    const size_t count = spec.edge_values.size() + spec.node_values.size() +
+                         (spec.edge_uses_distance ? 1 : 0);
+    descriptor[30] = squash(count ? magnitude / count / spec.scale : 0.0);
+    const double events =
+        std::count(spec.reset_nodes.begin(), spec.reset_nodes.end(), uint8_t{1});
+    descriptor[31] = problem_.node_count > 0
+                         ? static_cast<float>(events / problem_.node_count)
+                         : 0.0f;
+  }
 }
 
 void RoutingDecoder::seed(uint64_t value) {
@@ -547,8 +704,8 @@ void RoutingDecoder::seed(uint64_t value) {
   generation_ = 0;
 }
 
-std::vector<int32_t> RoutingDecoder::rank_by_metric(int32_t from, int metric,
-                                                int32_t limit) const {
+std::vector<int32_t> RoutingDecoder::rank_by_distance(int32_t from,
+                                                      int32_t limit) const {
   std::vector<int32_t> nodes;
   nodes.reserve(problem_.node_count - 1);
   for (int32_t to = 0; to < problem_.node_count; ++to) {
@@ -557,8 +714,8 @@ std::vector<int32_t> RoutingDecoder::rank_by_metric(int32_t from, int metric,
     }
   }
   const auto compare = [&](int32_t lhs, int32_t rhs) {
-    const float lhs_score = resource_proximity(from, lhs, metric);
-    const float rhs_score = resource_proximity(from, rhs, metric);
+    const float lhs_score = problem_.dist(from, lhs);
+    const float rhs_score = problem_.dist(from, rhs);
     return lhs_score == rhs_score ? lhs < rhs : lhs_score < rhs_score;
   };
   limit = std::min<int32_t>(limit, nodes.size());
@@ -577,8 +734,6 @@ float RoutingDecoder::resource_proximity(int32_t from, int32_t to,
   const float travel = problem_.dist(from, to);
   const float base = config.gamma_unit * travel;
   switch (metric) {
-  case METRIC_GEOMETRIC:
-    return travel;
   case METRIC_TIME_WINDOW: {
     // Vidal-lineage directed proximity: latest departure from i determines
     // unavoidable waiting, while earliest departure determines time warp.
@@ -631,8 +786,6 @@ float RoutingDecoder::resource_proximity(int32_t from, int32_t to,
     const float value = problem_.prize[to] + problem_.penalty[to];
     return base + config.gamma_prize / std::max(value, EPS);
   }
-  case METRIC_COMBINED:
-    return classical_proximity(from, to);
   default:
     return base;
   }
@@ -682,13 +835,16 @@ bool RoutingDecoder::field_channel_active(int32_t channel) const {
 float RoutingDecoder::objective_edge_cost(int32_t from, int32_t to) const {
   const float travel = problem_.dist(from, to);
   if (to < problem_.depot_count)
-    // Rank the depot by real travel distance in every mode. For open routes
-    // the final return leg is genuinely free, but that only holds for the ACTUAL
-    // objective (computed independently in evaluate/finish). This function is a
-    // ranking/energy signal only; returning 0 here makes the depot the cheapest
-    // candidate at every construction step, so greedy closes the route after
-    // each customer and fragments open problems into one route per customer.
-    return travel;
+    // The return-to-depot leg is charged its real travel for closed routes and
+    // is genuinely free for open routes -- exactly matching the true objective
+    // accumulated in transition()/finish(). Charging it for open routes used to
+    // hide a phantom cost in the ranking energy that a non-negative field could
+    // not discount, making the learned field net-harmful on open variants. The
+    // fragmentation this previously guarded against (free returns making the
+    // depot the cheapest move at every step) is now handled structurally in
+    // select_next(), which drops depot options while a customer can still
+    // legally extend the open route.
+    return problem_.open_route ? 0.0f : travel;
   switch (problem_.objective) {
   case Objective::MIN_DISTANCE:
     return travel;
@@ -724,10 +880,33 @@ float RoutingDecoder::resource_scale(int32_t channel) const {
 }
 
 std::vector<float> RoutingDecoder::resource_scales() const {
-  std::vector<float> scales(FIELD_CHANNEL_COUNT);
-  for (int32_t channel = 0; channel < FIELD_CHANNEL_COUNT; ++channel)
-    scales[channel] = resource_scale(channel);
+  std::vector<float> scales(resource_count());
+  for (int32_t index = 0; index < resource_count(); ++index)
+    scales[index] = runtime_resource_scale(index);
   return scales;
+}
+
+float RoutingDecoder::runtime_resource_scale(int32_t resource_index) const {
+  const ResourceSpec &spec = resource(resource_index);
+  switch (spec.op) {
+  case ResourceOperator::LEGACY_CAPACITY:
+    return resource_scale(static_cast<int32_t>(FieldChannel::CAPACITY));
+  case ResourceOperator::LEGACY_TIME_WINDOW:
+    return resource_scale(static_cast<int32_t>(FieldChannel::TIME_WINDOW));
+  case ResourceOperator::LEGACY_ROUTE_LIMIT:
+    return resource_scale(static_cast<int32_t>(FieldChannel::ROUTE_LIMIT));
+  case ResourceOperator::LEGACY_TOUR_LIMIT:
+    return resource_scale(static_cast<int32_t>(FieldChannel::TOUR_LIMIT));
+  case ResourceOperator::LEGACY_BACKHAUL_ORDER:
+    return resource_scale(static_cast<int32_t>(FieldChannel::BACKHAUL_ORDER));
+  case ResourceOperator::LEGACY_PICKUP_DELIVERY:
+    return resource_scale(static_cast<int32_t>(FieldChannel::PICKUP_DELIVERY));
+  case ResourceOperator::LEGACY_PRIZE_QUOTA:
+    return resource_scale(static_cast<int32_t>(FieldChannel::PRIZE_QUOTA));
+  case ResourceOperator::AFFINE_ACCUMULATOR:
+    return std::max(spec.scale, EPS);
+  }
+  return 1.0f;
 }
 
 float RoutingDecoder::objective_scale() const {
@@ -804,6 +983,69 @@ float RoutingDecoder::analytic_resource_pressure(int32_t from, int32_t to,
   return 0.0f;
 }
 
+float RoutingDecoder::runtime_resource_pressure(int32_t from, int32_t to,
+                                                int32_t resource_index) const {
+  const ResourceSpec &spec = resource(resource_index);
+  if (!spec.active)
+    return 0.0f;
+  switch (spec.op) {
+  case ResourceOperator::LEGACY_CAPACITY:
+    return analytic_resource_pressure(
+        from, to, static_cast<int32_t>(FieldChannel::CAPACITY));
+  case ResourceOperator::LEGACY_TIME_WINDOW:
+    return analytic_resource_pressure(
+        from, to, static_cast<int32_t>(FieldChannel::TIME_WINDOW));
+  case ResourceOperator::LEGACY_ROUTE_LIMIT:
+    return analytic_resource_pressure(
+        from, to, static_cast<int32_t>(FieldChannel::ROUTE_LIMIT));
+  case ResourceOperator::LEGACY_TOUR_LIMIT:
+    return analytic_resource_pressure(
+        from, to, static_cast<int32_t>(FieldChannel::TOUR_LIMIT));
+  case ResourceOperator::LEGACY_BACKHAUL_ORDER:
+    return analytic_resource_pressure(
+        from, to, static_cast<int32_t>(FieldChannel::BACKHAUL_ORDER));
+  case ResourceOperator::LEGACY_PICKUP_DELIVERY:
+    return analytic_resource_pressure(
+        from, to, static_cast<int32_t>(FieldChannel::PICKUP_DELIVERY));
+  case ResourceOperator::LEGACY_PRIZE_QUOTA:
+    return analytic_resource_pressure(
+        from, to, static_cast<int32_t>(FieldChannel::PRIZE_QUOTA));
+  case ResourceOperator::AFFINE_ACCUMULATOR: {
+    double delta = 0.0;
+    if (spec.edge_uses_distance)
+      delta += spec.edge_coefficient * problem_.dist(from, to);
+    if (!spec.edge_values.empty())
+      delta += spec.edge_coefficient *
+               spec.edge_values[static_cast<size_t>(from) *
+                                    problem_.node_count +
+                                to];
+    if (!spec.node_values.empty())
+      delta += spec.node_coefficient * spec.node_values[to];
+    // Pressure is the bound-worsening magnitude in physical units. Lower-bound
+    // resources (battery remaining) worsen on negative extension; upper-bound
+    // accumulators worsen on positive extension.
+    if (std::isfinite(spec.lower) && !std::isfinite(spec.upper))
+      return static_cast<float>(std::max(-delta, 0.0));
+    return static_cast<float>(std::max(delta, 0.0));
+  }
+  }
+  return 0.0f;
+}
+
+float RoutingDecoder::candidate_resource_relevance(
+    int32_t from, int32_t to, int32_t resource_index) const {
+  const ResourceSpec &spec = resource(resource_index);
+  if (!spec.active)
+    return 0.0f;
+  float relevance = runtime_resource_pressure(from, to, resource_index) /
+                    std::max(runtime_resource_scale(resource_index), EPS);
+  const bool resets = (to < problem_.depot_count && spec.reset_at_depot) ||
+                      (!spec.reset_nodes.empty() && spec.reset_nodes[to]);
+  if (resets)
+    relevance = std::max(relevance, 1.0f);
+  return relevance;
+}
+
 void RoutingDecoder::validate_guidance(const float *edge_field,
                                        const float *edge_additive,
                                        const float *multipliers,
@@ -826,7 +1068,7 @@ void RoutingDecoder::validate_guidance(const float *edge_field,
         "edge_field is required when classical_behavior is false");
   }
   const size_t value_count =
-      static_cast<size_t>(edge_count()) * FIELD_CHANNEL_COUNT;
+      static_cast<size_t>(edge_count()) * resource_count();
   for (size_t index = 0; index < value_count; ++index) {
     if (!std::isfinite(edge_field[index]) || edge_field[index] < 0.0f) {
       throw std::invalid_argument(
@@ -842,7 +1084,7 @@ void RoutingDecoder::validate_guidance(const float *edge_field,
     }
   }
   if (multipliers != nullptr) {
-    for (int32_t channel = 0; channel < MULTIPLIER_COUNT; ++channel) {
+    for (int32_t channel = 0; channel < multiplier_count(); ++channel) {
       if (!std::isfinite(multipliers[channel]) || multipliers[channel] < 0.0f) {
         throw std::invalid_argument(
             "field multipliers must be finite and non-negative");
@@ -851,7 +1093,7 @@ void RoutingDecoder::validate_guidance(const float *edge_field,
   }
   if (coupler_weights != nullptr) {
     const size_t count =
-        static_cast<size_t>(MULTIPLIER_COUNT) * LIVE_STATE_FEATURE_COUNT;
+        static_cast<size_t>(multiplier_count()) * live_state_feature_count();
     for (size_t index = 0; index < count; ++index) {
       if (!std::isfinite(coupler_weights[index])) {
         throw std::invalid_argument("coupler weights must be finite");
@@ -859,7 +1101,7 @@ void RoutingDecoder::validate_guidance(const float *edge_field,
     }
   }
   if (coupler_bias != nullptr) {
-    for (int32_t channel = 0; channel < MULTIPLIER_COUNT; ++channel) {
+    for (int32_t channel = 0; channel < multiplier_count(); ++channel) {
       if (!std::isfinite(coupler_bias[channel])) {
         throw std::invalid_argument("coupler bias must be finite");
       }
@@ -880,8 +1122,7 @@ void RoutingDecoder::validate_guidance(const float *edge_field,
   }
 }
 
-std::array<float, LIVE_STATE_FEATURE_COUNT>
-RoutingDecoder::live_state_features(const State &state) const {
+std::vector<float> RoutingDecoder::live_state_features(const State &state) const {
   const auto unit = [](double value) {
     return static_cast<float>(std::clamp(value, 0.0, 1.0));
   };
@@ -893,38 +1134,68 @@ RoutingDecoder::live_state_features(const State &state) const {
       std::isfinite(problem_.tour_limit)
           ? std::max<double>(problem_.tour_limit, EPS)
           : time_scale_;
-  std::array<float, LIVE_STATE_FEATURE_COUNT> result{};
-  result[static_cast<int32_t>(FieldChannel::CAPACITY)] =
-      unit(1.0 - state.load / std::max(problem_.capacity, EPS));
-  result[static_cast<int32_t>(FieldChannel::TIME_WINDOW)] =
-      unit(state.current_time / time_scale_);
-  result[static_cast<int32_t>(FieldChannel::ROUTE_LIMIT)] =
-      unit(state.route_distance / route_scale);
-  result[static_cast<int32_t>(FieldChannel::TOUR_LIMIT)] =
-      unit(state.route_distance / tour_scale);
-  result[static_cast<int32_t>(FieldChannel::BACKHAUL_ORDER)] =
-      state.route_has_backhaul ? 1.0f : 0.0f;
-  result[static_cast<int32_t>(FieldChannel::PICKUP_DELIVERY)] =
-      unit(static_cast<double>(state.open_pickups) / std::max(pair_count_, 1));
-  result[static_cast<int32_t>(FieldChannel::PRIZE_QUOTA)] =
-      unit(1.0 - state.collected_prize / std::max(problem_.prize_quota, EPS));
-  for (int32_t channel = 0; channel < FIELD_CHANNEL_COUNT; ++channel) {
-    if (!field_channel_active(channel))
-      result[channel] = 0.0f;
+  std::vector<float> result(resource_count(), 0.0f);
+  for (int32_t index = 0; index < resource_count(); ++index) {
+    if (!resource(index).active)
+      continue;
+    switch (resource(index).op) {
+    case ResourceOperator::LEGACY_CAPACITY:
+      result[index] = unit(1.0 - state.load / std::max(problem_.capacity, EPS));
+      break;
+    case ResourceOperator::LEGACY_TIME_WINDOW:
+      result[index] = unit(state.current_time / time_scale_);
+      break;
+    case ResourceOperator::LEGACY_ROUTE_LIMIT:
+      result[index] = unit(state.route_distance / route_scale);
+      break;
+    case ResourceOperator::LEGACY_TOUR_LIMIT:
+      result[index] = unit(state.route_distance / tour_scale);
+      break;
+    case ResourceOperator::LEGACY_BACKHAUL_ORDER:
+      result[index] = state.route_has_backhaul ? 1.0f : 0.0f;
+      break;
+    case ResourceOperator::LEGACY_PICKUP_DELIVERY:
+      result[index] = unit(static_cast<double>(state.open_pickups) /
+                           std::max(pair_count_, 1));
+      break;
+    case ResourceOperator::LEGACY_PRIZE_QUOTA:
+      result[index] = unit(1.0 - state.collected_prize /
+                                     std::max(problem_.prize_quota, EPS));
+      break;
+    case ResourceOperator::AFFINE_ACCUMULATOR:
+      result[index] = resource_state_feature(state, index);
+      break;
+    }
   }
   return result;
 }
 
-std::array<float, LIVE_STATE_FEATURE_COUNT>
-RoutingDecoder::incumbent_state_features(int32_t current) const {
-  std::array<float, LIVE_STATE_FEATURE_COUNT> result{};
+float RoutingDecoder::resource_state_feature(const State &state,
+                                             int32_t resource_index) const {
+  const ResourceSpec &spec = resource(resource_index);
+  const float value = state.algebra_state[resource_index];
+  if (std::isfinite(spec.lower) && std::isfinite(spec.upper))
+    return std::clamp((value - spec.lower) /
+                          std::max(spec.upper - spec.lower, EPS),
+                      0.0f, 1.0f);
+  if (std::isfinite(spec.lower))
+    return std::clamp(1.0f - (value - spec.lower) / runtime_resource_scale(resource_index),
+                      0.0f, 1.0f);
+  if (std::isfinite(spec.upper))
+    return std::clamp(value / runtime_resource_scale(resource_index), 0.0f, 1.0f);
+  return std::clamp(std::abs(value) / runtime_resource_scale(resource_index),
+                    0.0f, 1.0f);
+}
+
+std::vector<float> RoutingDecoder::incumbent_state_features(int32_t current) const {
+  std::vector<float> result(resource_count(), 0.0f);
   if (current < 0 || current >= problem_.node_count ||
       incumbent_live_state_.size() !=
-          static_cast<size_t>(problem_.node_count) * LIVE_STATE_FEATURE_COUNT)
+          static_cast<size_t>(problem_.node_count) * resource_count())
     return result;
   std::copy_n(incumbent_live_state_.data() +
-                  static_cast<size_t>(current) * LIVE_STATE_FEATURE_COUNT,
-              LIVE_STATE_FEATURE_COUNT, result.begin());
+                  static_cast<size_t>(current) * resource_count(),
+              resource_count(), result.begin());
   return result;
 }
 
@@ -957,8 +1228,8 @@ double RoutingDecoder::coupled_multiplier(
   if (coupler_weights != nullptr) {
     const float *weights = coupler_weights +
                            static_cast<size_t>(channel) *
-                               LIVE_STATE_FEATURE_COUNT;
-    for (int32_t feature = 0; feature < LIVE_STATE_FEATURE_COUNT; ++feature)
+                               live_state_feature_count();
+    for (int32_t feature = 0; feature < live_state_feature_count(); ++feature)
       logit += weights[feature] * live_state[feature];
   }
   const double modulation =
@@ -983,7 +1254,7 @@ void RoutingDecoder::record_decision(RolloutTrace *trace, int32_t current,
   trace->stochastic.push_back(stochastic ? 1 : 0);
   trace->log_probabilities.push_back(log_probability);
   trace->live_state.insert(trace->live_state.end(), live_state,
-                           live_state + LIVE_STATE_FEATURE_COUNT);
+                           live_state + live_state_feature_count());
 }
 
 void RoutingDecoder::record_feasibility_labels(RolloutTrace *trace,
@@ -1010,28 +1281,36 @@ double RoutingDecoder::field_score(int32_t from, int32_t to, int32_t edge,
     return 0.0;
   }
   double result = 0.0;
-  for (int32_t channel = 0; channel < FIELD_CHANNEL_COUNT; ++channel) {
-    if (!field_channel_active(channel))
+  for (int32_t channel = 0; channel < resource_count(); ++channel) {
+    if (!resource(channel).active)
       continue;
-    // edge_field is the learned per-edge resource field (already scaled to the
-    // resource's units by the model). Analytic pressure is no longer a
-    // multiplicative gate -- it is exposed to the GNN as an input feature -- so
-    // it only serves as the fallback field on off-graph reachability edges.
-    const double field = edge >= 0 && edge_field != nullptr
-                             ? edge_field[static_cast<size_t>(edge) *
-                                              FIELD_CHANNEL_COUNT +
-                                          channel]
-                             : analytic_resource_pressure(from, to, channel);
-    const double additive =
-        edge >= 0 && edge_additive != nullptr
-            ? edge_additive[static_cast<size_t>(edge) * FIELD_CHANNEL_COUNT +
-                            channel]
-            : 0.0;
     const double multiplier = coupled_multiplier(
         channel, multipliers, coupler_weights, coupler_bias, live_state);
-    result += multiplier * std::max(field + additive, 0.0);
+    result += multiplier * resource_field_value(
+                               from, to, edge, channel, edge_field,
+                               edge_additive);
   }
   return result;
+}
+
+double RoutingDecoder::resource_field_value(
+    int32_t from, int32_t to, int32_t edge, int32_t channel,
+    const float *edge_field, const float *edge_additive) const {
+  // edge_field is the learned per-edge resource field (already scaled to the
+  // resource's units by the model). Analytic pressure is no longer a
+  // multiplicative gate -- it is exposed to the GNN as an input feature -- so
+  // it only serves as the fallback field on off-graph reachability edges.
+  const double field = edge >= 0 && edge_field != nullptr
+                           ? edge_field[static_cast<size_t>(edge) *
+                                            resource_count() +
+                                        channel]
+                           : runtime_resource_pressure(from, to, channel);
+  const double additive =
+      edge >= 0 && edge_additive != nullptr
+          ? edge_additive[static_cast<size_t>(edge) * resource_count() +
+                          channel]
+          : 0.0;
+  return std::max(field + additive, 0.0);
 }
 
 double RoutingDecoder::edge_energy(int32_t from, int32_t to, int32_t edge,
@@ -1048,7 +1327,7 @@ double RoutingDecoder::edge_energy(int32_t from, int32_t to, int32_t edge,
   // (multiplier slot OBJECTIVE_MULTIPLIER) rather than a hard unit coefficient.
   // With no guidance the coupler returns 1.0, recovering the plain objective.
   const double objective_weight = coupled_multiplier(
-      OBJECTIVE_MULTIPLIER, multipliers, coupler_weights, coupler_bias,
+      objective_multiplier(), multipliers, coupler_weights, coupler_bias,
       live_state);
   return objective_weight * objective_edge_cost(from, to) +
          field_score(from, to, edge, edge_field, edge_additive, multipliers,
@@ -1075,28 +1354,14 @@ void RoutingDecoder::build_candidate_graph(const std::vector<int32_t> &incumbent
   if (edge_risk != nullptr)
     old_risk.swap(*edge_risk);
 
-  std::vector<std::vector<int32_t>> mandatory(n);
+  // The graph topology is deliberately geometric only. Depot connectivity is
+  // the sole overlay because a depot may be required to close/reset a route
+  // even when it is not among a customer's nearest spatial neighbours.
+  std::vector<std::vector<int32_t>> depot_edges(n);
   for (int32_t customer = problem_.depot_count; customer < n; ++customer) {
     for (int32_t depot = 0; depot < problem_.depot_count; ++depot) {
-      mandatory[customer].push_back(depot);
-      mandatory[depot].push_back(customer);
-    }
-  }
-  for (size_t index = 1; index < incumbent.size(); ++index) {
-    const int32_t from = incumbent[index - 1];
-    const int32_t to = incumbent[index];
-    if (from >= 0 && from < n && to >= 0 && to < n && from != to) {
-      mandatory[from].push_back(to);
-    }
-  }
-  if (!incumbent.empty() && problem_.has(VISIT_ALL) && !problem_.multi_route &&
-      !problem_.open_route) {
-    mandatory[incumbent.back()].push_back(incumbent.front());
-  }
-  for (int32_t pickup = problem_.depot_count; pickup < n; ++pickup) {
-    const int32_t delivery = problem_.delivery_of_pickup[pickup];
-    if (delivery >= 0) {
-      mandatory[pickup].push_back(delivery);
+      depot_edges[customer].push_back(depot);
+      depot_edges[depot].push_back(customer);
     }
   }
 
@@ -1105,57 +1370,33 @@ void RoutingDecoder::build_candidate_graph(const std::vector<int32_t> &incumbent
     kd_tree = std::make_unique<KDTree2D>(problem_.coordinates);
   }
 
-  // Exact all-node resource ranking is quadratic. Keep it for small parity
-  // tests, but at scale score a bounded, constraint-aware support assembled
-  // from spatial and one-dimensional resource indexes.
-  const bool bounded_pool = n > 512;
-  const int32_t pool_target =
-      std::min(n - 1, std::max(8 * k, 256));
-  std::vector<int32_t> time_order;
-  std::vector<int32_t> load_order;
-  std::vector<int32_t> prize_order;
-  std::vector<int32_t> backhaul_nodes;
-  std::unique_ptr<KDTree2D> backhaul_tree;
-  if (bounded_pool) {
-    time_order.resize(n);
-    load_order.resize(n);
-    prize_order.resize(n);
-    for (int32_t node = 0; node < n; ++node) {
-      time_order[node] = node;
-      load_order[node] = node;
-      prize_order[node] = node;
-      if (node >= problem_.depot_count &&
-          problem_.demand[node] < -FEASIBILITY_EPS) {
-        backhaul_nodes.push_back(node);
+  // Effective per-resource candidate allocation, constant across source nodes.
+  // The schema-derived candidate_resource_relevance is the deterministic,
+  // variant-agnostic admission rule: when the learned quota policy has installed
+  // fractions we honor them, otherwise we synthesize a uniform equal-share over
+  // active resources (plus an implicit geometric slot, mirroring the learned
+  // head's softmax structure). This keeps a newly declared resource covered with
+  // no per-variant tuning. GEOMETRIC mode drops resource channels entirely.
+  std::vector<float> effective_quotas;
+  if (candidate_config_.candidate_mode == CandidateMode::SCHEMA) {
+    if (!candidate_resource_quotas_.empty()) {
+      effective_quotas = candidate_resource_quotas_;
+    } else {
+      int32_t active = 0;
+      for (const ResourceSpec &spec : resources_)
+        active += spec.active ? 1 : 0;
+      if (active > 0) {
+        effective_quotas.assign(resource_count(), 0.0f);
+        const float share = 1.0f / static_cast<float>(active + 1);
+        for (int32_t index = 0; index < resource_count(); ++index)
+          if (resources_[index].active)
+            effective_quotas[index] = share;
       }
-    }
-    std::sort(time_order.begin(), time_order.end(), [&](int32_t lhs,
-                                                        int32_t rhs) {
-      const float lhs_value = problem_.tw_start[lhs];
-      const float rhs_value = problem_.tw_start[rhs];
-      return lhs_value == rhs_value ? lhs < rhs : lhs_value < rhs_value;
-    });
-    std::sort(load_order.begin(), load_order.end(), [&](int32_t lhs,
-                                                        int32_t rhs) {
-      const float lhs_value = std::abs(problem_.demand[lhs]);
-      const float rhs_value = std::abs(problem_.demand[rhs]);
-      return lhs_value == rhs_value ? lhs < rhs : lhs_value < rhs_value;
-    });
-    std::sort(prize_order.begin(), prize_order.end(), [&](int32_t lhs,
-                                                          int32_t rhs) {
-      const float lhs_value = problem_.prize[lhs] + problem_.penalty[lhs];
-      const float rhs_value = problem_.prize[rhs] + problem_.penalty[rhs];
-      return lhs_value == rhs_value ? lhs < rhs : lhs_value > rhs_value;
-    });
-    if (kd_tree && !backhaul_nodes.empty()) {
-      backhaul_tree =
-          std::make_unique<KDTree2D>(problem_.coordinates, backhaul_nodes);
     }
   }
 
   std::vector<std::vector<int32_t>> rows(n);
   std::vector<int32_t> included_at(n, -1);
-  std::vector<int32_t> pooled_at(n, -1);
   for (int32_t from = 0; from < n; ++from) {
     const auto add = [&](int32_t to) {
       if (to != from && to >= 0 && to < n && included_at[to] != from) {
@@ -1165,186 +1406,68 @@ void RoutingDecoder::build_candidate_graph(const std::vector<int32_t> &incumbent
       }
       return false;
     };
-    for (int32_t to : mandatory[from]) {
+    for (int32_t to : depot_edges[from]) {
       add(to);
     }
 
-    // Depot rows contain the mandatory overlay. Their degree may exceed K,
-    // but total depot storage is O(nD), with D bounded by three in URS.
+    // A depot must be able to start/reset a route at any customer. These rows
+    // are the required depot overlay; customer rows are bounded by K plus any
+    // depots that must be retained when the depot count itself exceeds K.
     if (from < problem_.depot_count) {
       std::sort(rows[from].begin(), rows[from].end());
       continue;
     }
 
-    std::vector<int32_t> candidate_pool;
-    if (bounded_pool) {
-      candidate_pool.reserve(2 * pool_target);
-      const auto add_pool = [&](int32_t to) {
-        if (to != from && to >= 0 && to < n && pooled_at[to] != from) {
-          pooled_at[to] = from;
-          candidate_pool.push_back(to);
-        }
-      };
-      if (kd_tree) {
-        for (int32_t node : kd_tree->nearest(from, pool_target))
-          add_pool(node);
-      }
-      const int32_t resource_width = std::max(pool_target / 4, k);
-      const auto add_numeric_window =
-          [&](const std::vector<int32_t> &order, float target,
-              const auto &value) {
-            const auto middle = std::lower_bound(
-                order.begin(), order.end(), target,
-                [&](int32_t node, float wanted) {
-                  return value(node) < wanted;
-                });
-            int32_t left = static_cast<int32_t>(middle - order.begin()) - 1;
-            int32_t right = left + 1;
-            for (int32_t count = 0;
-                 count < resource_width && (left >= 0 || right < n); ++count) {
-              const bool take_left =
-                  right >= n ||
-                  (left >= 0 &&
-                   std::abs(value(order[left]) - target) <=
-                       std::abs(value(order[right]) - target));
-              add_pool(take_left ? order[left--] : order[right++]);
-            }
-          };
-      if (problem_.has(TIME_WINDOWS)) {
-        const float target = problem_.tw_start[from] +
-                             problem_.service_time[from];
-        add_numeric_window(time_order, target, [&](int32_t node) {
-          return problem_.tw_start[node];
-        });
-      }
-      if (problem_.has(CAPACITY)) {
-        const float target = std::max(
-            problem_.capacity - std::abs(problem_.demand[from]), 0.0f);
-        add_numeric_window(load_order, target, [&](int32_t node) {
-          return std::abs(problem_.demand[node]);
-        });
-      }
-      if (problem_.has(BACKHAUL_ORDER) && backhaul_tree) {
-        for (int32_t node : backhaul_tree->nearest(from, resource_width))
-          add_pool(node);
-      }
-      if (problem_.objective != Objective::MIN_DISTANCE) {
-        for (int32_t index = 0;
-             index < std::min(resource_width,
-                              static_cast<int32_t>(prize_order.size()));
-             ++index) {
-          add_pool(prize_order[index]);
-        }
-      }
-      for (int32_t offset = 1;
-           static_cast<int32_t>(candidate_pool.size()) < pool_target &&
-           offset < n;
-           ++offset) {
-        add_pool((from + offset) % n);
-      }
-    }
-    const auto bounded_ranking = [&](int metric, int32_t limit) {
-      std::vector<std::pair<float, int32_t>> scored;
-      scored.reserve(candidate_pool.size());
-      for (int32_t node : candidate_pool)
-        scored.push_back({resource_proximity(from, node, metric), node});
-      limit = std::min(limit, static_cast<int32_t>(scored.size()));
-      const auto compare = [](const auto &lhs, const auto &rhs) {
-        return lhs.first == rhs.first ? lhs.second < rhs.second
-                                     : lhs.first < rhs.first;
-      };
-      if (limit < static_cast<int32_t>(scored.size())) {
-        std::nth_element(scored.begin(), scored.begin() + limit, scored.end(),
-                         compare);
-        scored.resize(limit);
-      }
-      std::sort(scored.begin(), scored.end(), compare);
-      std::vector<int32_t> ranking;
-      ranking.reserve(scored.size());
-      for (const auto &[score, node] : scored) {
-        (void)score;
-        ranking.push_back(node);
-      }
-      return ranking;
-    };
-    const auto metric_ranking = [&](int metric, int32_t limit) {
-      return bounded_pool ? bounded_ranking(metric, limit)
-                          : rank_by_metric(from, metric, limit);
-    };
-
-    struct Channel {
-      std::vector<int32_t> ranking;
-      int32_t quota;
-      size_t cursor = 0;
-      int32_t inserted = 0;
-    };
-    std::vector<Channel> channels;
-    if (candidate_config_.geometric_quota > 0) {
-      std::vector<int32_t> ranking =
-          kd_tree
-              ? kd_tree->nearest(
-                    from, std::min(n - 1,
-                                   candidate_config_.geometric_quota +
-                                       static_cast<int32_t>(rows[from].size())))
-              : metric_ranking(
-                    METRIC_GEOMETRIC,
-                    candidate_config_.geometric_quota +
-                        static_cast<int32_t>(rows[from].size()));
-      channels.push_back(
-          {std::move(ranking), candidate_config_.geometric_quota});
-    }
-    const auto add_channel = [&](bool active, int quota, int metric) {
-      if (active && quota > 0) {
-        channels.push_back({metric_ranking(
-                                metric, std::min(n - 1, quota + k)),
-                            quota});
-      }
-    };
-    add_channel(problem_.has(TIME_WINDOWS), candidate_config_.time_window_quota,
-                METRIC_TIME_WINDOW);
-    add_channel(problem_.has(CAPACITY), candidate_config_.capacity_quota,
-                METRIC_CAPACITY);
-    add_channel(problem_.has(BACKHAUL_ORDER), candidate_config_.backhaul_quota,
-                METRIC_BACKHAUL);
-    add_channel(problem_.has(PICKUP_DELIVERY),
-                candidate_config_.pickup_delivery_quota,
-                METRIC_PICKUP_DELIVERY);
-    add_channel(problem_.has(ROUTE_LIMIT) || problem_.has(TOUR_LIMIT),
-                candidate_config_.route_limit_quota, METRIC_ROUTE_LIMIT);
-    add_channel(problem_.objective != Objective::MIN_DISTANCE,
-                candidate_config_.prize_quota, METRIC_PRIZE);
-
-    bool progress = true;
-    while (static_cast<int32_t>(rows[from].size()) < k && progress) {
-      progress = false;
-      for (Channel &channel : channels) {
-        if (channel.inserted >= channel.quota) {
+    const int32_t target = std::max(k, static_cast<int32_t>(rows[from].size()));
+    const int32_t allocatable = target - static_cast<int32_t>(rows[from].size());
+    if (!effective_quotas.empty() && allocatable > 0) {
+      for (int32_t resource_index = 0; resource_index < resource_count();
+           ++resource_index) {
+        const int32_t quota = std::min(
+            allocatable,
+            static_cast<int32_t>(std::floor(
+                effective_quotas[resource_index] * allocatable)));
+        if (quota <= 0 || !resource(resource_index).active)
           continue;
+        std::vector<int32_t> ranked;
+        ranked.reserve(n - 1);
+        for (int32_t to = 0; to < n; ++to) {
+          if (to != from && included_at[to] != from)
+            ranked.push_back(to);
         }
-        while (channel.cursor < channel.ranking.size()) {
-          const int32_t candidate = channel.ranking[channel.cursor++];
-          if (add(candidate)) {
-            ++channel.inserted;
-            progress = true;
+        std::sort(ranked.begin(), ranked.end(), [&](int32_t lhs, int32_t rhs) {
+          const float lhs_score =
+              candidate_resource_relevance(from, lhs, resource_index);
+          const float rhs_score =
+              candidate_resource_relevance(from, rhs, resource_index);
+          if (lhs_score != rhs_score)
+            return lhs_score > rhs_score;
+          const float lhs_distance = problem_.dist(from, lhs);
+          const float rhs_distance = problem_.dist(from, rhs);
+          return lhs_distance == rhs_distance ? lhs < rhs
+                                              : lhs_distance < rhs_distance;
+        });
+        int32_t admitted = 0;
+        for (int32_t to : ranked) {
+          if (candidate_resource_relevance(from, to, resource_index) <= 0.0f)
             break;
-          }
+          admitted += add(to) ? 1 : 0;
+          if (admitted >= quota || static_cast<int32_t>(rows[from].size()) >= target)
+            break;
         }
-        if (static_cast<int32_t>(rows[from].size()) >= k) {
+        if (static_cast<int32_t>(rows[from].size()) >= target)
           break;
-        }
       }
     }
-    if (static_cast<int32_t>(rows[from].size()) < k) {
-      for (int32_t to : metric_ranking(
-               METRIC_COMBINED, bounded_pool ? pool_target : n - 1)) {
-        add(to);
-        if (static_cast<int32_t>(rows[from].size()) >= k) {
-          break;
-        }
-      }
-    }
-    if (static_cast<int32_t>(rows[from].size()) > k) {
-      rows[from].resize(k);
+    const int32_t query_count =
+        std::min(n - 1, target + problem_.depot_count);
+    const std::vector<int32_t> nearest =
+        kd_tree ? kd_tree->nearest(from, query_count)
+                : rank_by_distance(from, query_count);
+    for (int32_t to : nearest) {
+      if (static_cast<int32_t>(rows[from].size()) >= target)
+        break;
+      add(to);
     }
     std::sort(rows[from].begin(), rows[from].end());
   }
@@ -1361,16 +1484,16 @@ void RoutingDecoder::build_candidate_graph(const std::vector<int32_t> &incumbent
   }
   proximity_.resize(edge_to_.size());
   heuristic_.resize(edge_to_.size());
-  resource_pressure_.assign(edge_to_.size() * FIELD_CHANNEL_COUNT, 0.0f);
+  resource_pressure_.assign(edge_to_.size() * resource_count(), 0.0f);
+  resource_events_.assign(edge_to_.size() * resource_count(), 0.0f);
   objective_edge_costs_.assign(edge_to_.size(), 0.0f);
   if (edge_field != nullptr) {
-    edge_field->assign(static_cast<size_t>(edge_to_.size()) *
-                           FIELD_CHANNEL_COUNT,
+    edge_field->assign(static_cast<size_t>(edge_to_.size()) * resource_count(),
                        1.0f);
   }
   if (edge_additive != nullptr) {
     edge_additive->assign(static_cast<size_t>(edge_to_.size()) *
-                              FIELD_CHANNEL_COUNT,
+                              resource_count(),
                           0.0f);
   }
   if (edge_risk != nullptr)
@@ -1393,28 +1516,34 @@ void RoutingDecoder::build_candidate_graph(const std::vector<int32_t> &incumbent
       proximity_[edge] = classical_proximity(from, edge_to_[edge]);
       heuristic_[edge] = 1.0f / std::max(proximity_[edge], EPS);
       objective_edge_costs_[edge] = objective_edge_cost(from, to);
-      for (int32_t channel = 0; channel < FIELD_CHANNEL_COUNT; ++channel) {
-        resource_pressure_[static_cast<size_t>(edge) * FIELD_CHANNEL_COUNT +
+      for (int32_t channel = 0; channel < resource_count(); ++channel) {
+        resource_pressure_[static_cast<size_t>(edge) * resource_count() +
                            channel] =
-            analytic_resource_pressure(from, to, channel);
+            runtime_resource_pressure(from, to, channel);
+        const ResourceSpec &spec = resource(channel);
+        const bool reset =
+            (to < problem_.depot_count && spec.reset_at_depot) ||
+            (!spec.reset_nodes.empty() && spec.reset_nodes[to]);
+        resource_events_[static_cast<size_t>(edge) * resource_count() +
+                         channel] = reset ? 1.0f : 0.0f;
       }
       if (edge_field != nullptr && preserved &&
-          static_cast<size_t>(old_edge + 1) * FIELD_CHANNEL_COUNT <=
+          static_cast<size_t>(old_edge + 1) * resource_count() <=
               old_field.size()) {
         std::copy_n(old_field.data() +
-                        static_cast<size_t>(old_edge) * FIELD_CHANNEL_COUNT,
-                    FIELD_CHANNEL_COUNT,
+                        static_cast<size_t>(old_edge) * resource_count(),
+                    resource_count(),
                     edge_field->data() +
-                        static_cast<size_t>(edge) * FIELD_CHANNEL_COUNT);
+                        static_cast<size_t>(edge) * resource_count());
       }
       if (edge_additive != nullptr && preserved &&
-          static_cast<size_t>(old_edge + 1) * FIELD_CHANNEL_COUNT <=
+          static_cast<size_t>(old_edge + 1) * resource_count() <=
               old_additive.size()) {
         std::copy_n(old_additive.data() +
-                        static_cast<size_t>(old_edge) * FIELD_CHANNEL_COUNT,
-                    FIELD_CHANNEL_COUNT,
+                        static_cast<size_t>(old_edge) * resource_count(),
+                    resource_count(),
                     edge_additive->data() +
-                        static_cast<size_t>(edge) * FIELD_CHANNEL_COUNT);
+                        static_cast<size_t>(edge) * resource_count());
       }
       if (edge_risk != nullptr && preserved &&
           static_cast<size_t>(old_edge) < old_risk.size())
@@ -1433,7 +1562,7 @@ void RoutingDecoder::build_model_features() {
   };
   node_features_.assign(static_cast<size_t>(n) * NODE_FEATURE_COUNT, 0.0f);
   incumbent_live_state_.assign(
-      static_cast<size_t>(n) * LIVE_STATE_FEATURE_COUNT, 0.0f);
+      static_cast<size_t>(n) * resource_count(), 0.0f);
 
   float min_x = 0.0f;
   float min_y = 0.0f;
@@ -1526,24 +1655,21 @@ void RoutingDecoder::build_model_features() {
       features[18] = unit(distance / distance_scale_);
       const float state_time = time + problem_.service_time[node];
       float *live = incumbent_live_state_.data() +
-                    static_cast<size_t>(node) * LIVE_STATE_FEATURE_COUNT;
-      live[static_cast<int32_t>(FieldChannel::CAPACITY)] = 1.0f - features[14];
-      live[static_cast<int32_t>(FieldChannel::TIME_WINDOW)] =
-          unit(state_time / time_scale_);
-      live[static_cast<int32_t>(FieldChannel::ROUTE_LIMIT)] =
-          unit(distance / route_scale);
-      live[static_cast<int32_t>(FieldChannel::TOUR_LIMIT)] =
-          unit(distance / tour_scale);
-      live[static_cast<int32_t>(FieldChannel::BACKHAUL_ORDER)] =
-          backhaul ? 1.0f : 0.0f;
-      live[static_cast<int32_t>(FieldChannel::PICKUP_DELIVERY)] = features[17];
-      live[static_cast<int32_t>(FieldChannel::PRIZE_QUOTA)] =
-          unit(1.0 - cumulative_prize /
-                         std::max<double>(problem_.prize_quota, EPS));
-      for (int32_t channel = 0; channel < FIELD_CHANNEL_COUNT; ++channel) {
-        if (!field_channel_active(channel))
-          live[channel] = 0.0f;
-      }
+                    static_cast<size_t>(node) * resource_count();
+      const auto set_legacy = [&](FieldChannel channel, float value) {
+        const int32_t slot = legacy_resource_index(channel);
+        if (slot >= 0)
+          live[slot] = value;
+      };
+      set_legacy(FieldChannel::CAPACITY, 1.0f - features[14]);
+      set_legacy(FieldChannel::TIME_WINDOW, unit(state_time / time_scale_));
+      set_legacy(FieldChannel::ROUTE_LIMIT, unit(distance / route_scale));
+      set_legacy(FieldChannel::TOUR_LIMIT, unit(distance / tour_scale));
+      set_legacy(FieldChannel::BACKHAUL_ORDER, backhaul ? 1.0f : 0.0f);
+      set_legacy(FieldChannel::PICKUP_DELIVERY, features[17]);
+      set_legacy(FieldChannel::PRIZE_QUOTA,
+                 unit(1.0 - cumulative_prize /
+                                std::max<double>(problem_.prize_quota, EPS)));
       time = state_time;
       previous = node;
     }
@@ -1599,6 +1725,21 @@ void RoutingDecoder::build_model_features() {
         scan_route(nodes, depot);
       }
     }
+    State replay = initial_state(incumbent_route_.front());
+    const auto store_replay = [&](int32_t node) {
+      const std::vector<float> live = live_state_features(replay);
+      if (node >= 0 && node < n && !live.empty())
+        std::copy(live.begin(), live.end(),
+                  incumbent_live_state_.begin() +
+                      static_cast<size_t>(node) * resource_count());
+    };
+    store_replay(replay.current);
+    for (size_t index = 1; index < incumbent_route_.size(); ++index) {
+      std::string error;
+      if (!transition(replay, incumbent_route_[index], error))
+        break;
+      store_replay(replay.current);
+    }
   }
 
   // Reference counts make incremental removal robust when a depot edge occurs
@@ -1617,7 +1758,7 @@ void RoutingDecoder::build_model_features() {
   }
 
   resource_features_.assign(static_cast<size_t>(edge_count()) *
-                                FIELD_CHANNEL_COUNT,
+                                resource_count(),
                             0.0f);
   edge_features_.assign(static_cast<size_t>(edge_count()) * EDGE_FEATURE_COUNT,
                         0.0f);
@@ -1626,18 +1767,22 @@ void RoutingDecoder::build_model_features() {
          ++edge) {
       const int32_t to = edge_to_[edge];
       float *resources = resource_features_.data() +
-                         static_cast<size_t>(edge) * FIELD_CHANNEL_COUNT;
-      for (int32_t channel = 0; channel < FIELD_CHANNEL_COUNT; ++channel) {
+                         static_cast<size_t>(edge) * resource_count();
+      for (int32_t channel = 0; channel < resource_count(); ++channel) {
         resources[channel] =
             unit(resource_pressure_[static_cast<size_t>(edge) *
-                                        FIELD_CHANNEL_COUNT +
+                                        resource_count() +
                                     channel] /
-                 resource_scale(channel));
+                 runtime_resource_scale(channel));
       }
       float *features = edge_features_.data() +
                         static_cast<size_t>(edge) * EDGE_FEATURE_COUNT;
       features[0] = unit(problem_.dist(from, to) / distance_scale_);
-      std::copy_n(resources, FIELD_CHANNEL_COUNT, features + 1);
+      for (int32_t legacy = 0; legacy < FIELD_CHANNEL_COUNT; ++legacy) {
+        const int32_t slot = legacy_resource_index(
+            static_cast<FieldChannel>(legacy));
+        features[1 + legacy] = slot >= 0 ? resources[slot] : 0.0f;
+      }
       features[8] = incumbent_edges[edge] ? 1.0f : 0.0f;
       features[9] = reverse_incumbent_edges[edge] ? 1.0f : 0.0f;
       // Structural openness lever: on an open route the arrival-at-depot leg is
@@ -1678,6 +1823,11 @@ RoutingDecoder::State RoutingDecoder::initial_state(int32_t start_node) const {
   state.start_node = start_node;
   state.route.push_back(start_node);
   state.load = problem_.capacity;
+  state.algebra_state.resize(resource_count(), 0.0f);
+  for (int32_t index = 0; index < resource_count(); ++index) {
+    if (!resource(index).is_legacy())
+      state.algebra_state[index] = resource(index).initial;
+  }
 
   if (problem_.depot_count == 0) {
     if (start_node < 0 || start_node >= problem_.node_count) {
@@ -1699,6 +1849,39 @@ RoutingDecoder::State RoutingDecoder::initial_state(int32_t start_node) const {
     state.load = depot_reload(state);
   }
   return state;
+}
+
+bool RoutingDecoder::algebra_transition_feasible(const State &state,
+                                                  int32_t next,
+                                                  int32_t resource_index,
+                                                  float *next_value) const {
+  const ResourceSpec &spec = resource(resource_index);
+  if (spec.is_legacy())
+    return true;
+  float value = state.algebra_state[resource_index];
+  const bool depot = next < problem_.depot_count;
+  const bool event_reset = !spec.reset_nodes.empty() && spec.reset_nodes[next];
+  if (spec.edge_uses_distance)
+    value += spec.edge_coefficient * problem_.dist(state.current, next);
+  if (!spec.edge_values.empty()) {
+    value += spec.edge_coefficient *
+             spec.edge_values[static_cast<size_t>(state.current) *
+                                  problem_.node_count +
+                              next];
+  }
+  if (!spec.node_values.empty())
+    value += spec.node_coefficient * spec.node_values[next];
+  const bool check = spec.bound_check == BoundCheck::TRANSITION ||
+                     (depot && spec.bound_check == BoundCheck::ROUTE_END);
+  const bool feasible = !check || (value >= spec.lower - FEASIBILITY_EPS &&
+                                   value <= spec.upper + FEASIBILITY_EPS);
+  if ((depot && spec.reset_at_depot) || event_reset)
+    value = spec.reset_value;
+  else if (depot && spec.scope == ResourceScope::ROUTE)
+    value = spec.initial;
+  if (next_value != nullptr)
+    *next_value = value;
+  return feasible;
 }
 
 float RoutingDecoder::depot_reload(const State &state) const {
@@ -1762,6 +1945,10 @@ bool RoutingDecoder::legal_node(const State &state, int32_t node) const {
           return false;
       }
     }
+    for (int32_t index = 0; index < resource_count(); ++index) {
+      if (!algebra_transition_feasible(state, node, index))
+        return false;
+    }
     return true;
   }
 
@@ -1775,6 +1962,10 @@ bool RoutingDecoder::legal_node(const State &state, int32_t node) const {
       state.collected_prize + FEASIBILITY_EPS < problem_.prize_quota &&
       state.visited_customers < problem_.customer_count())
     depot_allowed = false;
+  for (int32_t index = 0; depot_allowed && index < resource_count(); ++index) {
+    if (!algebra_transition_feasible(state, node, index))
+      depot_allowed = false;
+  }
   return depot_allowed;
 }
 
@@ -1799,6 +1990,13 @@ bool RoutingDecoder::transition(State &state, int32_t next,
   if (find_edge(state.current, next) < 0) {
     ++state.off_graph_edges;
   }
+  std::vector<float> next_algebra = state.algebra_state;
+  for (int32_t index = 0; index < resource_count(); ++index) {
+    if (!resource(index).is_legacy()) {
+      (void)algebra_transition_feasible(state, next, index,
+                                        &next_algebra[index]);
+    }
+  }
 
   if (next < problem_.depot_count) {
     if (!problem_.open_route) {
@@ -1812,6 +2010,7 @@ bool RoutingDecoder::transition(State &state, int32_t next,
     state.route_distance = 0.0f;
     state.current_time = 0.0f;
     state.load = depot_reload(state);
+    state.algebra_state = std::move(next_algebra);
     return true;
   }
 
@@ -1840,6 +2039,7 @@ bool RoutingDecoder::transition(State &state, int32_t next,
       problem_.demand[next] < -FEASIBILITY_EPS ? 1 : 0;
   ++state.visited_customers;
   state.collected_prize += problem_.prize[next];
+  state.algebra_state = std::move(next_algebra);
   state.route.push_back(next);
   return true;
 }
@@ -1888,6 +2088,7 @@ bool RoutingDecoder::feasible_after_lookahead_transition(
   const float distance = state.distance;
   const float collected_prize = state.collected_prize;
   const int32_t off_graph_edges = state.off_graph_edges;
+  const std::vector<float> algebra_state = state.algebra_state;
 
   std::string error;
   const bool transitioned = transition(state, next, error);
@@ -1909,6 +2110,7 @@ bool RoutingDecoder::feasible_after_lookahead_transition(
   state.distance = distance;
   state.collected_prize = collected_prize;
   state.off_graph_edges = off_graph_edges;
+  state.algebra_state = algebra_state;
   return feasible;
 }
 
@@ -1943,6 +2145,34 @@ Solution RoutingDecoder::finish(State state) const {
   if (problem_.has(PICKUP_DELIVERY) && state.open_pickups != 0) {
     solution.error = "route ended with an undelivered pickup";
     return solution;
+  }
+  if (!problem_.open_route && !state.at_depot) {
+    const int32_t end =
+        problem_.depot_count == 0 ? state.start_node : state.route_depot;
+    for (int32_t index = 0; index < resource_count(); ++index) {
+      if (resource(index).is_legacy())
+        continue;
+      float value = state.algebra_state[index];
+      if (!algebra_transition_feasible(state, end, index, &value)) {
+        solution.error = "closing resource bound failed: " +
+                         resource(index).name;
+        return solution;
+      }
+      state.algebra_state[index] = value;
+    }
+  }
+  for (int32_t index = 0; index < resource_count(); ++index) {
+    const ResourceSpec &spec = resource(index);
+    if (!spec.is_legacy() &&
+        (spec.bound_check == BoundCheck::SOLUTION_END ||
+         spec.bound_check == BoundCheck::ROUTE_END)) {
+      const float value = state.algebra_state[index];
+      if (value < spec.lower - FEASIBILITY_EPS ||
+          value > spec.upper + FEASIBILITY_EPS) {
+        solution.error = "terminal resource bound failed: " + spec.name;
+        return solution;
+      }
+    }
   }
 
   if (problem_.has(VISIT_ALL) && !problem_.multi_route && !state.at_depot) {
@@ -2021,7 +2251,35 @@ int32_t RoutingDecoder::select_next(State &state,
   if (pool.empty()) {
     return -1;
   }
-  const std::array<float, LIVE_STATE_FEATURE_COUNT> live_state =
+  // Anti-fragmentation guard for open routes. objective_edge_cost() charges the
+  // return leg 0 for open routes (matching the true objective), which would
+  // otherwise make closing the route the cheapest move at every step and
+  // shatter open routes into one customer each. While any customer can still
+  // legally extend the current route, drop the depot options so routes fill up;
+  // a depot return stays available only when no customer continuation is legal
+  // (a forced close), and the local search reshapes routes afterwards. This
+  // replaces the old phantom return cost with a structural rule, so the
+  // ranking energy no longer contains a distortion the non-negative field must
+  // fight. Only the field/neutral energy path zeroes the return; the classical
+  // proximity heuristic never did, so it neither fragments nor needs the guard.
+  if (problem_.open_route && !search_config_.classical_behavior) {
+    bool has_customer = false;
+    for (const Choice &choice : pool) {
+      if (choice.node >= problem_.depot_count) {
+        has_customer = true;
+        break;
+      }
+    }
+    if (has_customer) {
+      pool.erase(
+          std::remove_if(pool.begin(), pool.end(),
+                         [&](const Choice &choice) {
+                           return choice.node < problem_.depot_count;
+                         }),
+          pool.end());
+    }
+  }
+  const std::vector<float> live_state =
       live_state_features(state);
   record_feasibility_labels(trace, state);
   std::vector<int32_t> valid_indices;
@@ -2191,7 +2449,7 @@ RoutingDecoder::perturbation_order(int32_t current,
         route_depot = depot;
     }
   }
-  const std::array<float, LIVE_STATE_FEATURE_COUNT> live_state =
+  const std::vector<float> live_state =
       incumbent_state_features(current);
   for (int32_t edge = edge_offsets_[current]; edge < edge_offsets_[current + 1];
        ++edge) {
@@ -2314,7 +2572,6 @@ Solution RoutingDecoder::scope_restricted_refine(
   if (!search_config_.use_srr || !solution.feasible) {
     return solution;
   }
-
   const auto position_of = [](const std::vector<int32_t> &route,
                               int32_t node) -> int32_t {
     const auto found = std::find(route.begin(), route.end(), node);
@@ -2577,65 +2834,59 @@ Solution RoutingDecoder::scope_restricted_refine(
   struct GuidanceValue {
     double objective = 0.0;
     double feasibility_risk = 0.0;
-    std::array<double, FIELD_CHANNEL_COUNT> resource{};
+    std::vector<double> resource;
+    explicit GuidanceValue(int32_t resource_count = 0)
+        : resource(resource_count, 0.0) {}
   };
   struct GuidedSequence : GuidanceValue {
     bool empty = true;
     int32_t first = -1;
     int32_t last = -1;
   };
-  const auto add_guidance = [](GuidanceValue lhs, const GuidanceValue &rhs) {
+  const auto add_guidance = [&](GuidanceValue lhs, const GuidanceValue &rhs) {
     lhs.objective += rhs.objective;
     lhs.feasibility_risk += rhs.feasibility_risk;
-    for (int32_t channel = 0; channel < FIELD_CHANNEL_COUNT; ++channel)
-      lhs.resource[channel] += rhs.resource[channel];
+    lhs.resource.resize(resource_count(), 0.0);
+    for (int32_t channel = 0; channel < resource_count(); ++channel)
+      lhs.resource[channel] += channel < static_cast<int32_t>(rhs.resource.size())
+                                   ? rhs.resource[channel]
+                                   : 0.0;
     return lhs;
   };
-  const auto subtract_guidance = [](GuidanceValue lhs,
+  const auto subtract_guidance = [&](GuidanceValue lhs,
                                     const GuidanceValue &rhs) {
     lhs.objective -= rhs.objective;
     lhs.feasibility_risk -= rhs.feasibility_risk;
-    for (int32_t channel = 0; channel < FIELD_CHANNEL_COUNT; ++channel)
-      lhs.resource[channel] -= rhs.resource[channel];
+    lhs.resource.resize(resource_count(), 0.0);
+    for (int32_t channel = 0; channel < resource_count(); ++channel)
+      lhs.resource[channel] -= channel < static_cast<int32_t>(rhs.resource.size())
+                                   ? rhs.resource[channel]
+                                   : 0.0;
     return lhs;
   };
   const auto edge_guidance = [&](int32_t from, int32_t to) {
-    GuidanceValue value;
+    GuidanceValue value(resource_count());
     value.objective = objective_edge_cost(from, to);
     const int32_t edge = find_edge(from, to);
     value.feasibility_risk =
         edge >= 0 && edge_risk != nullptr ? edge_risk[edge] : 0.0;
-    for (int32_t channel = 0; channel < FIELD_CHANNEL_COUNT; ++channel) {
-      if (!field_channel_active(channel))
+    for (int32_t channel = 0; channel < resource_count(); ++channel) {
+      if (!resource(channel).active)
         continue;
-      const double residual =
-          edge >= 0 && edge_field != nullptr
-              ? edge_field[static_cast<size_t>(edge) * FIELD_CHANNEL_COUNT +
-                           channel]
-              : 1.0;
-      const double pressure =
-          edge >= 0
-              ? resource_pressure_[static_cast<size_t>(edge) *
-                                       FIELD_CHANNEL_COUNT +
-                                   channel]
-              : analytic_resource_pressure(from, to, channel);
-      const double additive =
-          edge >= 0 && edge_additive != nullptr
-              ? edge_additive[static_cast<size_t>(edge) *
-                                      FIELD_CHANNEL_COUNT +
-                                  channel]
-              : 0.0;
-      value.resource[channel] =
-          std::max(residual * pressure + additive, 0.0);
+      value.resource[channel] = resource_field_value(
+          from, to, edge, channel, edge_field, edge_additive);
     }
     return value;
   };
   const auto guidance_energy = [&](const GuidanceValue &value,
                                    const float *live_state) {
-    double result = value.objective;
+    double result = coupled_multiplier(
+                        objective_multiplier(), multipliers, coupler_weights,
+                        coupler_bias, live_state) *
+                    value.objective;
     result += risk_penalty * value.feasibility_risk;
-    for (int32_t channel = 0; channel < FIELD_CHANNEL_COUNT; ++channel) {
-      if (field_channel_active(channel)) {
+    for (int32_t channel = 0; channel < resource_count(); ++channel) {
+      if (resource(channel).active) {
         result += coupled_multiplier(channel, multipliers, coupler_weights,
                                      coupler_bias, live_state) *
                   value.resource[channel];
@@ -2648,6 +2899,8 @@ Solution RoutingDecoder::scope_restricted_refine(
     bool exact = true;
     double capacity_excess = 0.0;
     double capacity_binding = 0.0;
+    double time_warp = 0.0;
+    double time_binding = 0.0;
     double route_excess = 0.0;
     double tour_excess = 0.0;
     double route_ratio = 0.0;
@@ -2707,12 +2960,69 @@ Solution RoutingDecoder::scope_restricted_refine(
   };
   const double capacity_scale = resource_scale(
       static_cast<int32_t>(FieldChannel::CAPACITY));
+  const double time_scale = resource_scale(
+      static_cast<int32_t>(FieldChannel::TIME_WINDOW));
   const double route_scale = resource_scale(
       static_cast<int32_t>(FieldChannel::ROUTE_LIMIT));
   const double tour_scale = resource_scale(
       static_cast<int32_t>(FieldChannel::TOUR_LIMIT));
   const double quota_scale = resource_scale(
       static_cast<int32_t>(FieldChannel::PRIZE_QUOTA));
+  struct TimeWindowMetrics {
+    double time_warp = 0.0;
+    double time_binding = 0.0;
+  };
+  // Preserve evaluate_resources() semantics exactly: start every depot route
+  // at time zero, wait until each customer's opening time, sum lateness at
+  // every visit, and exclude the depot return from the minimum-slack binding.
+  // The visitor form lets planned routes be scanned directly from their pieces
+  // without materializing the full candidate solution (or allocating a route).
+  const auto time_window_metrics = [&]
+      (int32_t depot, const auto &visit_nodes) {
+    TimeWindowMetrics result;
+    if (!problem_.has(TIME_WINDOWS))
+      return result;
+    float route_time = 0.0f;
+    float time_warp = 0.0f;
+    float min_time_slack = static_cast<float>(time_scale);
+    int32_t current = depot;
+    bool has_current = depot >= 0;
+    bool visited_customer = false;
+    visit_nodes([&](int32_t next) {
+      // Depot-free tours use their first node as evaluate_resources()'s start
+      // token; that token is not itself evaluated as a time-window arrival.
+      if (!has_current) {
+        current = next;
+        has_current = true;
+        return;
+      }
+      const float travel = problem_.dist(current, next);
+      const float raw_arrival = route_time + travel;
+      const float arrival = std::max(raw_arrival, problem_.tw_start[next]);
+      time_warp += std::max(arrival - problem_.tw_end[next], 0.0f);
+      min_time_slack = std::min(
+          min_time_slack,
+          std::max(problem_.tw_end[next] - arrival, 0.0f));
+      route_time = arrival + problem_.service_time[next];
+      current = next;
+      visited_customer = true;
+    });
+    if (depot >= 0 && visited_customer && !problem_.open_route) {
+      const float return_time = route_time + problem_.dist(current, depot);
+      time_warp += std::max(return_time - problem_.tw_end[depot], 0.0f);
+    }
+    result.time_warp = time_warp;
+    result.time_binding = std::clamp(
+        1.0 - static_cast<double>(min_time_slack) / time_scale, 0.0, 1.0);
+    return result;
+  };
+  const auto cached_time_window_metrics = [&]
+      (int32_t depot, const std::vector<int32_t> &nodes) {
+    return time_window_metrics(depot, [&](const auto &visit) {
+      for (int32_t node : nodes)
+        visit(node);
+    });
+  };
   const auto route_resource_metrics = [&]
       (int32_t depot, const SequenceSummary &sequence) {
     RouteResourceMetrics result;
@@ -2749,8 +3059,7 @@ Solution RoutingDecoder::scope_restricted_refine(
         problem_.has(TOUR_LIMIT) ? tour / tour_scale : 0.0;
     result.prize = sequence.prize;
     result.backhaul_count = sequence.has_backhaul ? 1 : 0;
-    result.exact = !problem_.has(TIME_WINDOWS) &&
-                   !problem_.has(PICKUP_DELIVERY) &&
+    result.exact = !problem_.has(PICKUP_DELIVERY) &&
                    !sequence.backhaul_violation;
     return result;
   };
@@ -2758,6 +3067,7 @@ Solution RoutingDecoder::scope_restricted_refine(
   enum RouteRank : int32_t {
     CAPACITY_EXCESS_RANK = 0,
     CAPACITY_BINDING_RANK,
+    TIME_BINDING_RANK,
     ROUTE_RATIO_RANK,
     TOUR_RATIO_RANK,
     ROUTE_RANK_COUNT,
@@ -2782,17 +3092,18 @@ Solution RoutingDecoder::scope_restricted_refine(
   std::vector<uint64_t> route_rank_versions;
   double total_route_excess = 0.0;
   double total_tour_excess = 0.0;
+  double total_time_warp = 0.0;
   double total_prize = 0.0;
   int32_t total_backhauls = 0;
-  GuidanceValue total_guidance;
+  GuidanceValue total_guidance(resource_count());
   // Directed edges can occur more than once in a multi-route incumbent.  Keep
   // reference counts so replacing one route cannot clear an edge still used by
   // another route.
   std::vector<int32_t> incumbent_edges(edge_count(), 0);
   const auto build_route_guidance = [&](CachedRoute &route) {
     const std::vector<int32_t> &nodes = route.sequence.nodes;
-    route.forward_guidance.assign(nodes.size(), {});
-    route.reverse_guidance.assign(nodes.size(), {});
+    route.forward_guidance.assign(nodes.size(), GuidanceValue(resource_count()));
+    route.reverse_guidance.assign(nodes.size(), GuidanceValue(resource_count()));
     for (size_t index = 1; index < nodes.size(); ++index) {
       route.forward_guidance[index] = add_guidance(
           route.forward_guidance[index - 1],
@@ -2819,7 +3130,7 @@ Solution RoutingDecoder::scope_restricted_refine(
   const auto rebuild_cache = [&]() {
     cached_routes.clear();
     route_head = -1;
-    total_guidance = {};
+    total_guidance = GuidanceValue(resource_count());
     std::fill(node_route.begin(), node_route.end(), -1);
     std::fill(node_local.begin(), node_local.end(), -1);
     if (problem_.depot_count == 0) {
@@ -2905,6 +3216,7 @@ Solution RoutingDecoder::scope_restricted_refine(
     route_rank_versions.assign(cached_routes.size(), 1);
     total_route_excess = 0.0;
     total_tour_excess = 0.0;
+    total_time_warp = 0.0;
     total_prize = 0.0;
     total_backhauls = 0;
     std::fill(incumbent_edges.begin(), incumbent_edges.end(), 0);
@@ -2921,6 +3233,10 @@ Solution RoutingDecoder::scope_restricted_refine(
       if (!route.active)
         continue;
       route.resources = route_resource_metrics(route.depot, route.summary);
+      const TimeWindowMetrics time = cached_time_window_metrics(
+          route.depot, route.sequence.nodes);
+      route.resources.time_warp = time.time_warp;
+      route.resources.time_binding = time.time_binding;
       double positive_load = 0.0;
       double negative_load = 0.0;
       for (int32_t node : route.sequence.nodes) {
@@ -2937,12 +3253,15 @@ Solution RoutingDecoder::scope_restricted_refine(
           {resource.capacity_excess, route_id, version});
       ranked_routes[CAPACITY_BINDING_RANK].push(
           {resource.capacity_binding, route_id, version});
+      ranked_routes[TIME_BINDING_RANK].push(
+          {resource.time_binding, route_id, version});
       ranked_routes[ROUTE_RATIO_RANK].push(
           {resource.route_ratio, route_id, version});
       ranked_routes[TOUR_RATIO_RANK].push(
           {resource.tour_ratio, route_id, version});
       total_route_excess += resource.route_excess;
       total_tour_excess += resource.tour_excess;
+      total_time_warp += resource.time_warp;
       total_prize += resource.prize;
       total_backhauls += resource.backhaul_count;
     }
@@ -2977,6 +3296,25 @@ Solution RoutingDecoder::scope_restricted_refine(
       }
     }
     return nodes;
+  };
+  const auto planned_time_window_metrics = [&](const PlannedRoute &plan) {
+    return time_window_metrics(plan.depot, [&](const auto &visit) {
+      for (const SequencePiece &piece : plan.pieces) {
+        if (piece.singleton >= 0) {
+          visit(piece.singleton);
+          continue;
+        }
+        const std::vector<int32_t> &source =
+            cached_routes[piece.route].sequence.nodes;
+        if (!piece.reverse) {
+          for (int32_t local = piece.begin; local < piece.end; ++local)
+            visit(source[local]);
+        } else {
+          for (int32_t local = piece.end - 1; local >= piece.begin; --local)
+            visit(source[local]);
+        }
+      }
+    });
   };
   const auto guided_piece = [&](const SequencePiece &piece) {
     GuidedSequence result;
@@ -3159,10 +3497,11 @@ Solution RoutingDecoder::scope_restricted_refine(
       -> std::optional<ResourceEvaluation> {
     if (plans.size() != sequences.size())
       return std::nullopt;
-    // The legacy TW label sums cascading lateness at every visited node, and
-    // pickup-delivery binding tracks maximum open pairs. Neither has an exact
-    // fixed-size concatenation summary, so preserve their existing evaluator.
-    if (problem_.has(TIME_WINDOWS) || problem_.has(PICKUP_DELIVERY))
+    // Pickup-delivery binding tracks maximum open pairs and does not yet have
+    // an exact fixed-size concatenation summary. Time-window labels are handled
+    // below by scanning only the affected route pieces, preserving the legacy
+    // summed-lateness and minimum-slack definitions exactly.
+    if (problem_.has(PICKUP_DELIVERY))
       return std::nullopt;
     std::array<int32_t, 2> affected{-1, -1};
     int32_t affected_count = 0;
@@ -3182,6 +3521,7 @@ Solution RoutingDecoder::scope_restricted_refine(
 
     double route_excess = total_route_excess;
     double tour_excess = total_tour_excess;
+    double time_warp = total_time_warp;
     double prize = total_prize;
     int32_t backhauls = total_backhauls;
     for (int32_t index = 0; index < affected_count; ++index) {
@@ -3189,6 +3529,7 @@ Solution RoutingDecoder::scope_restricted_refine(
       const RouteResourceMetrics &old = cached_routes[route].resources;
       route_excess -= old.route_excess;
       tour_excess -= old.tour_excess;
+      time_warp -= old.time_warp;
       prize -= old.prize;
       backhauls -= old.backhaul_count;
     }
@@ -3197,6 +3538,8 @@ Solution RoutingDecoder::scope_restricted_refine(
         CAPACITY_EXCESS_RANK, affected, affected_count, 0.0);
     double capacity_binding = unaffected_rank(
         CAPACITY_BINDING_RANK, affected, affected_count, 0.0);
+    double time_binding = unaffected_rank(
+        TIME_BINDING_RANK, affected, affected_count, 0.0);
     double max_route_ratio = unaffected_rank(
         ROUTE_RATIO_RANK, affected, affected_count, 0.0);
     double max_tour_ratio = unaffected_rank(
@@ -3207,18 +3550,23 @@ Solution RoutingDecoder::scope_restricted_refine(
       const SequenceSummary &sequence = sequences[index];
       if (sequence.empty)
         return std::nullopt;
-      const RouteResourceMetrics resource = route_resource_metrics(
+      RouteResourceMetrics resource = route_resource_metrics(
           plan.depot, sequence);
       if (!resource.exact)
         return std::nullopt;
+      const TimeWindowMetrics time = planned_time_window_metrics(plan);
+      resource.time_warp = time.time_warp;
+      resource.time_binding = time.time_binding;
       capacity_excess =
           std::max(capacity_excess, resource.capacity_excess);
       capacity_binding =
           std::max(capacity_binding, resource.capacity_binding);
+      time_binding = std::max(time_binding, resource.time_binding);
       max_route_ratio = std::max(max_route_ratio, resource.route_ratio);
       max_tour_ratio = std::max(max_tour_ratio, resource.tour_ratio);
       route_excess += resource.route_excess;
       tour_excess += resource.tour_excess;
+      time_warp += resource.time_warp;
       prize += resource.prize;
       backhauls += resource.backhaul_count;
     }
@@ -3228,7 +3576,8 @@ Solution RoutingDecoder::scope_restricted_refine(
     result.binding.assign(FIELD_CHANNEL_COUNT, 0.0f);
     result.violation[static_cast<int32_t>(FieldChannel::CAPACITY)] =
         static_cast<float>(capacity_excess / capacity_scale);
-    result.violation[static_cast<int32_t>(FieldChannel::TIME_WINDOW)] = 0.0f;
+    result.violation[static_cast<int32_t>(FieldChannel::TIME_WINDOW)] =
+        static_cast<float>(time_warp / time_scale);
     result.violation[static_cast<int32_t>(FieldChannel::ROUTE_LIMIT)] =
         static_cast<float>(route_excess / route_scale);
     result.violation[static_cast<int32_t>(FieldChannel::TOUR_LIMIT)] =
@@ -3241,7 +3590,8 @@ Solution RoutingDecoder::scope_restricted_refine(
 
     result.binding[static_cast<int32_t>(FieldChannel::CAPACITY)] =
         static_cast<float>(std::clamp(capacity_binding, 0.0, 1.0));
-    result.binding[static_cast<int32_t>(FieldChannel::TIME_WINDOW)] = 0.0f;
+    result.binding[static_cast<int32_t>(FieldChannel::TIME_WINDOW)] =
+        static_cast<float>(std::clamp(time_binding, 0.0, 1.0));
     result.binding[static_cast<int32_t>(FieldChannel::ROUTE_LIMIT)] =
         static_cast<float>(std::clamp(max_route_ratio, 0.0, 1.0));
     result.binding[static_cast<int32_t>(FieldChannel::TOUR_LIMIT)] =
@@ -3327,7 +3677,7 @@ Solution RoutingDecoder::scope_restricted_refine(
     route.open_pickups.clear();
     route.forward_guidance.clear();
     route.reverse_guidance.clear();
-    route.guidance = {};
+    route.guidance = GuidanceValue(resource_count());
     route.sequence = build_sequence_table(problem_, nodes);
     route.summary = query_sequence(
         problem_, route.sequence, 0,
@@ -3351,6 +3701,10 @@ Solution RoutingDecoder::scope_restricted_refine(
           std::max(-static_cast<double>(problem_.demand[node]), 0.0);
     }
     route.resources = route_resource_metrics(route.depot, route.summary);
+    const TimeWindowMetrics time = cached_time_window_metrics(
+        route.depot, route.sequence.nodes);
+    route.resources.time_warp = time.time_warp;
+    route.resources.time_binding = time.time_binding;
     route.resources.capacity_binding =
         std::max(positive_load, negative_load) / capacity_scale;
     return route;
@@ -3385,6 +3739,8 @@ Solution RoutingDecoder::scope_restricted_refine(
       return resource.capacity_excess;
     case CAPACITY_BINDING_RANK:
       return resource.capacity_binding;
+    case TIME_BINDING_RANK:
+      return resource.time_binding;
     case ROUTE_RATIO_RANK:
       return resource.route_ratio;
     case TOUR_RATIO_RANK:
@@ -3504,6 +3860,7 @@ Solution RoutingDecoder::scope_restricted_refine(
       total_guidance = subtract_guidance(total_guidance, old.guidance);
       total_route_excess -= old.resources.route_excess;
       total_tour_excess -= old.resources.tour_excess;
+      total_time_warp -= old.resources.time_warp;
       total_prize -= old.resources.prize;
       total_backhauls -= old.resources.backhaul_count;
       for (int32_t node : old.sequence.nodes) {
@@ -3525,6 +3882,7 @@ Solution RoutingDecoder::scope_restricted_refine(
       total_guidance = add_guidance(total_guidance, route.guidance);
       total_route_excess += route.resources.route_excess;
       total_tour_excess += route.resources.tour_excess;
+      total_time_warp += route.resources.time_warp;
       total_prize += route.resources.prize;
       total_backhauls += route.resources.backhaul_count;
       const uint64_t version = ++route_rank_versions[slot];
@@ -3637,6 +3995,7 @@ Solution RoutingDecoder::scope_restricted_refine(
       total_guidance = subtract_guidance(total_guidance, old.guidance);
       total_route_excess -= old.resources.route_excess;
       total_tour_excess -= old.resources.tour_excess;
+      total_time_warp -= old.resources.time_warp;
       total_prize -= old.resources.prize;
       total_backhauls -= old.resources.backhaul_count;
       for (int32_t node : old.sequence.nodes) {
@@ -3677,6 +4036,7 @@ Solution RoutingDecoder::scope_restricted_refine(
       total_guidance = add_guidance(total_guidance, route.guidance);
       total_route_excess += route.resources.route_excess;
       total_tour_excess += route.resources.tour_excess;
+      total_time_warp += route.resources.time_warp;
       total_prize += route.resources.prize;
       total_backhauls += route.resources.backhaul_count;
       const uint64_t version = route_rank_versions[slot];
@@ -3841,6 +4201,7 @@ Solution RoutingDecoder::scope_restricted_refine(
     }
     const double incremental_route_excess = total_route_excess;
     const double incremental_tour_excess = total_tour_excess;
+    const double incremental_time_warp = total_time_warp;
     const double incremental_prize = total_prize;
     const int32_t incremental_backhauls = total_backhauls;
     const GuidanceValue incremental_guidance = total_guidance;
@@ -3858,7 +4219,7 @@ Solution RoutingDecoder::scope_restricted_refine(
           !close(lhs.feasibility_risk, rhs.feasibility_risk)) {
         return false;
       }
-      for (int32_t channel = 0; channel < FIELD_CHANNEL_COUNT; ++channel) {
+      for (int32_t channel = 0; channel < resource_count(); ++channel) {
         if (!close(lhs.resource[channel], rhs.resource[channel]))
           return false;
       }
@@ -3869,6 +4230,8 @@ Solution RoutingDecoder::scope_restricted_refine(
       return lhs.exact == rhs.exact &&
              close(lhs.capacity_excess, rhs.capacity_excess) &&
              close(lhs.capacity_binding, rhs.capacity_binding) &&
+             close(lhs.time_warp, rhs.time_warp) &&
+             close(lhs.time_binding, rhs.time_binding) &&
              close(lhs.route_excess, rhs.route_excess) &&
              close(lhs.tour_excess, rhs.tour_excess) &&
              close(lhs.route_ratio, rhs.route_ratio) &&
@@ -3908,6 +4271,7 @@ Solution RoutingDecoder::scope_restricted_refine(
     }
     if (!close(incremental_route_excess, total_route_excess) ||
         !close(incremental_tour_excess, total_tour_excess) ||
+        !close(incremental_time_warp, total_time_warp) ||
         !close(incremental_prize, total_prize) ||
         incremental_backhauls != total_backhauls ||
         !same_guidance(incremental_guidance, total_guidance)) {
@@ -3961,12 +4325,11 @@ Solution RoutingDecoder::scope_restricted_refine(
     if (anchor < problem_.depot_count || node_route[anchor] < 0) {
       continue;
     }
-
     Solution best_move;
     AcceptedPlan best_plan;
     StructuralMove best_structural;
     const GuidanceValue current_guidance = total_guidance;
-    const std::array<float, LIVE_STATE_FEATURE_COUNT> anchor_state =
+    const std::vector<float> anchor_state =
         incumbent_state_features(anchor);
     double best_guided_energy = std::numeric_limits<double>::infinity();
     const auto consider = [&](const std::vector<int32_t> &trial,
@@ -4068,11 +4431,15 @@ Solution RoutingDecoder::scope_restricted_refine(
               feasible = false;
             }
           }
+          const bool needs_planned_resource =
+              trace != nullptr &&
+              (trace->screened_edges.size() < MAX_SCREENING_LABELS ||
+               search_config_.verify_screening_resources);
           const std::optional<ResourceEvaluation> planned_resource =
-              trace == nullptr
-                  ? std::nullopt
-                  : evaluate_planned_resources(
-                        plans, planned_sequences, affected_routes);
+              needs_planned_resource
+                  ? evaluate_planned_resources(
+                        plans, planned_sequences, affected_routes)
+                  : std::nullopt;
           if (search_config_.verify_screening_resources &&
               planned_resource.has_value()) {
             std::vector<int32_t> verification_route;
@@ -4794,7 +5161,7 @@ Solution RoutingDecoder::perturb(uint64_t rollout_seed, const float *edge_field,
     for (const OrderedChoice &choice : order) {
       valid_indices.push_back(choice.local_index);
     }
-    const std::array<float, LIVE_STATE_FEATURE_COUNT> live_state =
+    const std::vector<float> live_state =
         incumbent_state_features(current);
     for (size_t order_index = 0; order_index < order.size(); ++order_index) {
       const OrderedChoice &choice = order[order_index];
@@ -5050,13 +5417,13 @@ Solution RoutingDecoder::solve(int32_t iterations, const float *edge_field,
     working_field.assign(
         edge_field,
         edge_field + static_cast<size_t>(edge_to_.size()) *
-                         FIELD_CHANNEL_COUNT);
+                         resource_count());
   }
   if (edge_additive != nullptr) {
     working_additive.assign(
         edge_additive,
         edge_additive + static_cast<size_t>(edge_to_.size()) *
-                            FIELD_CHANNEL_COUNT);
+                            resource_count());
   }
   if (edge_risk != nullptr)
     working_risk.assign(edge_risk, edge_risk + edge_to_.size());
@@ -5102,6 +5469,23 @@ void RoutingDecoder::set_incumbent(const std::vector<int32_t> &route) {
   if (better(solution, best_solution_)) {
     best_solution_ = solution;
   }
+}
+
+void RoutingDecoder::set_candidate_resource_quotas(
+    const std::vector<float> &quotas) {
+  if (quotas.size() != static_cast<size_t>(resource_count()))
+    throw std::invalid_argument(
+        "candidate resource quotas must match resource_count");
+  double total = 0.0;
+  for (float quota : quotas) {
+    if (!std::isfinite(quota) || quota < 0.0f || quota > 1.0f)
+      throw std::invalid_argument(
+          "candidate resource quotas must be finite values in [0, 1]");
+    total += quota;
+  }
+  if (total > 1.0 + FEASIBILITY_EPS)
+    throw std::invalid_argument("candidate resource quotas must sum to at most 1");
+  candidate_resource_quotas_ = quotas;
 }
 
 Solution RoutingDecoder::evaluate(const std::vector<int32_t> &route) const {
@@ -5313,6 +5697,74 @@ Solution RoutingDecoder::evaluate(const std::vector<int32_t> &route) const {
       ++off_graph_edges;
   }
 
+  // The legacy evaluator above remains the frozen parity oracle. Explicit
+  // algebra rows are replayed alongside it from the same route so schema-only
+  // resources participate in incumbent validation and SRR fallback checks.
+  std::vector<float> algebra(resource_count(), 0.0f);
+  for (int32_t resource_index = 0; resource_index < resource_count();
+       ++resource_index) {
+    if (!resource(resource_index).is_legacy())
+      algebra[resource_index] = resource(resource_index).initial;
+  }
+  int32_t algebra_current = route.front();
+  const auto extend_algebra = [&](int32_t next, bool force_route_end) {
+    const bool depot = next < problem_.depot_count;
+    for (int32_t resource_index = 0; resource_index < resource_count();
+         ++resource_index) {
+      const ResourceSpec &spec = resource(resource_index);
+      if (spec.is_legacy())
+        continue;
+      float value = algebra[resource_index];
+      const bool event_reset =
+          !spec.reset_nodes.empty() && spec.reset_nodes[next];
+      if (spec.edge_uses_distance)
+        value +=
+            spec.edge_coefficient * problem_.dist(algebra_current, next);
+      if (!spec.edge_values.empty())
+        value += spec.edge_coefficient *
+                 spec.edge_values[static_cast<size_t>(algebra_current) *
+                                      problem_.node_count +
+                                  next];
+      if (!spec.node_values.empty())
+        value += spec.node_coefficient * spec.node_values[next];
+      const bool check = spec.bound_check == BoundCheck::TRANSITION ||
+                         ((depot || force_route_end) &&
+                          spec.bound_check == BoundCheck::ROUTE_END);
+      if (check && (value < spec.lower - FEASIBILITY_EPS ||
+                    value > spec.upper + FEASIBILITY_EPS)) {
+        failed.error = "resource bound failed: " + spec.name;
+        return false;
+      }
+      if ((depot && spec.reset_at_depot) || event_reset)
+        value = spec.reset_value;
+      else if (depot && spec.scope == ResourceScope::ROUTE)
+        value = spec.initial;
+      algebra[resource_index] = value;
+    }
+    algebra_current = next;
+    return true;
+  };
+  for (size_t route_index = 1; route_index < route.size(); ++route_index) {
+    if (!extend_algebra(route[route_index], false))
+      return failed;
+  }
+  if (problem_.has(VISIT_ALL) && !problem_.multi_route && !at_depot &&
+      !problem_.open_route) {
+    const int32_t end = problem_.depot_count == 0 ? start_node : route_depot;
+    if (!extend_algebra(end, true))
+      return failed;
+  }
+  for (int32_t resource_index = 0; resource_index < resource_count();
+       ++resource_index) {
+    const ResourceSpec &spec = resource(resource_index);
+    if (!spec.is_legacy() && spec.bound_check == BoundCheck::SOLUTION_END &&
+        (algebra[resource_index] < spec.lower - FEASIBILITY_EPS ||
+         algebra[resource_index] > spec.upper + FEASIBILITY_EPS)) {
+      failed.error = "terminal resource bound failed: " + spec.name;
+      return failed;
+    }
+  }
+
   Solution solution;
   solution.route = route;
   solution.distance = distance;
@@ -5341,8 +5793,8 @@ Solution RoutingDecoder::evaluate(const std::vector<int32_t> &route) const {
 ResourceEvaluation RoutingDecoder::evaluate_resources(
     const std::vector<int32_t> &route) const {
   ResourceEvaluation result;
-  result.violation.assign(FIELD_CHANNEL_COUNT, 0.0f);
-  result.binding.assign(FIELD_CHANNEL_COUNT, 0.0f);
+  result.violation.assign(resource_count(), 0.0f);
+  result.binding.assign(resource_count(), 0.0f);
   if (route.empty()) {
     result.error = "route must not be empty";
     return result;
@@ -5568,6 +6020,83 @@ ResourceEvaluation RoutingDecoder::evaluate_resources(
     } else if (result.violation[channel] > FEASIBILITY_EPS) {
       result.binding[channel] = 1.0f;
     }
+  }
+  std::vector<float> algebra(resource_count(), 0.0f);
+  for (int32_t resource_index = FIELD_CHANNEL_COUNT;
+       resource_index < resource_count(); ++resource_index) {
+    algebra[resource_index] = resource(resource_index).initial;
+  }
+  int32_t algebra_current = route.front();
+  const auto record_custom = [&](int32_t resource_index, float value,
+                                 bool check_bound) {
+    const ResourceSpec &spec = resource(resource_index);
+    const float scale = runtime_resource_scale(resource_index);
+    float violation = 0.0f;
+    if (check_bound) {
+      if (std::isfinite(spec.lower))
+        violation = std::max(violation, spec.lower - value);
+      if (std::isfinite(spec.upper))
+        violation = std::max(violation, value - spec.upper);
+    }
+    result.violation[resource_index] = std::max(
+        result.violation[resource_index], violation / std::max(scale, EPS));
+    float binding = 0.0f;
+    if (std::isfinite(spec.lower) && std::isfinite(spec.upper)) {
+      const float slack = std::min(value - spec.lower, spec.upper - value);
+      binding = 1.0f - slack / std::max(0.5f * (spec.upper - spec.lower), EPS);
+    } else if (std::isfinite(spec.lower)) {
+      binding = 1.0f - (value - spec.lower) / std::max(scale, EPS);
+    } else if (std::isfinite(spec.upper)) {
+      binding = 1.0f - (spec.upper - value) / std::max(scale, EPS);
+    }
+    result.binding[resource_index] =
+        std::max(result.binding[resource_index],
+                 std::clamp(binding, 0.0f, 1.0f));
+  };
+  const auto extend_custom = [&](int32_t next, bool force_route_end) {
+    const bool depot = next < problem_.depot_count;
+    for (int32_t resource_index = FIELD_CHANNEL_COUNT;
+         resource_index < resource_count(); ++resource_index) {
+      const ResourceSpec &spec = resource(resource_index);
+      float value = algebra[resource_index];
+      const bool event_reset =
+          !spec.reset_nodes.empty() && spec.reset_nodes[next];
+      if (spec.edge_uses_distance)
+        value +=
+            spec.edge_coefficient * problem_.dist(algebra_current, next);
+      if (!spec.edge_values.empty())
+        value += spec.edge_coefficient *
+                 spec.edge_values[static_cast<size_t>(algebra_current) *
+                                      problem_.node_count +
+                                  next];
+      if (!spec.node_values.empty())
+        value += spec.node_coefficient * spec.node_values[next];
+      const bool check = spec.bound_check == BoundCheck::TRANSITION ||
+                         ((depot || force_route_end) &&
+                          spec.bound_check == BoundCheck::ROUTE_END);
+      record_custom(resource_index, value, check);
+      if ((depot && spec.reset_at_depot) || event_reset)
+        value = spec.reset_value;
+      else if (depot && spec.scope == ResourceScope::ROUTE)
+        value = spec.initial;
+      algebra[resource_index] = value;
+    }
+    algebra_current = next;
+  };
+  for (size_t route_index = 1; route_index < route.size(); ++route_index) {
+    extend_custom(route[route_index], false);
+  }
+  if (problem_.has(VISIT_ALL) && !problem_.multi_route && !at_depot &&
+      !problem_.open_route) {
+    const int32_t end = problem_.depot_count == 0 ? route.front() : route_depot;
+    extend_custom(end, true);
+  }
+  for (int32_t resource_index = FIELD_CHANNEL_COUNT;
+       resource_index < resource_count(); ++resource_index) {
+    if (resource(resource_index).bound_check == BoundCheck::SOLUTION_END)
+      record_custom(resource_index, algebra[resource_index], true);
+    if (result.violation[resource_index] > FEASIBILITY_EPS)
+      result.binding[resource_index] = 1.0f;
   }
   result.structurally_valid = true;
   return result;

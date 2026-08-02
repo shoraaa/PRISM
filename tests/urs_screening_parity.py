@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify O(1) planned SRR labels against full resource evaluation."""
+"""Verify incremental planned SRR labels against full resource evaluation."""
 
 from __future__ import annotations
 

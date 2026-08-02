@@ -25,6 +25,11 @@ using prism::PRIZE_QUOTA;
 using prism::Problem;
 using prism::ROUTE_LIMIT;
 using prism::ResourceEvaluation;
+using prism::ResourceSpec;
+using prism::ResourceOperator;
+using prism::ResourceDirection;
+using prism::ResourceScope;
+using prism::BoundCheck;
 using prism::SearchConfig;
 using prism::Solution;
 using prism::TIME_WINDOWS;
@@ -201,6 +206,161 @@ T value_or(const py::dict &data, const char *key, T default_value) {
   return data.contains(key) ? data[key].cast<T>() : default_value;
 }
 
+float algebra_scalar(const py::dict &problem, py::handle expression,
+                     const char *field) {
+  if (py::isinstance<py::float_>(expression) ||
+      py::isinstance<py::int_>(expression))
+    return py::cast<float>(expression);
+  if (!py::isinstance<py::dict>(expression))
+    throw std::invalid_argument(std::string(field) +
+                                " must be a number or scalar reference");
+  const py::dict reference = py::reinterpret_borrow<py::dict>(expression);
+  if (!reference.contains("scalar"))
+    throw std::invalid_argument(std::string(field) +
+                                " scalar reference is missing 'scalar'");
+  const std::string name = reference["scalar"].cast<std::string>();
+  if (!problem.contains(name.c_str()))
+    throw std::invalid_argument("missing resource scalar: " + name);
+  return problem[name.c_str()].cast<float>();
+}
+
+std::vector<float> algebra_node_attribute(const py::dict &problem,
+                                          const std::string &name,
+                                          int32_t node_count) {
+  if (!problem.contains("node_attributes"))
+    throw std::invalid_argument("problem is missing node_attributes");
+  const py::dict attributes = problem["node_attributes"].cast<py::dict>();
+  if (!attributes.contains(name.c_str()))
+    throw std::invalid_argument("missing node attribute: " + name);
+  py::dict wrapper;
+  wrapper["value"] = attributes[name.c_str()];
+  return optional_vector(wrapper, "value", node_count, 0.0f);
+}
+
+std::vector<float> algebra_edge_attribute(const py::dict &problem,
+                                          const std::string &name,
+                                          int32_t node_count) {
+  if (name == "distance") {
+    if (!problem.contains("distance") || problem["distance"].is_none())
+      throw std::invalid_argument(
+          "distance resource input requires an explicit distance matrix");
+    int32_t parsed_count = node_count;
+    return required_matrix(problem, "distance", parsed_count);
+  }
+  if (!problem.contains("edge_attributes"))
+    throw std::invalid_argument("problem is missing edge_attributes");
+  const py::dict attributes = problem["edge_attributes"].cast<py::dict>();
+  if (!attributes.contains(name.c_str()))
+    throw std::invalid_argument("missing edge attribute: " + name);
+  py::dict wrapper;
+  wrapper["value"] = attributes[name.c_str()];
+  int32_t parsed_count = node_count;
+  return required_matrix(wrapper, "value", parsed_count);
+}
+
+std::vector<ResourceSpec> parse_resource_algebra(const py::dict &data,
+                                                 int32_t node_count) {
+  std::vector<ResourceSpec> result;
+  if (!data.contains("resources"))
+    return result;
+  const py::list rows = data["resources"].cast<py::list>();
+  result.reserve(rows.size());
+  for (py::handle item : rows) {
+    const py::dict row = py::reinterpret_borrow<py::dict>(item);
+    ResourceSpec spec;
+    if (!row.contains("name") || !row.contains("operator"))
+      throw std::invalid_argument(
+          "resource row requires 'name' and 'operator'");
+    spec.name = row["name"].cast<std::string>();
+    const std::string op = row["operator"].cast<std::string>();
+    if (op != "affine_accumulator")
+      throw std::invalid_argument("unknown resource operator: " + op);
+    spec.op = ResourceOperator::AFFINE_ACCUMULATOR;
+    spec.state_dim = value_or<int32_t>(row, "state_dim", 1);
+    const std::string direction =
+        value_or<std::string>(row, "direction", "forward");
+    spec.direction = direction == "forward"
+                         ? ResourceDirection::FORWARD
+                         : direction == "backward"
+                               ? ResourceDirection::BACKWARD
+                               : direction == "bidirectional"
+                                     ? ResourceDirection::BIDIRECTIONAL
+                                     : throw std::invalid_argument(
+                                           "unknown resource direction: " +
+                                           direction);
+    const std::string scope = value_or<std::string>(row, "scope", "route");
+    spec.scope = scope == "route"
+                     ? ResourceScope::ROUTE
+                     : scope == "tour"
+                           ? ResourceScope::TOUR
+                           : scope == "solution"
+                                 ? ResourceScope::SOLUTION
+                                 : throw std::invalid_argument(
+                                       "unknown resource scope: " + scope);
+    if (row.contains("initial"))
+      spec.initial = algebra_scalar(data, row["initial"], "initial");
+    if (row.contains("scale"))
+      spec.scale = algebra_scalar(data, row["scale"], "scale");
+    if (row.contains("increment")) {
+      const py::dict increment = row["increment"].cast<py::dict>();
+      const float coefficient = value_or<float>(increment, "coefficient", 1.0f);
+      if (increment.contains("edge_attribute")) {
+        spec.edge_coefficient = coefficient;
+        const std::string attribute =
+            increment["edge_attribute"].cast<std::string>();
+        if (attribute == "distance")
+          spec.edge_uses_distance = true;
+        else
+          spec.edge_values =
+              algebra_edge_attribute(data, attribute, node_count);
+      }
+      if (increment.contains("node_attribute")) {
+        spec.node_coefficient = coefficient;
+        spec.node_values = algebra_node_attribute(
+            data, increment["node_attribute"].cast<std::string>(), node_count);
+      }
+    }
+    if (row.contains("reset")) {
+      const py::dict reset = row["reset"].cast<py::dict>();
+      spec.reset_value = reset.contains("value")
+                             ? algebra_scalar(data, reset["value"], "reset.value")
+                             : spec.initial;
+      spec.reset_at_depot = value_or<bool>(reset, "at_depot", false);
+      if (reset.contains("node_attribute")) {
+        const std::vector<float> flags = algebra_node_attribute(
+            data, reset["node_attribute"].cast<std::string>(), node_count);
+        spec.reset_nodes.resize(node_count);
+        std::transform(flags.begin(), flags.end(), spec.reset_nodes.begin(),
+                       [](float value) { return value > 0.5f ? 1 : 0; });
+      }
+    }
+    if (row.contains("bounds")) {
+      const py::list bounds = row["bounds"].cast<py::list>();
+      if (bounds.size() != 1)
+        throw std::invalid_argument(
+            "resource algebra v1 requires exactly one bound row");
+      const py::dict bound = py::reinterpret_borrow<py::dict>(bounds[0]);
+      if (bound.contains("lower"))
+        spec.lower = algebra_scalar(data, bound["lower"], "bound.lower");
+      if (bound.contains("upper"))
+        spec.upper = algebra_scalar(data, bound["upper"], "bound.upper");
+      const std::string check =
+          value_or<std::string>(bound, "check", "transition");
+      spec.bound_check = check == "transition"
+                             ? BoundCheck::TRANSITION
+                             : check == "route_end"
+                                   ? BoundCheck::ROUTE_END
+                                   : check == "solution_end"
+                                         ? BoundCheck::SOLUTION_END
+                                         : throw std::invalid_argument(
+                                               "unknown resource bound phase: " +
+                                               check);
+    }
+    result.push_back(std::move(spec));
+  }
+  return result;
+}
+
 void set_pickup_delivery_relations(Problem &problem, const py::dict &data) {
   problem.delivery_of_pickup.assign(problem.node_count, -1);
   problem.pickup_of_delivery.assign(problem.node_count, -1);
@@ -294,6 +454,7 @@ Problem parse_problem(const py::dict &data) {
   problem.service_time =
       optional_vector(data, "service_time", problem.node_count, 0.0f);
   set_pickup_delivery_relations(problem, data);
+  problem.resources = parse_resource_algebra(data, problem.node_count);
   return problem;
 }
 
@@ -307,13 +468,15 @@ CandidateConfig parse_candidate_config(const py::dict &data) {
 #define CONFIG_FLOAT(field)                                                    \
   config.field = value_or<float>(data, #field, config.field)
   CONFIG_INT(max_candidates);
-  CONFIG_INT(geometric_quota);
-  CONFIG_INT(time_window_quota);
-  CONFIG_INT(capacity_quota);
-  CONFIG_INT(backhaul_quota);
-  CONFIG_INT(pickup_delivery_quota);
-  CONFIG_INT(route_limit_quota);
-  CONFIG_INT(prize_quota);
+  if (data.contains("candidate_mode")) {
+    const std::string mode = data["candidate_mode"].cast<std::string>();
+    if (mode == "schema")
+      config.candidate_mode = prism::CandidateMode::SCHEMA;
+    else if (mode == "geometric")
+      config.candidate_mode = prism::CandidateMode::GEOMETRIC;
+    else
+      throw std::invalid_argument("unknown candidate_mode: " + mode);
+  }
   CONFIG_FLOAT(gamma_unit);
   CONFIG_FLOAT(gamma_wait);
   CONFIG_FLOAT(gamma_time_warp);
@@ -381,7 +544,9 @@ void parse_guidance(py::object edge_field, py::object edge_additive,
                     py::object multipliers,
                     py::object coupler_weights, py::object coupler_bias,
                     py::object edge_risk,
-                    int32_t edge_count, bool classical_behavior,
+                    int32_t edge_count, int32_t resource_count,
+                    int32_t multiplier_count, int32_t live_state_count,
+                    bool classical_behavior,
                     py::array_t<float> &field_storage,
                     py::array_t<float> &additive_storage,
                     py::array_t<float> &multiplier_storage,
@@ -418,9 +583,9 @@ void parse_guidance(py::object edge_field, py::object edge_additive,
       py::array_t<float, py::array::c_style | py::array::forcecast>>();
   const py::buffer_info field_buffer = field_storage.request();
   if (field_buffer.ndim != 2 || field_buffer.shape[0] != edge_count ||
-      field_buffer.shape[1] != prism::FIELD_CHANNEL_COUNT) {
+      field_buffer.shape[1] != resource_count) {
     throw std::invalid_argument(
-        "edge_field must have shape (edge_count, FIELD_CHANNEL_COUNT)");
+        "edge_field must have shape (edge_count, resource_count)");
   }
   field_values = static_cast<const float *>(field_buffer.ptr);
   if (!edge_additive.is_none()) {
@@ -429,9 +594,9 @@ void parse_guidance(py::object edge_field, py::object edge_additive,
     const py::buffer_info additive_buffer = additive_storage.request();
     if (additive_buffer.ndim != 2 ||
         additive_buffer.shape[0] != edge_count ||
-        additive_buffer.shape[1] != prism::FIELD_CHANNEL_COUNT) {
+        additive_buffer.shape[1] != resource_count) {
       throw std::invalid_argument(
-          "edge_additive must have shape (edge_count, FIELD_CHANNEL_COUNT)");
+          "edge_additive must have shape (edge_count, resource_count)");
     }
     additive_values = static_cast<const float *>(additive_buffer.ptr);
   }
@@ -440,9 +605,9 @@ void parse_guidance(py::object edge_field, py::object edge_additive,
         py::array_t<float, py::array::c_style | py::array::forcecast>>();
     const py::buffer_info multiplier_buffer = multiplier_storage.request();
     if (multiplier_buffer.ndim != 1 ||
-        multiplier_buffer.shape[0] != prism::MULTIPLIER_COUNT) {
+        multiplier_buffer.shape[0] != multiplier_count) {
       throw std::invalid_argument(
-          "multipliers must have shape (MULTIPLIER_COUNT,)");
+          "multipliers must have shape (multiplier_count,)");
     }
     multiplier_values = static_cast<const float *>(multiplier_buffer.ptr);
   }
@@ -450,11 +615,11 @@ void parse_guidance(py::object edge_field, py::object edge_additive,
     coupler_weight_storage = coupler_weights.cast<
         py::array_t<float, py::array::c_style | py::array::forcecast>>();
     const py::buffer_info buffer = coupler_weight_storage.request();
-    if (buffer.ndim != 2 || buffer.shape[0] != prism::MULTIPLIER_COUNT ||
-        buffer.shape[1] != prism::LIVE_STATE_FEATURE_COUNT) {
+    if (buffer.ndim != 2 || buffer.shape[0] != multiplier_count ||
+        buffer.shape[1] != live_state_count) {
       throw std::invalid_argument(
-          "coupler_weights must have shape (MULTIPLIER_COUNT, "
-          "LIVE_STATE_FEATURE_COUNT)");
+          "coupler_weights must have shape (multiplier_count, "
+          "live_state_count)");
     }
     coupler_weight_values = static_cast<const float *>(buffer.ptr);
   }
@@ -462,9 +627,9 @@ void parse_guidance(py::object edge_field, py::object edge_additive,
     coupler_bias_storage = coupler_bias.cast<
         py::array_t<float, py::array::c_style | py::array::forcecast>>();
     const py::buffer_info buffer = coupler_bias_storage.request();
-    if (buffer.ndim != 1 || buffer.shape[0] != prism::MULTIPLIER_COUNT) {
+    if (buffer.ndim != 1 || buffer.shape[0] != multiplier_count) {
       throw std::invalid_argument(
-          "coupler_bias must have shape (MULTIPLIER_COUNT,)");
+          "coupler_bias must have shape (multiplier_count,)");
     }
     coupler_bias_values = static_cast<const float *>(buffer.ptr);
   }
@@ -480,7 +645,7 @@ void parse_guidance(py::object edge_field, py::object edge_additive,
   }
 }
 
-py::dict trace_to_dict(const DecisionTrace &trace) {
+py::dict trace_to_dict(const DecisionTrace &trace, int32_t resource_count) {
   py::dict result;
   result["starts"] = vector_copy<int32_t>(
       trace.starts, {static_cast<py::ssize_t>(trace.starts.size())});
@@ -504,7 +669,7 @@ py::dict trace_to_dict(const DecisionTrace &trace) {
   result["live_state"] = vector_copy<float>(
       trace.live_state,
       {static_cast<py::ssize_t>(trace.current_nodes.size()),
-       prism::LIVE_STATE_FEATURE_COUNT});
+       resource_count});
   result["feasibility_edges"] = vector_copy<int32_t>(
       trace.feasibility_edges,
       {static_cast<py::ssize_t>(trace.feasibility_edges.size())});
@@ -558,6 +723,8 @@ public:
     const float *risk_values;
     parse_guidance(edge_field, edge_additive, multipliers, coupler_weights,
                    coupler_bias, edge_risk, solver_.edge_count(),
+                   solver_.resource_count(), solver_.multiplier_count(),
+                   solver_.live_state_feature_count(),
                    solver_.search_config().classical_behavior, field_storage,
                    additive_storage, multiplier_storage,
                    coupler_weight_storage, coupler_bias_storage, risk_storage,
@@ -598,6 +765,8 @@ public:
     const float *risk_values;
     parse_guidance(edge_field, edge_additive, multipliers, coupler_weights,
                    coupler_bias, edge_risk, solver_.edge_count(),
+                   solver_.resource_count(), solver_.multiplier_count(),
+                   solver_.live_state_feature_count(),
                    solver_.search_config().classical_behavior, field_storage,
                    additive_storage, multiplier_storage,
                    coupler_weight_storage, coupler_bias_storage, risk_storage,
@@ -620,7 +789,7 @@ public:
           solution_to_dict(solution, solver_.problem().objective));
     py::dict result;
     result["solutions"] = std::move(serialized);
-    result["trace"] = trace_to_dict(trace);
+    result["trace"] = trace_to_dict(trace, solver_.resource_count());
     result["graph_version"] = solver_.graph_version();
     return result;
   }
@@ -643,6 +812,8 @@ public:
     const float *risk_values;
     parse_guidance(edge_field, edge_additive, multipliers, coupler_weights,
                    coupler_bias, edge_risk, solver_.edge_count(),
+                   solver_.resource_count(), solver_.multiplier_count(),
+                   solver_.live_state_feature_count(),
                    solver_.search_config().classical_behavior, field_storage,
                    additive_storage, multiplier_storage,
                    coupler_weight_storage, coupler_bias_storage, risk_storage,
@@ -679,6 +850,8 @@ public:
     const float *risk_values;
     parse_guidance(edge_field, edge_additive, multipliers, coupler_weights,
                    coupler_bias, edge_risk, solver_.edge_count(),
+                   solver_.resource_count(), solver_.multiplier_count(),
+                   solver_.live_state_feature_count(),
                    solver_.search_config().classical_behavior, field_storage,
                    additive_storage, multiplier_storage,
                    coupler_weight_storage, coupler_bias_storage, risk_storage,
@@ -721,9 +894,9 @@ public:
         std::vector<int32_t>(values, values + buffer.shape[0]));
     py::dict result;
     result["violation"] = vector_copy<float>(
-        evaluation.violation, {prism::FIELD_CHANNEL_COUNT});
+        evaluation.violation, {solver_.resource_count()});
     result["binding"] =
-        vector_copy<float>(evaluation.binding, {prism::FIELD_CHANNEL_COUNT});
+        vector_copy<float>(evaluation.binding, {solver_.resource_count()});
     result["structurally_valid"] = evaluation.structurally_valid;
     result["error"] = evaluation.error;
     return result;
@@ -768,16 +941,20 @@ public:
           std::max(maximum_degree, offsets[node] - offsets[node - 1]);
     }
     result["maximum_degree"] = maximum_degree;
-    py::dict quotas;
     const CandidateConfig &config = solver_.candidate_config();
-    quotas["geometric"] = config.geometric_quota;
-    quotas["time_window"] = config.time_window_quota;
-    quotas["capacity"] = config.capacity_quota;
-    quotas["backhaul"] = config.backhaul_quota;
-    quotas["pickup_delivery"] = config.pickup_delivery_quota;
-    quotas["route_limit"] = config.route_limit_quota;
-    quotas["prize"] = config.prize_quota;
-    result["candidate_quotas"] = quotas;
+    bool any_active_resource = false;
+    for (const auto &spec : solver_.resources())
+      any_active_resource |= spec.active;
+    result["candidate_strategy"] =
+        config.candidate_mode == prism::CandidateMode::GEOMETRIC ||
+                !any_active_resource
+            ? "distance"
+            : solver_.candidate_resource_quotas().empty()
+                  ? "uniform_schema"
+                  : "typed_resource_quota";
+    result["candidate_resource_quotas"] = vector_copy<float>(
+        solver_.candidate_resource_quotas(),
+        {static_cast<py::ssize_t>(solver_.candidate_resource_quotas().size())});
     py::dict weights;
     weights["unit"] = config.gamma_unit;
     weights["wait"] = config.gamma_wait;
@@ -790,18 +967,26 @@ public:
     result["proximity_weights"] = weights;
     result["candidate_feature_names"] = prism::candidate_feature_names();
     result["field_channel_names"] = prism::field_channel_names();
+    py::list resource_rows;
+    for (const ResourceSpec &resource : solver_.resources()) {
+      py::dict row;
+      row["name"] = resource.name;
+      row["active"] = resource.active;
+      row["state_dim"] = resource.state_dim;
+      row["legacy"] = resource.is_legacy();
+      resource_rows.append(std::move(row));
+    }
+    result["resources"] = std::move(resource_rows);
+    result["resource_count"] = solver_.resource_count();
+    result["multiplier_count"] = solver_.multiplier_count();
+    result["resource_descriptor_version"] = "resource_descriptor_v1";
     result["node_feature_names"] = prism::node_feature_names();
-    const std::vector<uint8_t> active_channels = {
-        static_cast<uint8_t>(problem.has(CAPACITY)),
-        static_cast<uint8_t>(problem.has(TIME_WINDOWS)),
-        static_cast<uint8_t>(problem.has(ROUTE_LIMIT)),
-        static_cast<uint8_t>(problem.has(TOUR_LIMIT)),
-        static_cast<uint8_t>(problem.has(BACKHAUL_ORDER)),
-        static_cast<uint8_t>(problem.has(PICKUP_DELIVERY)),
-        static_cast<uint8_t>(problem.has(PRIZE_QUOTA)),
-    };
+    std::vector<uint8_t> active_channels;
+    active_channels.reserve(solver_.resource_count());
+    for (const ResourceSpec &resource : solver_.resources())
+      active_channels.push_back(static_cast<uint8_t>(resource.active));
     result["field_channel_mask"] = vector_copy<uint8_t>(
-        active_channels, {prism::FIELD_CHANNEL_COUNT});
+        active_channels, {solver_.resource_count()});
     const SearchConfig &search = solver_.search_config();
     py::dict search_values;
     search_values["min_changed_edges"] = search.min_changed_edges;
@@ -842,24 +1027,36 @@ public:
   py::array_t<float> incumbent_live_state() const {
     return vector_copy<float>(
         solver_.incumbent_live_state(),
-        {solver_.problem().node_count, prism::LIVE_STATE_FEATURE_COUNT});
+        {solver_.problem().node_count, solver_.live_state_feature_count()});
   }
 
   py::array_t<float> resource_features() const {
     return vector_copy<float>(
         solver_.resource_features(),
-        {solver_.edge_count(), prism::FIELD_CHANNEL_COUNT});
+        {solver_.edge_count(), solver_.resource_count()});
   }
 
   py::array_t<float> resource_pressure() const {
     return vector_copy<float>(
         solver_.resource_pressure(),
-        {solver_.edge_count(), prism::FIELD_CHANNEL_COUNT});
+        {solver_.edge_count(), solver_.resource_count()});
+  }
+
+  py::array_t<float> resource_events() const {
+    return vector_copy<float>(
+        solver_.resource_events(),
+        {solver_.edge_count(), solver_.resource_count()});
   }
 
   py::array_t<float> resource_scales() const {
     return vector_copy<float>(solver_.resource_scales(),
-                              {prism::FIELD_CHANNEL_COUNT});
+                              {solver_.resource_count()});
+  }
+
+  py::array_t<float> resource_descriptors() const {
+    return vector_copy<float>(
+        solver_.resource_descriptors(),
+        {solver_.resource_count(), prism::RESOURCE_DESCRIPTOR_DIM});
   }
 
   py::array_t<float> objective_edge_costs() const {
@@ -902,6 +1099,16 @@ public:
     const int32_t *values = static_cast<const int32_t *>(buffer.ptr);
     solver_.set_incumbent(
         std::vector<int32_t>(values, values + buffer.shape[0]));
+  }
+
+  void set_candidate_resource_quotas(
+      py::array_t<float, py::array::c_style | py::array::forcecast> quotas) {
+    const py::buffer_info buffer = quotas.request();
+    if (buffer.ndim != 1)
+      throw std::invalid_argument("candidate resource quotas must be one-dimensional");
+    const float *values = static_cast<const float *>(buffer.ptr);
+    solver_.set_candidate_resource_quotas(
+        std::vector<float>(values, values + buffer.shape[0]));
   }
 
 private:
@@ -966,6 +1173,8 @@ PYBIND11_MODULE(prism_decoder, module) {
       .def("evaluate_resources", &PyDecoder::evaluate_resources,
            py::arg("route"))
       .def("set_incumbent", &PyDecoder::set_incumbent, py::arg("route"))
+      .def("set_candidate_resource_quotas",
+           &PyDecoder::set_candidate_resource_quotas, py::arg("quotas"))
       .def("mask", &PyDecoder::mask, py::arg("prefix"))
       .def_property_readonly("metadata", &PyDecoder::metadata)
       .def_property_readonly("heuristic", &PyDecoder::heuristic)
@@ -978,7 +1187,10 @@ PYBIND11_MODULE(prism_decoder, module) {
                              &PyDecoder::resource_features)
       .def_property_readonly("resource_pressure",
                              &PyDecoder::resource_pressure)
+      .def_property_readonly("resource_events", &PyDecoder::resource_events)
       .def_property_readonly("resource_scales", &PyDecoder::resource_scales)
+      .def_property_readonly("resource_descriptors",
+                             &PyDecoder::resource_descriptors)
       .def_property_readonly("objective_edge_costs",
                              &PyDecoder::objective_edge_costs)
       .def_property_readonly("edge_offsets", &PyDecoder::edge_offsets)
@@ -993,4 +1205,5 @@ PYBIND11_MODULE(prism_decoder, module) {
   module.attr("FIELD_CHANNEL_COUNT") = prism::FIELD_CHANNEL_COUNT;
   module.attr("LIVE_STATE_FEATURE_COUNT") = prism::LIVE_STATE_FEATURE_COUNT;
   module.attr("MULTIPLIER_COUNT") = prism::MULTIPLIER_COUNT;
+  module.attr("RESOURCE_DESCRIPTOR_DIM") = prism::RESOURCE_DESCRIPTOR_DIM;
 }
