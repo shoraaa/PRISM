@@ -194,7 +194,18 @@ def test_candidate_graph_keeps_required_depot_overlay() -> None:
 
 @pytest.mark.parametrize(
     "variant",
-    ["cvrp", "cvrpb", "cvrpl", "cvrptw", "cvrpbltw", "pctsp"],
+    [
+        "cvrp",
+        "cvrpb",
+        "cvrpl",
+        "cvrptw",
+        "cvrpbltw",
+        "cvrpbp",
+        "mdcvrptw",
+        "pdtsp",
+        "pdcvrp",
+        "pctsp",
+    ],
 )
 def test_incremental_screening_resources_match_full_evaluation_and_search(
     variant: str,
@@ -226,7 +237,15 @@ def test_incremental_screening_resources_match_full_evaluation_and_search(
             solution["srr_incremental_rebuilds"]
             for solution in traced["solutions"]
         ) > 0
-    if variant in {"cvrpl", "cvrptw"}:
+    if variant in {
+        "cvrpl",
+        "cvrptw",
+        "cvrpbltw",
+        "cvrpbp",
+        "mdcvrptw",
+        "pdtsp",
+        "pdcvrp",
+    }:
         assert sum(
             solution["srr_certified_evaluations"]
             for solution in traced["solutions"]

@@ -31,6 +31,8 @@ struct SequenceSummary {
   double load_delta = 0.0;
   double min_load_delta = 0.0;
   double max_load_delta = 0.0;
+  double positive_load = 0.0;
+  double negative_load = 0.0;
   double duration = 0.0;
   double time_warp = 0.0;
   double earliest = 0.0;
@@ -51,6 +53,10 @@ SequenceSummary node_summary(const Problem &problem, int32_t node) {
   result.load_delta = -problem.demand[node];
   result.min_load_delta = std::min(0.0, result.load_delta);
   result.max_load_delta = std::max(0.0, result.load_delta);
+  result.positive_load = std::max(static_cast<double>(problem.demand[node]),
+                                  0.0);
+  result.negative_load =
+      std::max(-static_cast<double>(problem.demand[node]), 0.0);
   result.duration = problem.service_time[node];
   result.earliest = std::max(static_cast<double>(problem.tw_start[node]),
                              -SEQUENCE_INFINITY);
@@ -82,6 +88,8 @@ SequenceSummary concatenate(const Problem &problem,
       std::min(lhs.min_load_delta, lhs.load_delta + rhs.min_load_delta);
   result.max_load_delta =
       std::max(lhs.max_load_delta, lhs.load_delta + rhs.max_load_delta);
+  result.positive_load = lhs.positive_load + rhs.positive_load;
+  result.negative_load = lhs.negative_load + rhs.negative_load;
 
   const double delta = lhs.duration - lhs.time_warp + travel;
   const double wait = std::max(rhs.earliest - delta - lhs.latest, 0.0);
@@ -2909,6 +2917,7 @@ Solution RoutingDecoder::scope_restricted_refine(
     double tour_excess = 0.0;
     double route_ratio = 0.0;
     double tour_ratio = 0.0;
+    double pickup_binding = 0.0;
     double prize = 0.0;
     int32_t backhaul_count = 0;
   };
@@ -2972,6 +2981,12 @@ Solution RoutingDecoder::scope_restricted_refine(
       static_cast<int32_t>(FieldChannel::TOUR_LIMIT));
   const double quota_scale = resource_scale(
       static_cast<int32_t>(FieldChannel::PRIZE_QUOTA));
+  const double pickup_scale = std::max(
+      static_cast<double>(std::count_if(
+          problem_.delivery_of_pickup.begin() + problem_.depot_count,
+          problem_.delivery_of_pickup.end(),
+          [](int32_t delivery) { return delivery >= 0; })),
+      1.0);
   struct TimeWindowMetrics {
     double time_warp = 0.0;
     double time_binding = 0.0;
@@ -3043,11 +3058,9 @@ Solution RoutingDecoder::scope_restricted_refine(
         std::max({-(initial_load + sequence.min_load_delta),
                   initial_load + sequence.max_load_delta - problem_.capacity,
                   0.0});
-    const double positive_load = std::max(-sequence.min_load_delta, 0.0);
-    const double negative_load = std::max(
-        sequence.load_delta - sequence.min_load_delta, 0.0);
     result.capacity_binding =
-        std::max(positive_load, negative_load) / capacity_scale;
+        std::max(sequence.positive_load, sequence.negative_load) /
+        capacity_scale;
 
     const double distance = route_distance(depot, sequence);
     const double tour = route_distance(depot, sequence, true);
@@ -3063,8 +3076,8 @@ Solution RoutingDecoder::scope_restricted_refine(
         problem_.has(TOUR_LIMIT) ? tour / tour_scale : 0.0;
     result.prize = sequence.prize;
     result.backhaul_count = sequence.has_backhaul ? 1 : 0;
-    result.exact = !problem_.has(PICKUP_DELIVERY) &&
-                   !sequence.backhaul_violation;
+    result.exact =
+        !problem_.has(BACKHAUL_ORDER) || !sequence.backhaul_violation;
     return result;
   };
 
@@ -3074,6 +3087,7 @@ Solution RoutingDecoder::scope_restricted_refine(
     TIME_BINDING_RANK,
     ROUTE_RATIO_RANK,
     TOUR_RATIO_RANK,
+    PICKUP_BINDING_RANK,
     ROUTE_RANK_COUNT,
   };
   struct RankedRoute {
@@ -3154,10 +3168,12 @@ Solution RoutingDecoder::scope_restricted_refine(
         const int32_t node = route.sequence.nodes[local];
         node_route[node] = route_id;
         node_local[node] = local;
-        if (problem_.delivery_of_pickup[node] >= 0)
-          ++open;
-        if (problem_.pickup_of_delivery[node] >= 0)
-          --open;
+        if (local > 0) {
+          if (problem_.delivery_of_pickup[node] >= 0)
+            ++open;
+          if (problem_.pickup_of_delivery[node] >= 0)
+            --open;
+        }
         route.open_pickups.push_back(open);
       }
       cached_routes.push_back(std::move(route));
@@ -3263,6 +3279,13 @@ Solution RoutingDecoder::scope_restricted_refine(
           {resource.route_ratio, route_id, version});
       ranked_routes[TOUR_RATIO_RANK].push(
           {resource.tour_ratio, route_id, version});
+      if (problem_.has(PICKUP_DELIVERY)) {
+        const int32_t max_open = *std::max_element(
+            route.open_pickups.begin(), route.open_pickups.end());
+        route.resources.pickup_binding = max_open / pickup_scale;
+        ranked_routes[PICKUP_BINDING_RANK].push(
+            {route.resources.pickup_binding, route_id, version});
+      }
       total_route_excess += resource.route_excess;
       total_tour_excess += resource.tour_excess;
       total_time_warp += resource.time_warp;
@@ -3319,6 +3342,67 @@ Solution RoutingDecoder::scope_restricted_refine(
         }
       }
     });
+  };
+  std::vector<int32_t> pickup_seen(problem_.node_count, 0);
+  int32_t pickup_epoch = 0;
+  struct PickupMetrics {
+    int32_t violations = 0;
+    int32_t max_open = 0;
+  };
+  const auto planned_pickup_metrics = [&](const PlannedRoute &plan) {
+    PickupMetrics result;
+    if (!problem_.has(PICKUP_DELIVERY))
+      return result;
+    if (pickup_epoch == std::numeric_limits<int32_t>::max()) {
+      std::fill(pickup_seen.begin(), pickup_seen.end(), 0);
+      pickup_epoch = 1;
+    } else {
+      ++pickup_epoch;
+    }
+    int32_t open = 0;
+    bool first = true;
+    const auto visit = [&](int32_t node) {
+      const int32_t delivery = problem_.delivery_of_pickup[node];
+      const int32_t pickup = problem_.pickup_of_delivery[node];
+      // Depot-free evaluation treats the first route token as the already
+      // visited start node: its pickup identity is visible to later deliveries,
+      // but it does not itself change the open-pair counters.
+      if (first && plan.depot < 0) {
+        if (delivery >= 0)
+          pickup_seen[node] = pickup_epoch;
+        first = false;
+        return;
+      }
+      first = false;
+      if (delivery >= 0) {
+        pickup_seen[node] = pickup_epoch;
+        ++open;
+      }
+      if (pickup >= 0) {
+        if (pickup_seen[pickup] != pickup_epoch)
+          ++result.violations;
+        if (open > 0)
+          --open;
+      }
+      result.max_open = std::max(result.max_open, open);
+    };
+    for (const SequencePiece &piece : plan.pieces) {
+      if (piece.singleton >= 0) {
+        visit(piece.singleton);
+        continue;
+      }
+      const std::vector<int32_t> &source =
+          cached_routes[piece.route].sequence.nodes;
+      if (!piece.reverse) {
+        for (int32_t local = piece.begin; local < piece.end; ++local)
+          visit(source[local]);
+      } else {
+        for (int32_t local = piece.end - 1; local >= piece.begin; --local)
+          visit(source[local]);
+      }
+    }
+    result.violations += open;
+    return result;
   };
   const auto guided_piece = [&](const SequencePiece &piece) {
     GuidedSequence result;
@@ -3420,18 +3504,16 @@ Solution RoutingDecoder::scope_restricted_refine(
   rebuild_cache();
   rebuild_resource_cache();
   static constexpr size_t MAX_SCREENING_LABELS = 512;
-  // Planned summaries exactly certify the single-depot capacity, time-window,
-  // route/tour-limit, and prize paths. Custom algebra rows are replayed below
-  // without rebuilding the legacy evaluator state. Multi-depot routes,
-  // pickup-delivery precedence, and globally ordered backhauls retain full
-  // replay because their state crosses independently planned route pieces.
+  // Planned summaries exactly certify capacity, time-window, route/tour-limit,
+  // prize, and depot assignment for customer-only route edits. Custom algebra
+  // rows are replayed below without rebuilding the legacy evaluator state.
   const bool has_negative_demand = std::any_of(
       problem_.demand.begin() + problem_.depot_count,
       problem_.demand.end(),
       [](float demand) { return demand < -FEASIBILITY_EPS; });
-  const bool planned_commit_certificate =
-      problem_.depot_count <= 1 && !problem_.has(PICKUP_DELIVERY) &&
-      !problem_.has(BACKHAUL_ORDER) && !has_negative_demand;
+  const bool needs_load_partition_certificate =
+      problem_.has(CAPACITY) && has_negative_demand;
+  const bool planned_commit_certificate = true;
   std::vector<int32_t> structure_seen(problem_.node_count, 0);
   int32_t structure_epoch = 0;
   const auto route_structure_certificate =
@@ -3552,6 +3634,43 @@ Solution RoutingDecoder::scope_restricted_refine(
         }
         return true;
       };
+  const auto load_partition_certificate = [&]
+      (const std::vector<PlannedRoute> &plans,
+       const std::vector<SequenceSummary> &sequences) {
+        if (!needs_load_partition_certificate)
+          return true;
+        if (plans.size() != sequences.size())
+          return false;
+        bool backhaul_only_suffix = false;
+        int32_t visited_routes = 0;
+        for (int32_t route = route_head; route >= 0;
+             route = cached_routes[route].next) {
+          if (route >= static_cast<int32_t>(cached_routes.size()) ||
+              !cached_routes[route].active)
+            return false;
+          const SequenceSummary *sequence = &cached_routes[route].summary;
+          for (size_t index = 0; index < plans.size(); ++index) {
+            if (plans[index].slot == route) {
+              sequence = &sequences[index];
+              break;
+            }
+          }
+          if (sequence->empty)
+            return false;
+          // The evaluator reloads capacity while any positive-demand customer
+          // remains globally. Therefore negative-only routes form one suffix;
+          // inside that suffix they start empty, and before it routes start at
+          // capacity exactly as route_resource_metrics() assumes.
+          if (backhaul_only_suffix && sequence->has_linehaul)
+            return false;
+          if (sequence->has_backhaul && !sequence->has_linehaul)
+            backhaul_only_suffix = true;
+          ++visited_routes;
+          if (visited_routes > static_cast<int32_t>(cached_routes.size()))
+            return false;
+        }
+        return visited_routes > 0;
+      };
   ResourceEvaluation current_resource;
   if (trace != nullptr)
     current_resource = evaluate_resources(solution.route);
@@ -3633,12 +3752,10 @@ Solution RoutingDecoder::scope_restricted_refine(
       -> std::optional<ResourceEvaluation> {
     if (plans.size() != sequences.size())
       return std::nullopt;
-    // Pickup-delivery binding tracks maximum open pairs and does not yet have
-    // an exact fixed-size concatenation summary. Time-window labels are handled
-    // below by scanning only the affected route pieces, preserving the legacy
-    // summed-lateness and minimum-slack definitions exactly.
-    if (problem_.has(PICKUP_DELIVERY))
+    if (!load_partition_certificate(plans, sequences))
       return std::nullopt;
+    // Time-window and pickup-delivery labels scan only the affected planned
+    // route pieces, preserving summed lateness and pair-identity semantics.
     std::array<int32_t, 2> affected{-1, -1};
     int32_t affected_count = 0;
     for (int32_t route : affected_routes) {
@@ -3680,6 +3797,12 @@ Solution RoutingDecoder::scope_restricted_refine(
         ROUTE_RATIO_RANK, affected, affected_count, 0.0);
     double max_tour_ratio = unaffected_rank(
         TOUR_RATIO_RANK, affected, affected_count, 0.0);
+    double max_pickup_binding =
+        problem_.has(PICKUP_DELIVERY)
+            ? unaffected_rank(PICKUP_BINDING_RANK, affected, affected_count,
+                              0.0)
+            : 0.0;
+    int32_t pickup_violations = 0;
 
     for (size_t index = 0; index < plans.size(); ++index) {
       const PlannedRoute &plan = plans[index];
@@ -3700,6 +3823,13 @@ Solution RoutingDecoder::scope_restricted_refine(
       time_binding = std::max(time_binding, resource.time_binding);
       max_route_ratio = std::max(max_route_ratio, resource.route_ratio);
       max_tour_ratio = std::max(max_tour_ratio, resource.tour_ratio);
+      if (problem_.has(PICKUP_DELIVERY)) {
+        const PickupMetrics pickup = planned_pickup_metrics(plan);
+        pickup_violations += pickup.violations;
+        max_pickup_binding = std::max(
+            max_pickup_binding,
+            static_cast<double>(pickup.max_open) / pickup_scale);
+      }
       route_excess += resource.route_excess;
       tour_excess += resource.tour_excess;
       time_warp += resource.time_warp;
@@ -3719,7 +3849,8 @@ Solution RoutingDecoder::scope_restricted_refine(
     result.violation[static_cast<int32_t>(FieldChannel::TOUR_LIMIT)] =
         static_cast<float>(tour_excess / tour_scale);
     result.violation[static_cast<int32_t>(FieldChannel::BACKHAUL_ORDER)] = 0.0f;
-    result.violation[static_cast<int32_t>(FieldChannel::PICKUP_DELIVERY)] = 0.0f;
+    result.violation[static_cast<int32_t>(FieldChannel::PICKUP_DELIVERY)] =
+        static_cast<float>(pickup_violations / pickup_scale);
     result.violation[static_cast<int32_t>(FieldChannel::PRIZE_QUOTA)] =
         static_cast<float>(
             std::max(problem_.prize_quota - prize, 0.0) / quota_scale);
@@ -3734,7 +3865,8 @@ Solution RoutingDecoder::scope_restricted_refine(
         static_cast<float>(std::clamp(max_tour_ratio, 0.0, 1.0));
     result.binding[static_cast<int32_t>(FieldChannel::BACKHAUL_ORDER)] =
         backhauls > 0 ? 1.0f : 0.0f;
-    result.binding[static_cast<int32_t>(FieldChannel::PICKUP_DELIVERY)] = 0.0f;
+    result.binding[static_cast<int32_t>(FieldChannel::PICKUP_DELIVERY)] =
+        static_cast<float>(std::clamp(max_pickup_binding, 0.0, 1.0));
     result.binding[static_cast<int32_t>(FieldChannel::PRIZE_QUOTA)] =
         problem_.has(PRIZE_QUOTA)
             ? static_cast<float>(std::clamp(prize / quota_scale, 0.0, 1.0))
@@ -3825,11 +3957,15 @@ Solution RoutingDecoder::scope_restricted_refine(
     int32_t open = 0;
     double positive_load = 0.0;
     double negative_load = 0.0;
-    for (int32_t node : route.sequence.nodes) {
-      if (problem_.delivery_of_pickup[node] >= 0)
-        ++open;
-      if (problem_.pickup_of_delivery[node] >= 0)
-        --open;
+    for (int32_t local = 0;
+         local < static_cast<int32_t>(route.sequence.nodes.size()); ++local) {
+      const int32_t node = route.sequence.nodes[local];
+      if (route.depot >= 0 || local > 0) {
+        if (problem_.delivery_of_pickup[node] >= 0)
+          ++open;
+        if (problem_.pickup_of_delivery[node] >= 0)
+          --open;
+      }
       route.open_pickups.push_back(open);
       positive_load +=
           std::max(static_cast<double>(problem_.demand[node]), 0.0);
@@ -3843,6 +3979,12 @@ Solution RoutingDecoder::scope_restricted_refine(
     route.resources.time_binding = time.time_binding;
     route.resources.capacity_binding =
         std::max(positive_load, negative_load) / capacity_scale;
+    if (problem_.has(PICKUP_DELIVERY)) {
+      const int32_t max_open =
+          *std::max_element(route.open_pickups.begin(),
+                            route.open_pickups.end());
+      route.resources.pickup_binding = max_open / pickup_scale;
+    }
     return route;
   };
   const auto build_incremental_route = [&](int32_t slot,
@@ -3881,6 +4023,8 @@ Solution RoutingDecoder::scope_restricted_refine(
       return resource.route_ratio;
     case TOUR_RATIO_RANK:
       return resource.tour_ratio;
+    case PICKUP_BINDING_RANK:
+      return resource.pickup_binding;
     case ROUTE_RANK_COUNT:
       break;
     }
@@ -4023,6 +4167,9 @@ Solution RoutingDecoder::scope_restricted_refine(
       total_backhauls += route.resources.backhaul_count;
       const uint64_t version = ++route_rank_versions[slot];
       for (int32_t rank = 0; rank < ROUTE_RANK_COUNT; ++rank) {
+        if (rank == PICKUP_BINDING_RANK &&
+            !problem_.has(PICKUP_DELIVERY))
+          continue;
         ranked_routes[rank].push(
             {rank_value(route.resources, static_cast<RouteRank>(rank)), slot,
              version});
@@ -4177,6 +4324,9 @@ Solution RoutingDecoder::scope_restricted_refine(
       total_backhauls += route.resources.backhaul_count;
       const uint64_t version = route_rank_versions[slot];
       for (int32_t rank = 0; rank < ROUTE_RANK_COUNT; ++rank) {
+        if (rank == PICKUP_BINDING_RANK &&
+            !problem_.has(PICKUP_DELIVERY))
+          continue;
         ranked_routes[rank].push(
             {rank_value(route.resources, static_cast<RouteRank>(rank)), slot,
              version});
@@ -4695,6 +4845,7 @@ Solution RoutingDecoder::scope_restricted_refine(
               planned_resource->structurally_valid &&
               route_structure_certificate(trial) &&
               runtime_resource_certificate(trial) &&
+              load_partition_certificate(plans, planned_sequences) &&
               planned_resources_feasible;
           Solution candidate;
           if (certificate_feasible) {
