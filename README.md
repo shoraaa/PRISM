@@ -209,6 +209,19 @@ Time-window cascading lateness and pickup-delivery open-pair maxima use exact
 route replay, preserving their full state-dependent semantics. Trace output
 reports both summary and replay evaluation counts.
 
+The default repair policy ports DyNACO's bounded local-search mechanics into
+this unified evaluator: it scans at most 32 ranked edges per affected node,
+accepts the first exact improving move, and uses don't-look bits until a changed
+local link reactivates the node. Its hot loop contains the same compact move
+families (relocate, swap, 2-opt-star, and intra-route 2-opt), while optional-node,
+depot-structure, and pickup-delivery moves remain enabled when their schema
+requires them. These are schema-independent scheduling rules, not a
+CVRP-specialized move evaluator. Every tentatively accepted move is still
+replayed by the same exact constraint and runtime-resource algebra before it can
+replace the incumbent. `srr_candidate_limit`, `srr_first_improvement`,
+`srr_dont_look`, and `srr_extended_operators` expose the policy and permit an
+exhaustive legacy ablation.
+
 Accepted plans replace only the affected route caches. Edge membership uses
 reference counts, resource extrema use versioned heaps, and the repair scope is
 derived from changed local links. Stable route slots allow depot split, merge,

@@ -69,6 +69,33 @@ def test_cvrp_uses_same_perturbation_backend() -> None:
     assert refined["srr_moves"] > 0
 
 
+def test_dynaco_policy_bounds_generic_srr_work() -> None:
+    problem = generated_problem("cvrp", 60, 77)
+
+    def refine(search_config: dict) -> dict:
+        solver = prism_decoder.Decoder(
+            problem, search_config=search_config, n_rollouts=4
+        )
+        solver.seed(2026)
+        solver.solve(1)
+        return solver.solve(1)
+
+    bounded = refine({})
+    exhaustive = refine(
+        {
+            "srr_candidate_limit": 64,
+            "srr_first_improvement": False,
+            "srr_dont_look": False,
+            "srr_extended_operators": True,
+        }
+    )
+
+    assert bounded["feasible"]
+    assert bounded["srr_moves"] > 0
+    assert bounded["srr_evaluations"] < exhaustive["srr_evaluations"]
+    assert bounded["srr_full_rebuilds"] == 0
+
+
 def test_capacity_free_vrptw_uses_closed_multi_route_semantics() -> None:
     problem = generated_problem("vrptw", 20)
     solver = prism_decoder.Decoder(problem, n_rollouts=2)
@@ -103,8 +130,12 @@ def test_search_configuration_is_exposed() -> None:
         "max_perturb_attempts": 20,
         "or_opt_max_segment": 2,
         "feasibility_lookahead_depth": 2,
+        "srr_candidate_limit": 32,
         "use_srr": True,
         "classical_behavior": True,
+        "srr_first_improvement": True,
+        "srr_dont_look": True,
+        "srr_extended_operators": False,
         "verify_screening_resources": False,
         "verify_incremental_srr": False,
     }
@@ -870,6 +901,58 @@ def test_runtime_battery_resource_enforces_reset_and_exports_dynamic_rows() -> N
     labels = solver.evaluate_resources(np.array([0, 1, 0], dtype=np.int32))
     assert labels["violation"].shape == (solver.metadata["resource_count"],)
     assert labels["violation"][-1] > 0.0
+
+
+def test_dynaco_policy_refines_through_runtime_resource_schema() -> None:
+    rng = np.random.default_rng(71)
+    coordinates = rng.random((25, 2), dtype=np.float32)
+    distance = np.linalg.norm(
+        coordinates[:, None] - coordinates[None, :], axis=-1
+    ).astype(np.float32)
+    problem = {
+        "name": "schema_route_cardinality",
+        "coordinates": coordinates,
+        "distance": distance,
+        "constraints": ["visit_all"],
+        "multi_route": True,
+        "node_attributes": {
+            "unit": np.r_[0.0, np.ones(24)].astype(np.float32),
+            "depot_reset": np.r_[1.0, np.zeros(24)].astype(np.float32),
+        },
+        "resources": [
+            {
+                "name": "route_cardinality",
+                "operator": "affine_accumulator",
+                "initial": 0.0,
+                "scale": 4.0,
+                "increment": {
+                    "node_attribute": "unit",
+                    "coefficient": 1.0,
+                },
+                "reset": {
+                    "node_attribute": "depot_reset",
+                    "value": 0.0,
+                },
+                "bounds": [{"upper": 4.0, "check": "transition"}],
+            }
+        ],
+    }
+    solver = prism_decoder.Decoder(
+        problem,
+        search_config={"verify_incremental_srr": True},
+        n_rollouts=4,
+    )
+    solver.seed(71)
+    solver.solve(1)
+    refined = solver.solve(1)
+
+    exact = solver.evaluate(refined["route"])
+    resources = solver.evaluate_resources(refined["route"])
+    assert refined["feasible"] and exact["feasible"]
+    assert refined["srr_moves"] > 0
+    assert refined["srr_incremental_rebuilds"] == refined["srr_moves"]
+    assert refined["srr_full_rebuilds"] == 0
+    assert resources["violation"][-1] == 0.0
 
 
 def test_typed_candidate_quota_admits_reset_edge_behind_distance_gate() -> None:

@@ -165,8 +165,12 @@ struct SearchConfig {
   int32_t max_perturb_attempts = 64;
   int32_t or_opt_max_segment = 3;
   int32_t feasibility_lookahead_depth = 2;
+  int32_t srr_candidate_limit = 32;
   bool use_srr = true;
   bool classical_behavior = true;
+  bool srr_first_improvement = true;
+  bool srr_dont_look = true;
+  bool srr_extended_operators = false;
   bool verify_screening_resources = false;
   bool verify_incremental_srr = false;
 

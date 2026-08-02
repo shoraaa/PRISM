@@ -504,9 +504,17 @@ SearchConfig parse_search_config(const py::dict &data) {
   config.feasibility_lookahead_depth = value_or<int32_t>(
       data, "feasibility_lookahead_depth",
       config.feasibility_lookahead_depth);
+  config.srr_candidate_limit = value_or<int32_t>(
+      data, "srr_candidate_limit", config.srr_candidate_limit);
   config.use_srr = value_or<bool>(data, "use_srr", config.use_srr);
   config.classical_behavior =
       value_or<bool>(data, "classical_behavior", config.classical_behavior);
+  config.srr_first_improvement = value_or<bool>(
+      data, "srr_first_improvement", config.srr_first_improvement);
+  config.srr_dont_look =
+      value_or<bool>(data, "srr_dont_look", config.srr_dont_look);
+  config.srr_extended_operators = value_or<bool>(
+      data, "srr_extended_operators", config.srr_extended_operators);
   config.verify_screening_resources = value_or<bool>(
       data, "verify_screening_resources",
       config.verify_screening_resources);
@@ -994,8 +1002,13 @@ public:
     search_values["or_opt_max_segment"] = search.or_opt_max_segment;
     search_values["feasibility_lookahead_depth"] =
         search.feasibility_lookahead_depth;
+    search_values["srr_candidate_limit"] = search.srr_candidate_limit;
     search_values["use_srr"] = search.use_srr;
     search_values["classical_behavior"] = search.classical_behavior;
+    search_values["srr_first_improvement"] = search.srr_first_improvement;
+    search_values["srr_dont_look"] = search.srr_dont_look;
+    search_values["srr_extended_operators"] =
+        search.srr_extended_operators;
     search_values["verify_screening_resources"] =
         search.verify_screening_resources;
     search_values["verify_incremental_srr"] =

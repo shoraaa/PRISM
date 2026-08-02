@@ -429,6 +429,9 @@ void SearchConfig::validate() const {
     throw std::invalid_argument(
         "feasibility_lookahead_depth must be in [0, 4]");
   }
+  if (srr_candidate_limit <= 0 || srr_candidate_limit > 64) {
+    throw std::invalid_argument("srr_candidate_limit must be in [1, 64]");
+  }
 }
 
 const char *objective_name(Objective objective) {
@@ -2580,6 +2583,7 @@ Solution RoutingDecoder::scope_restricted_refine(
   };
   std::deque<int32_t> checklist;
   std::vector<uint8_t> in_queue(problem_.node_count, 0);
+  std::vector<uint8_t> dont_look(problem_.node_count, 0);
   std::vector<int32_t> visits(problem_.node_count, 0);
   const auto enqueue = [&](int32_t node) {
     if (node >= problem_.depot_count && node < problem_.node_count &&
@@ -4325,6 +4329,8 @@ Solution RoutingDecoder::scope_restricted_refine(
     if (anchor < problem_.depot_count || node_route[anchor] < 0) {
       continue;
     }
+    if (search_config_.srr_dont_look && dont_look[anchor])
+      continue;
     Solution best_move;
     AcceptedPlan best_plan;
     StructuralMove best_structural;
@@ -4332,8 +4338,13 @@ Solution RoutingDecoder::scope_restricted_refine(
     const std::vector<float> anchor_state =
         incumbent_state_features(anchor);
     double best_guided_energy = std::numeric_limits<double>::infinity();
+    const auto found_first = [&]() {
+      return search_config_.srr_first_improvement && best_move.feasible;
+    };
     const auto consider = [&](const std::vector<int32_t> &trial,
                               StructuralMove structural) {
+      if (found_first())
+        return;
       ++full_evaluations;
       const Solution candidate = evaluate(trial);
       record_screening(candidate);
@@ -4359,7 +4370,7 @@ Solution RoutingDecoder::scope_restricted_refine(
         [&](const std::vector<PlannedRoute> &plans,
             const std::vector<int32_t> &affected_routes,
             const auto &materialize) {
-          if (plans.empty())
+          if (plans.empty() || found_first())
             return;
           std::array<int32_t, 2> affected{-1, -1};
           int32_t affected_count = 0;
@@ -4929,7 +4940,7 @@ Solution RoutingDecoder::scope_restricted_refine(
               static_cast<int32_t>(found - solution.route.begin());
         return anchor_position;
       };
-      if (problem_.multi_route) {
+      if (problem_.multi_route && !found_first()) {
         // A boundary token closes the preceding route and starts the next.
         // Removing it merges routes; changing it reassigns the next route.
         const int32_t route_slot = node_route[anchor];
@@ -4946,7 +4957,7 @@ Solution RoutingDecoder::scope_restricted_refine(
                    {StructuralMoveKind::MERGE_ROUTES, previous_slot,
                     route_slot, -1, -1});
         }
-        if (route_local + 1 == route_size &&
+        if (!found_first() && route_local + 1 == route_size &&
             next_slot >= 0 &&
             find_anchor_position() >= 0 &&
             anchor_position + 2 < static_cast<int32_t>(solution.route.size())) {
@@ -4960,8 +4971,13 @@ Solution RoutingDecoder::scope_restricted_refine(
 
       int32_t candidate_rank = 0;
       int32_t served_candidate_rank = 0;
+      int32_t examined_candidates = 0;
       for (int32_t rank = edge_offsets_[anchor];
            rank < edge_offsets_[anchor + 1]; ++rank) {
+        if (found_first() ||
+            examined_candidates >= search_config_.srr_candidate_limit)
+          break;
+        ++examined_candidates;
         const int32_t edge = ranked_local_edges[rank];
         const int32_t candidate_node = edge_to_[edge];
         if (candidate_node == anchor)
@@ -4981,6 +4997,8 @@ Solution RoutingDecoder::scope_restricted_refine(
                      {StructuralMoveKind::SPLIT_ROUTE, node_route[anchor], -1,
                       node_local[anchor], candidate_node});
           }
+          if (found_first())
+            break;
           int32_t route_start = anchor_position - 1;
           while (route_start >= 0 &&
                  solution.route[route_start] >= problem_.depot_count) {
@@ -5002,37 +5020,56 @@ Solution RoutingDecoder::scope_restricted_refine(
         if (!candidate_served) {
           if (!problem_.has(VISIT_ALL)) {
             consider_insert_plan(candidate_node, anchor, false);
-            consider_insert_plan(candidate_node, anchor, true);
-            consider_replace_plan(anchor, candidate_node);
+            if (!found_first())
+              consider_insert_plan(candidate_node, anchor, true);
+            if (!found_first())
+              consider_replace_plan(anchor, candidate_node);
           }
           continue;
         }
         ++served_candidate_rank;
-        consider_two_opt_plan(anchor, candidate_node);
-        consider_two_opt_star_plan(anchor, candidate_node);
-        consider_swap_plan(anchor, candidate_node);
-        for (int32_t length = 1; length <= search_config_.or_opt_max_segment;
-             ++length) {
-          consider_relocate_plan(candidate_node, anchor, length, false);
-          if (candidate_rank <= SRR_DIRECTED_CANDIDATES)
-            consider_relocate_plan(candidate_node, anchor, length, true);
-        }
+        // DyNACO's hot loop is deliberately small: relocate, swap, 2-opt*,
+        // then intra-route 2-opt. The generic plan evaluator below supplies
+        // the schema-specific legality that its CVRP-only O(1) deltas lack.
         consider_relocate_plan(anchor, candidate_node, 1, false);
-        if (candidate_rank <= SRR_DIRECTED_CANDIDATES)
+        if (!found_first())
           consider_relocate_plan(anchor, candidate_node, 1, true);
-        if (problem_.multi_route &&
+        if (!found_first())
+          consider_swap_plan(anchor, candidate_node);
+        if (!found_first())
+          consider_two_opt_star_plan(anchor, candidate_node);
+        if (!found_first())
+          consider_two_opt_plan(anchor, candidate_node);
+
+        if (!found_first() && search_config_.srr_extended_operators) {
+          for (int32_t length = 1;
+               length <= search_config_.or_opt_max_segment; ++length) {
+            consider_relocate_plan(candidate_node, anchor, length, false);
+            if (!found_first() && candidate_rank <= SRR_DIRECTED_CANDIDATES)
+              consider_relocate_plan(candidate_node, anchor, length, true);
+            if (found_first())
+              break;
+          }
+        }
+        if (!found_first() && search_config_.srr_extended_operators &&
+            problem_.multi_route &&
             node_route[anchor] != node_route[candidate_node] &&
             served_candidate_rank <= SRR_STRING_CANDIDATES) {
           for (int32_t length = 2;
                length <= search_config_.or_opt_max_segment; ++length) {
             consider_exchange_plan(anchor, 1, candidate_node, length);
-            consider_exchange_plan(anchor, length, candidate_node, 1);
-            consider_exchange_plan(anchor, length, candidate_node, length);
+            if (!found_first())
+              consider_exchange_plan(anchor, length, candidate_node, 1);
+            if (!found_first())
+              consider_exchange_plan(anchor, length, candidate_node, length);
+            if (found_first())
+              break;
           }
         }
-        if (problem_.has(PICKUP_DELIVERY)) {
+        if (!found_first() && problem_.has(PICKUP_DELIVERY)) {
           consider_relocate_pair_plan(anchor, candidate_node);
-          consider_relocate_pair_plan(candidate_node, anchor);
+          if (!found_first())
+            consider_relocate_pair_plan(candidate_node, anchor);
         }
       }
     if (best_move.feasible) {
@@ -5070,6 +5107,7 @@ Solution RoutingDecoder::scope_restricted_refine(
                                : evaluate_resources(solution.route);
       }
       for (int32_t node : touched) {
+        dont_look[node] = 0;
         enqueue(node);
         const int32_t route_slot = node_route[node];
         const int32_t local = node_local[node];
@@ -5077,17 +5115,27 @@ Solution RoutingDecoder::scope_restricted_refine(
           continue;
         const std::vector<int32_t> &nodes =
             cached_routes[route_slot].sequence.nodes;
-        if (local > 0)
+        if (local > 0) {
+          dont_look[nodes[local - 1]] = 0;
           enqueue(nodes[local - 1]);
-        if (local + 1 < static_cast<int32_t>(nodes.size()))
+        }
+        if (local + 1 < static_cast<int32_t>(nodes.size())) {
+          dont_look[nodes[local + 1]] = 0;
           enqueue(nodes[local + 1]);
+        }
         if (problem_.depot_count == 0 && !problem_.open_route &&
             !nodes.empty()) {
-          enqueue(nodes[(local + nodes.size() - 1) % nodes.size()]);
-          enqueue(nodes[(local + 1) % nodes.size()]);
+          const int32_t previous =
+              nodes[(local + nodes.size() - 1) % nodes.size()];
+          const int32_t next = nodes[(local + 1) % nodes.size()];
+          dont_look[previous] = 0;
+          dont_look[next] = 0;
+          enqueue(previous);
+          enqueue(next);
         }
       }
-      enqueue(anchor);
+    } else if (search_config_.srr_dont_look) {
+      dont_look[anchor] = 1;
     }
   }
   solution.srr_moves = moves;
