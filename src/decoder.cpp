@@ -3427,6 +3427,7 @@ Solution RoutingDecoder::scope_restricted_refine(
   // implemented as well.
   const bool canonical_plan_certificate =
       resource_count() == FIELD_CHANNEL_COUNT &&
+      !problem_.multi_route && problem_.depot_count <= 1 &&
       !problem_.has(PICKUP_DELIVERY) && !problem_.has(TIME_WINDOWS) &&
       !problem_.has(BACKHAUL_ORDER) && !problem_.has(ROUTE_LIMIT) &&
       !problem_.has(TOUR_LIMIT);
