@@ -10,7 +10,7 @@ import torch
 
 import prism_decoder
 from net import ConstraintFieldNet, build_decoder_data
-from problem_data import TRAIN_VARIANTS, VariantCurriculum
+from problem_data import TRAIN_VARIANTS, VariantCurriculum, problem_schema
 from train import (
     OptionOutcome,
     OptionStep,
@@ -91,6 +91,7 @@ def test_setup_decoder_starts_without_a_hand_built_incumbent() -> None:
         "demand": np.r_[0.0, rng.uniform(0.01, 0.05, 19)].astype(np.float32),
         "capacity": 0.5,
     }
+    problem = problem_schema("cvrp") | problem
     args = _args()
 
     decoder = setup_decoder(problem, args, deterministic=True)
@@ -116,6 +117,7 @@ def test_event_driven_option_rollout_and_pretrain_update(
         "demand": np.r_[0.0, rng.uniform(0.01, 0.07, 23)].astype(np.float32),
         "capacity": 0.5,
     }
+    problem = problem_schema("cvrp") | problem
     args = _args()
     args.smallvram = smallvram
     args.pretrain_aux_scale = 0.25
@@ -181,6 +183,7 @@ def test_typed_candidate_quota_receives_winner_gated_ppo_gradient() -> None:
         "demand": np.r_[0.0, rng.uniform(0.01, 0.05, 19)].astype(np.float32),
         "capacity": 0.5,
     }
+    problem = problem_schema("cvrp") | problem
     args = _args()
     model = ConstraintFieldNet(depth=1, units=8)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
@@ -225,6 +228,7 @@ def test_decision_level_ppo_moves_policy_without_auxiliary_losses(
         "demand": np.r_[0.0, rng.uniform(0.01, 0.07, 23)].astype(np.float32),
         "capacity": 0.5,
     }
+    problem = problem_schema("cvrp") | problem
     args = _args()
     args.pretrain_epochs = 0
     args.ppo_epochs = 1
@@ -507,6 +511,7 @@ def test_stagnant_options_reuse_field_and_skip_fallback_labels() -> None:
         "demand": np.r_[0.0, rng.uniform(0.01, 0.07, 23)].astype(np.float32),
         "capacity": 0.5,
     }
+    problem = problem_schema("cvrp") | problem
     args = _args()
     args.search_iterations = 4
     args.improvement_epsilon = float("inf")
@@ -536,6 +541,7 @@ def test_inference_is_deterministic() -> None:
         "demand": np.r_[0.0, rng.uniform(0.01, 0.05, 19)].astype(np.float32),
         "capacity": 0.5,
     }
+    problem = problem_schema("cvrp") | problem
     args = _args()
     model = ConstraintFieldNet(depth=1, units=8).eval()
 

@@ -24,9 +24,16 @@ def euclidean_problem(size: int, seed: int) -> tuple[np.ndarray, np.ndarray]:
     return coordinates, distance
 
 
+def make_decoder(problem: dict, *args, **kwargs):
+    """Materialize explicit fixture semantics before calling the native API."""
+    explicit = problem_schema(str(problem.get("name", "schema")))
+    explicit.update(problem)
+    return prism_decoder.Decoder(explicit, *args, **kwargs)
+
+
 def test_tsp_perturbation_and_srr_improve_incumbent() -> None:
     coordinates, distance = euclidean_problem(60, 7)
-    solver = prism_decoder.Decoder(
+    solver = make_decoder(
         {"name": "tsp", "coordinates": coordinates, "distance": distance},
         n_rollouts=8,
     )
@@ -50,7 +57,7 @@ def test_cvrp_uses_same_perturbation_backend() -> None:
     coordinates, distance = euclidean_problem(61, 8)
     rng = np.random.default_rng(9)
     demand = np.r_[0.0, rng.uniform(0.02, 0.09, 60)].astype(np.float32)
-    solver = prism_decoder.Decoder(
+    solver = make_decoder(
         {
             "name": "cvrp",
             "coordinates": coordinates,
@@ -77,7 +84,7 @@ def test_dynaco_policy_bounds_generic_srr_work() -> None:
     problem = generated_problem("cvrp", 60, 77)
 
     def refine(search_config: dict) -> dict:
-        solver = prism_decoder.Decoder(
+        solver = make_decoder(
             problem, search_config=search_config, n_rollouts=4
         )
         solver.seed(2026)
@@ -102,7 +109,7 @@ def test_dynaco_policy_bounds_generic_srr_work() -> None:
 
 def test_capacity_free_vrptw_uses_closed_multi_route_semantics() -> None:
     problem = generated_problem("vrptw", 20)
-    solver = prism_decoder.Decoder(problem, n_rollouts=2)
+    solver = make_decoder(problem, n_rollouts=2)
     solver.seed(20260731)
 
     solution = solver.solve(2)
@@ -116,7 +123,7 @@ def test_capacity_free_vrptw_uses_closed_multi_route_semantics() -> None:
 
 def test_search_configuration_is_exposed() -> None:
     coordinates, distance = euclidean_problem(20, 10)
-    solver = prism_decoder.Decoder(
+    solver = make_decoder(
         {"name": "tsp", "coordinates": coordinates, "distance": distance},
         candidate_config={"max_candidates": 12},
         search_config={
@@ -145,85 +152,12 @@ def test_search_configuration_is_exposed() -> None:
     }
 
 
-@pytest.mark.parametrize(
-    "variant",
-    [
-        "tsp",
-        "aop",
-        "pctsp",
-        "cvrpbp",
-        "mdcvrptw",
-        "pdtsp",
-        "opdcvrp",
-    ],
-)
-def test_legacy_name_adapter_is_lossless_against_normalized_schema(
-    variant: str,
-) -> None:
-    problem = generated_problem("op" if variant == "aop" else variant, 16, 50)
-    if variant == "aop":
-        problem = dict(problem, name="aop", tour_limit=1.0)
-    legacy = dict(problem)
-    for key in (
-        "constraints",
-        "objective",
-        "depot_count",
-        "multi_route",
-        "open_route",
-    ):
-        legacy.pop(key, None)
-    if variant in {"op", "aop"}:
-        legacy.pop("tour_limit", None)
-
-    explicit = prism_decoder.normalize_problem_schema(legacy)
-    legacy_solver = prism_decoder.Decoder(legacy, n_rollouts=2)
-    explicit_solver = prism_decoder.Decoder(explicit, n_rollouts=2)
-
-    assert legacy_solver.metadata["schema_source"] == "legacy_compat"
-    assert explicit_solver.metadata["schema_source"] == "explicit"
-    for key in (
-        "depot_count",
-        "constraints",
-        "constraint_kernels",
-        "objective",
-        "multi_route",
-        "open_route",
-        "resources",
-        "field_channel_names",
-    ):
-        assert legacy_solver.metadata[key] == explicit_solver.metadata[key]
-    for attribute in (
-        "edge_index",
-        "heuristic",
-        "proximity",
-        "edge_features",
-        "node_features",
-        "resource_features",
-        "resource_descriptors",
-    ):
-        assert np.array_equal(
-            getattr(legacy_solver, attribute),
-            getattr(explicit_solver, attribute),
-        )
-
-    legacy_solver.seed(20260803)
-    explicit_solver.seed(20260803)
-    for _ in range(2):
-        legacy_solution = legacy_solver.solve(1)
-        explicit_solution = explicit_solver.solve(1)
-        assert legacy_solution.keys() == explicit_solution.keys()
-        for key, expected in legacy_solution.items():
-            actual = explicit_solution[key]
-            if isinstance(expected, np.ndarray):
-                assert np.array_equal(expected, actual)
-            else:
-                assert expected == actual
-
-
-def test_legacy_adapter_matches_all_110_explicit_benchmark_schemas() -> None:
+def test_all_110_benchmark_schemas_are_explicit_and_normalizable() -> None:
     for variant in BENCHMARK_VARIANTS:
-        legacy = prism_decoder.normalize_problem_schema({"name": variant})
         explicit = problem_schema(variant)
+        if "tour_limit" in explicit["constraints"]:
+            explicit["tour_limit"] = 1.0 if variant == "aop" else 4.0
+        normalized = prism_decoder.normalize_problem_schema(explicit)
         for key in (
             "name",
             "constraints",
@@ -234,12 +168,13 @@ def test_legacy_adapter_matches_all_110_explicit_benchmark_schemas() -> None:
             "capacity",
             "prize_quota",
         ):
-            assert legacy[key] == explicit[key], (variant, key)
-        expected_tour_limit = 1.0 if variant == "aop" else 4.0
-        if "tour_limit" in explicit["constraints"]:
-            assert legacy["tour_limit"] == expected_tour_limit
-        else:
-            assert np.isinf(legacy["tour_limit"])
+            assert normalized[key] == explicit[key], (variant, key)
+
+
+def test_name_only_input_is_rejected_as_an_incomplete_schema() -> None:
+    coordinates, _ = euclidean_problem(8, 22)
+    with pytest.raises(ValueError, match="explicit schema is missing 'constraints'"):
+        prism_decoder.Decoder({"name": "cvrp", "coordinates": coordinates})
 
 
 def test_explicit_schema_execution_is_independent_of_variant_name() -> None:
@@ -247,13 +182,10 @@ def test_explicit_schema_execution_is_independent_of_variant_name() -> None:
     renamed = dict(named, name="custom_stateful_schema")
     nameless = dict(named)
     nameless.pop("name")
-    named_solver = prism_decoder.Decoder(named, n_rollouts=2)
-    renamed_solver = prism_decoder.Decoder(renamed, n_rollouts=2)
-    nameless_solver = prism_decoder.Decoder(nameless, n_rollouts=2)
+    named_solver = make_decoder(named, n_rollouts=2)
+    renamed_solver = make_decoder(renamed, n_rollouts=2)
+    nameless_solver = make_decoder(nameless, n_rollouts=2)
 
-    assert named_solver.metadata["schema_source"] == "explicit"
-    assert renamed_solver.metadata["schema_source"] == "explicit"
-    assert nameless_solver.metadata["schema_source"] == "explicit"
     assert nameless_solver.metadata["name"] == "schema"
     assert named_solver.metadata["constraint_kernels"] == renamed_solver.metadata[
         "constraint_kernels"
@@ -286,7 +218,7 @@ def test_candidate_graph_uses_only_kd_tree_distance_and_is_incumbent_stable(
         [[0.0, 0.0], [1.0, 0.0], [2.0, 0.0], [100.0, 0.0]],
         dtype=np.float32,
     )
-    solver = prism_decoder.Decoder(
+    solver = make_decoder(
         {
             "name": "tsp",
             "coordinates": coordinates,
@@ -312,7 +244,7 @@ def test_candidate_graph_keeps_required_depot_overlay() -> None:
         [[100.0, 100.0], [0.0, 0.0], [1.0, 0.0], [2.0, 0.0]],
         dtype=np.float32,
     )
-    solver = prism_decoder.Decoder(
+    solver = make_decoder(
         {
             "name": "cvrp",
             "coordinates": coordinates,
@@ -352,7 +284,7 @@ def test_incremental_screening_resources_match_full_evaluation_and_search(
     problem = generated_problem(variant, 50 if variant == "pctsp" else 30, 20)
 
     def make_solver(verify: bool) -> prism_decoder.Decoder:
-        solver = prism_decoder.Decoder(
+        solver = make_decoder(
             problem,
             search_config={
                 "verify_screening_resources": verify,
@@ -402,7 +334,7 @@ def test_classical_behavior_flag_matches_default() -> None:
     coordinates, distance = euclidean_problem(35, 101)
 
     def run(search_config: dict | None = None) -> dict:
-        solver = prism_decoder.Decoder(
+        solver = make_decoder(
             {"name": "tsp", "coordinates": coordinates, "distance": distance},
             search_config=search_config or {},
             n_rollouts=8,
@@ -419,7 +351,7 @@ def test_classical_behavior_flag_matches_default() -> None:
 
 def test_typed_field_mode_is_exposed_and_feasible() -> None:
     coordinates, distance = euclidean_problem(36, 102)
-    solver = prism_decoder.Decoder(
+    solver = make_decoder(
         {"name": "tsp", "coordinates": coordinates, "distance": distance},
         search_config={"classical_behavior": False},
         n_rollouts=8,
@@ -462,7 +394,7 @@ def test_all_decoder_gnn_inputs_are_normalized() -> None:
     demand = np.r_[0.0, rng.uniform(0.01, 0.08, 31)].astype(np.float32)
     tw_start = np.r_[0.0, rng.uniform(0.0, 2.0, 31)].astype(np.float32)
     tw_end = tw_start + 5.0
-    solver = prism_decoder.Decoder(
+    solver = make_decoder(
         {
             "name": "cvrptw",
             "coordinates": coordinates,
@@ -501,7 +433,7 @@ def test_incumbent_live_state_matches_transition_scales_and_timing() -> None:
         coordinates[:, None] - coordinates[None, :], axis=-1
     ).astype(np.float32)
     service_time = np.array([0.0, 2.0, 2.0, 2.0], dtype=np.float32)
-    solver = prism_decoder.Decoder(
+    solver = make_decoder(
         {
             "name": "cvrpltw",
             "coordinates": coordinates,
@@ -531,7 +463,7 @@ def test_incumbent_tour_state_uses_tour_limit() -> None:
     distance = np.linalg.norm(
         coordinates[:, None] - coordinates[None, :], axis=-1
     ).astype(np.float32)
-    solver = prism_decoder.Decoder(
+    solver = make_decoder(
         {
             "name": "tour-test",
             "coordinates": coordinates,
@@ -555,7 +487,7 @@ def test_incumbent_tour_state_uses_tour_limit() -> None:
 
 def test_resource_features_use_exported_cpp_scales() -> None:
     coordinates, distance = euclidean_problem(3, 123)
-    solver = prism_decoder.Decoder(
+    solver = make_decoder(
         {
             "name": "cvrp",
             "coordinates": coordinates,
@@ -584,7 +516,7 @@ def test_resource_features_use_exported_cpp_scales() -> None:
 def test_resource_evaluator_returns_aligned_labels() -> None:
     coordinates, distance = euclidean_problem(25, 122)
     demand = np.r_[0.0, np.full(24, 0.04, dtype=np.float32)]
-    solver = prism_decoder.Decoder(
+    solver = make_decoder(
         {
             "name": "cvrp",
             "coordinates": coordinates,
@@ -611,7 +543,7 @@ def test_guidance_validation_and_inactive_channel_masking() -> None:
     coordinates, distance = euclidean_problem(28, 103)
 
     def make_solver() -> prism_decoder.Decoder:
-        solver = prism_decoder.Decoder(
+        solver = make_decoder(
             {"name": "tsp", "coordinates": coordinates, "distance": distance},
             search_config={"classical_behavior": False},
             n_rollouts=4,
@@ -644,7 +576,7 @@ def test_guidance_validation_and_inactive_channel_masking() -> None:
             ),
         )
 
-    classical = prism_decoder.Decoder(
+    classical = make_decoder(
         {"name": "tsp", "coordinates": coordinates, "distance": distance}
     )
     with np.testing.assert_raises_regex(ValueError, "classical_behavior"):
@@ -661,7 +593,7 @@ def test_typed_field_changes_greedy_construction() -> None:
     demand = np.r_[0.0, np.full(23, 0.02, dtype=np.float32)]
 
     def make_solver() -> prism_decoder.Decoder:
-        solver = prism_decoder.Decoder(
+        solver = make_decoder(
             {
                 "name": "cvrp",
                 "coordinates": coordinates,
@@ -716,7 +648,7 @@ def test_additive_field_guides_zero_pressure_edge() -> None:
     demand = np.zeros(20, dtype=np.float32)
 
     def make_solver() -> prism_decoder.Decoder:
-        return prism_decoder.Decoder(
+        return make_decoder(
             {
                 "name": "cvrp",
                 "coordinates": coordinates,
@@ -780,12 +712,12 @@ def test_srr_aggregate_comparison_uses_the_same_edge_energy() -> None:
         "demand": demand,
         "capacity": 0.35,
     }
-    bootstrap = prism_decoder.Decoder(problem, n_rollouts=4)
+    bootstrap = make_decoder(problem, n_rollouts=4)
     bootstrap.seed(9001)
     incumbent = bootstrap.solve(1)["route"]
 
     def make_solver() -> prism_decoder.Decoder:
-        solver = prism_decoder.Decoder(
+        solver = make_decoder(
             problem,
             search_config={"classical_behavior": False},
             n_rollouts=1,
@@ -850,7 +782,7 @@ def test_lookahead_risk_labels_and_avoids_time_window_dead_end() -> None:
     }
 
     def make_solver() -> prism_decoder.Decoder:
-        solver = prism_decoder.Decoder(
+        solver = make_decoder(
             problem,
             search_config={
                 "classical_behavior": False,
@@ -905,7 +837,7 @@ def test_directed_srr_improves_atsp_without_reversal() -> None:
             distance,
             distance[:, intermediate, None] + distance[intermediate, None, :],
         )
-    solver = prism_decoder.Decoder(
+    solver = make_decoder(
         {"name": "atsp", "distance": distance},
         n_rollouts=8,
     )
@@ -923,7 +855,7 @@ def test_optional_srr_can_insert_unserved_nodes() -> None:
     coordinates, distance = euclidean_problem(31, 44)
     rng = np.random.default_rng(45)
     prize = np.r_[0.0, rng.uniform(0.1, 1.0, 30)].astype(np.float32)
-    solver = prism_decoder.Decoder(
+    solver = make_decoder(
         {
             "name": "op",
             "coordinates": coordinates,
@@ -951,7 +883,7 @@ def test_static_ant_parallelism_is_deterministic() -> None:
 
     def solve_with(threads: int) -> dict:
         prism_decoder.set_num_threads(threads)
-        solver = prism_decoder.Decoder(
+        solver = make_decoder(
             {"name": "tsp", "coordinates": coordinates, "distance": distance},
             n_rollouts=8,
         )
@@ -975,7 +907,7 @@ def test_coordinate_backed_distance_matches_euclidean_evaluation() -> None:
     coordinates = np.array(
         [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]], dtype=np.float32
     )
-    solver = prism_decoder.Decoder(
+    solver = make_decoder(
         {"name": "tsp", "coordinates": coordinates}, n_rollouts=1
     )
 
@@ -990,7 +922,7 @@ def test_large_coordinate_problem_keeps_sparse_candidate_storage() -> None:
     rng = np.random.default_rng(907)
     coordinates = rng.random((size, 2), dtype=np.float32)
     demand = np.r_[0.0, np.full(size - 1, 0.01, dtype=np.float32)]
-    solver = prism_decoder.Decoder(
+    solver = make_decoder(
         {
             "name": "cvrp",
             "coordinates": coordinates,
@@ -1039,7 +971,7 @@ def test_runtime_battery_resource_enforces_reset_and_exports_dynamic_rows() -> N
             }
         ],
     }
-    solver = prism_decoder.Decoder(problem, n_rollouts=1)
+    solver = make_decoder(problem, n_rollouts=1)
 
     assert solver.metadata["resource_count"] == prism_decoder.FIELD_CHANNEL_COUNT + 1
     assert solver.metadata["multiplier_count"] == solver.metadata["resource_count"] + 1
@@ -1052,7 +984,7 @@ def test_runtime_battery_resource_enforces_reset_and_exports_dynamic_rows() -> N
     assert solver.metadata["field_channel_mask"][-1] == 1
     coordinate_only = dict(problem)
     coordinate_only.pop("distance")
-    coordinate_solver = prism_decoder.Decoder(coordinate_only, n_rollouts=1)
+    coordinate_solver = make_decoder(coordinate_only, n_rollouts=1)
     assert coordinate_solver.resource_features.shape[1] == solver.metadata[
         "resource_count"
     ]
@@ -1101,7 +1033,7 @@ def test_dynaco_policy_refines_through_runtime_resource_schema() -> None:
             }
         ],
     }
-    solver = prism_decoder.Decoder(
+    solver = make_decoder(
         problem,
         search_config={"verify_incremental_srr": True},
         n_rollouts=4,
@@ -1128,7 +1060,7 @@ def test_typed_candidate_quota_admits_reset_edge_behind_distance_gate() -> None:
     distance = np.linalg.norm(
         coordinates[:, None] - coordinates[None, :], axis=-1
     ).astype(np.float32)
-    solver = prism_decoder.Decoder(
+    solver = make_decoder(
         {
             "name": "cvrp",
             "coordinates": coordinates,
@@ -1214,10 +1146,10 @@ def test_schema_mode_admits_resource_candidate_without_learned_quota() -> None:
         start, end = solver.edge_offsets[node : node + 2]
         return set(solver.edge_index[1, start:end].tolist())
 
-    schema = prism_decoder.Decoder(
+    schema = make_decoder(
         problem, candidate_config={"max_candidates": 3}, n_rollouts=1
     )
-    geometric = prism_decoder.Decoder(
+    geometric = make_decoder(
         problem,
         candidate_config={"max_candidates": 3, "candidate_mode": "geometric"},
         n_rollouts=1,

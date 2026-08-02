@@ -271,32 +271,32 @@ constraint_kernel_registry() {
           {VISIT_ALL, "visit_all", -1, nullptr,
            ResourceOperator::AFFINE_ACCUMULATOR, KERNEL_SOLUTION_STATE},
           {CAPACITY, "capacity", static_cast<int32_t>(FieldChannel::CAPACITY),
-           "capacity", ResourceOperator::LEGACY_CAPACITY,
+           "capacity", ResourceOperator::CANONICAL_CAPACITY,
            KERNEL_ROUTE_STATE},
           {BACKHAUL_ORDER, "backhaul_order",
            static_cast<int32_t>(FieldChannel::BACKHAUL_ORDER),
-           "backhaul_order", ResourceOperator::LEGACY_BACKHAUL_ORDER,
+           "backhaul_order", ResourceOperator::CANONICAL_BACKHAUL_ORDER,
            KERNEL_ROUTE_STATE | KERNEL_ORDER_SENSITIVE |
                KERNEL_REVERSAL_SENSITIVE},
           {PICKUP_DELIVERY, "pickup_delivery",
            static_cast<int32_t>(FieldChannel::PICKUP_DELIVERY),
-           "pickup_delivery", ResourceOperator::LEGACY_PICKUP_DELIVERY,
+           "pickup_delivery", ResourceOperator::CANONICAL_PICKUP_DELIVERY,
            KERNEL_ROUTE_STATE | KERNEL_ORDER_SENSITIVE |
                KERNEL_REVERSAL_SENSITIVE | KERNEL_RELATIONAL},
           {ROUTE_LIMIT, "route_limit",
            static_cast<int32_t>(FieldChannel::ROUTE_LIMIT), "route_limit",
-           ResourceOperator::LEGACY_ROUTE_LIMIT, KERNEL_ROUTE_STATE},
+           ResourceOperator::CANONICAL_ROUTE_LIMIT, KERNEL_ROUTE_STATE},
           {TIME_WINDOWS, "time_windows",
            static_cast<int32_t>(FieldChannel::TIME_WINDOW), "time_window",
-           ResourceOperator::LEGACY_TIME_WINDOW,
+           ResourceOperator::CANONICAL_TIME_WINDOW,
            KERNEL_ROUTE_STATE | KERNEL_ORDER_SENSITIVE |
                KERNEL_REVERSAL_SENSITIVE},
           {TOUR_LIMIT, "tour_limit",
            static_cast<int32_t>(FieldChannel::TOUR_LIMIT), "tour_limit",
-           ResourceOperator::LEGACY_TOUR_LIMIT, KERNEL_SOLUTION_STATE},
+           ResourceOperator::CANONICAL_TOUR_LIMIT, KERNEL_SOLUTION_STATE},
           {PRIZE_QUOTA, "prize_quota",
            static_cast<int32_t>(FieldChannel::PRIZE_QUOTA), "prize_quota",
-           ResourceOperator::LEGACY_PRIZE_QUOTA, KERNEL_SOLUTION_STATE},
+           ResourceOperator::CANONICAL_PRIZE_QUOTA, KERNEL_SOLUTION_STATE},
       }};
   return kernels;
 }
@@ -661,9 +661,9 @@ void RoutingDecoder::build_constraint_kernel_set() {
 
 void RoutingDecoder::build_resource_registry() {
   resources_.clear();
-  legacy_resource_index_.fill(-1);
-  const auto add_legacy = [&](FieldChannel channel, ResourceOperator op,
-                              const char *name, bool active) {
+  canonical_resource_index_.fill(-1);
+  const auto add_canonical = [&](FieldChannel channel, ResourceOperator op,
+                                 const char *name, bool active) {
     ResourceSpec spec;
     spec.name = name;
     spec.active = active;
@@ -671,14 +671,15 @@ void RoutingDecoder::build_resource_registry() {
     spec.scale = resource_scale(static_cast<int32_t>(channel));
     const int32_t index = static_cast<int32_t>(resources_.size());
     resources_.push_back(std::move(spec));
-    legacy_resource_index_[static_cast<int32_t>(channel)] = index;
+    canonical_resource_index_[static_cast<int32_t>(channel)] = index;
   };
   for (int32_t channel = 0; channel < FIELD_CHANNEL_COUNT; ++channel) {
     const ConstraintKernelSpec *kernel = field_channel_kernel(channel);
     if (kernel == nullptr)
       throw std::logic_error("missing canonical field-channel kernel");
-    add_legacy(static_cast<FieldChannel>(channel), kernel->resource_operator,
-               kernel->resource_name, active_field_channels_[channel] != 0);
+    add_canonical(static_cast<FieldChannel>(channel), kernel->resource_operator,
+                  kernel->resource_name,
+                  active_field_channels_[channel] != 0);
   }
 
   for (const ResourceSpec &spec : problem_.resources) {
@@ -692,8 +693,8 @@ void RoutingDecoder::build_resource_registry() {
   }
 }
 
-int32_t RoutingDecoder::legacy_resource_index(FieldChannel channel) const {
-  return legacy_resource_index_[static_cast<int32_t>(channel)];
+int32_t RoutingDecoder::canonical_resource_index(FieldChannel channel) const {
+  return canonical_resource_index_[static_cast<int32_t>(channel)];
 }
 
 const ResourceSpec &RoutingDecoder::resource(int32_t index) const {
@@ -715,33 +716,33 @@ void RoutingDecoder::build_resource_descriptors() {
                         static_cast<size_t>(index) * RESOURCE_DESCRIPTOR_DIM;
     switch (spec.op) {
     case ResourceOperator::AFFINE_ACCUMULATOR:
-    case ResourceOperator::LEGACY_CAPACITY:
-    case ResourceOperator::LEGACY_ROUTE_LIMIT:
-    case ResourceOperator::LEGACY_TOUR_LIMIT:
-    case ResourceOperator::LEGACY_PRIZE_QUOTA:
+    case ResourceOperator::CANONICAL_CAPACITY:
+    case ResourceOperator::CANONICAL_ROUTE_LIMIT:
+    case ResourceOperator::CANONICAL_TOUR_LIMIT:
+    case ResourceOperator::CANONICAL_PRIZE_QUOTA:
       descriptor[0] = 1.0f;
       descriptor[20] = 1.0f;
       break;
-    case ResourceOperator::LEGACY_TIME_WINDOW:
+    case ResourceOperator::CANONICAL_TIME_WINDOW:
       descriptor[1] = 1.0f;
       descriptor[21] = 1.0f;
       break;
-    case ResourceOperator::LEGACY_BACKHAUL_ORDER:
+    case ResourceOperator::CANONICAL_BACKHAUL_ORDER:
       descriptor[2] = 1.0f;
       descriptor[22] = 1.0f;
       break;
-    case ResourceOperator::LEGACY_PICKUP_DELIVERY:
+    case ResourceOperator::CANONICAL_PICKUP_DELIVERY:
       descriptor[3] = 1.0f;
       descriptor[22] = 1.0f;
       break;
     }
     const bool has_lower = std::isfinite(spec.lower) ||
-                           spec.op == ResourceOperator::LEGACY_PRIZE_QUOTA;
+                           spec.op == ResourceOperator::CANONICAL_PRIZE_QUOTA;
     const bool has_upper = std::isfinite(spec.upper) ||
-                           spec.op == ResourceOperator::LEGACY_CAPACITY ||
-                           spec.op == ResourceOperator::LEGACY_TIME_WINDOW ||
-                           spec.op == ResourceOperator::LEGACY_ROUTE_LIMIT ||
-                           spec.op == ResourceOperator::LEGACY_TOUR_LIMIT;
+                           spec.op == ResourceOperator::CANONICAL_CAPACITY ||
+                           spec.op == ResourceOperator::CANONICAL_TIME_WINDOW ||
+                           spec.op == ResourceOperator::CANONICAL_ROUTE_LIMIT ||
+                           spec.op == ResourceOperator::CANONICAL_TOUR_LIMIT;
     descriptor[has_lower && has_upper ? 7 : has_lower ? 5 : has_upper ? 6 : 4] =
         1.0f;
     descriptor[8 + static_cast<int32_t>(spec.bound_check)] = 1.0f;
@@ -752,8 +753,8 @@ void RoutingDecoder::build_resource_descriptors() {
     descriptor[23] = !spec.node_values.empty() ? 1.0f : 0.0f;
     descriptor[24] =
         (spec.edge_uses_distance || !spec.edge_values.empty()) ? 1.0f : 0.0f;
-    descriptor[25] = spec.op == ResourceOperator::LEGACY_PICKUP_DELIVERY ? 1.0f
-                                                                         : 0.0f;
+    descriptor[25] =
+        spec.op == ResourceOperator::CANONICAL_PICKUP_DELIVERY ? 1.0f : 0.0f;
     descriptor[26] = spec.edge_coefficient >= 0.0f &&
                              spec.node_coefficient >= 0.0f
                          ? 1.0f
@@ -958,19 +959,19 @@ std::vector<float> RoutingDecoder::resource_scales() const {
 float RoutingDecoder::runtime_resource_scale(int32_t resource_index) const {
   const ResourceSpec &spec = resource(resource_index);
   switch (spec.op) {
-  case ResourceOperator::LEGACY_CAPACITY:
+  case ResourceOperator::CANONICAL_CAPACITY:
     return resource_scale(static_cast<int32_t>(FieldChannel::CAPACITY));
-  case ResourceOperator::LEGACY_TIME_WINDOW:
+  case ResourceOperator::CANONICAL_TIME_WINDOW:
     return resource_scale(static_cast<int32_t>(FieldChannel::TIME_WINDOW));
-  case ResourceOperator::LEGACY_ROUTE_LIMIT:
+  case ResourceOperator::CANONICAL_ROUTE_LIMIT:
     return resource_scale(static_cast<int32_t>(FieldChannel::ROUTE_LIMIT));
-  case ResourceOperator::LEGACY_TOUR_LIMIT:
+  case ResourceOperator::CANONICAL_TOUR_LIMIT:
     return resource_scale(static_cast<int32_t>(FieldChannel::TOUR_LIMIT));
-  case ResourceOperator::LEGACY_BACKHAUL_ORDER:
+  case ResourceOperator::CANONICAL_BACKHAUL_ORDER:
     return resource_scale(static_cast<int32_t>(FieldChannel::BACKHAUL_ORDER));
-  case ResourceOperator::LEGACY_PICKUP_DELIVERY:
+  case ResourceOperator::CANONICAL_PICKUP_DELIVERY:
     return resource_scale(static_cast<int32_t>(FieldChannel::PICKUP_DELIVERY));
-  case ResourceOperator::LEGACY_PRIZE_QUOTA:
+  case ResourceOperator::CANONICAL_PRIZE_QUOTA:
     return resource_scale(static_cast<int32_t>(FieldChannel::PRIZE_QUOTA));
   case ResourceOperator::AFFINE_ACCUMULATOR:
     return std::max(spec.scale, EPS);
@@ -1058,25 +1059,25 @@ float RoutingDecoder::runtime_resource_pressure(int32_t from, int32_t to,
   if (!spec.active)
     return 0.0f;
   switch (spec.op) {
-  case ResourceOperator::LEGACY_CAPACITY:
+  case ResourceOperator::CANONICAL_CAPACITY:
     return analytic_resource_pressure(
         from, to, static_cast<int32_t>(FieldChannel::CAPACITY));
-  case ResourceOperator::LEGACY_TIME_WINDOW:
+  case ResourceOperator::CANONICAL_TIME_WINDOW:
     return analytic_resource_pressure(
         from, to, static_cast<int32_t>(FieldChannel::TIME_WINDOW));
-  case ResourceOperator::LEGACY_ROUTE_LIMIT:
+  case ResourceOperator::CANONICAL_ROUTE_LIMIT:
     return analytic_resource_pressure(
         from, to, static_cast<int32_t>(FieldChannel::ROUTE_LIMIT));
-  case ResourceOperator::LEGACY_TOUR_LIMIT:
+  case ResourceOperator::CANONICAL_TOUR_LIMIT:
     return analytic_resource_pressure(
         from, to, static_cast<int32_t>(FieldChannel::TOUR_LIMIT));
-  case ResourceOperator::LEGACY_BACKHAUL_ORDER:
+  case ResourceOperator::CANONICAL_BACKHAUL_ORDER:
     return analytic_resource_pressure(
         from, to, static_cast<int32_t>(FieldChannel::BACKHAUL_ORDER));
-  case ResourceOperator::LEGACY_PICKUP_DELIVERY:
+  case ResourceOperator::CANONICAL_PICKUP_DELIVERY:
     return analytic_resource_pressure(
         from, to, static_cast<int32_t>(FieldChannel::PICKUP_DELIVERY));
-  case ResourceOperator::LEGACY_PRIZE_QUOTA:
+  case ResourceOperator::CANONICAL_PRIZE_QUOTA:
     return analytic_resource_pressure(
         from, to, static_cast<int32_t>(FieldChannel::PRIZE_QUOTA));
   case ResourceOperator::AFFINE_ACCUMULATOR: {
@@ -1208,26 +1209,26 @@ std::vector<float> RoutingDecoder::live_state_features(const State &state) const
     if (!resource(index).active)
       continue;
     switch (resource(index).op) {
-    case ResourceOperator::LEGACY_CAPACITY:
+    case ResourceOperator::CANONICAL_CAPACITY:
       result[index] = unit(1.0 - state.load / std::max(problem_.capacity, EPS));
       break;
-    case ResourceOperator::LEGACY_TIME_WINDOW:
+    case ResourceOperator::CANONICAL_TIME_WINDOW:
       result[index] = unit(state.current_time / time_scale_);
       break;
-    case ResourceOperator::LEGACY_ROUTE_LIMIT:
+    case ResourceOperator::CANONICAL_ROUTE_LIMIT:
       result[index] = unit(state.route_distance / route_scale);
       break;
-    case ResourceOperator::LEGACY_TOUR_LIMIT:
+    case ResourceOperator::CANONICAL_TOUR_LIMIT:
       result[index] = unit(state.route_distance / tour_scale);
       break;
-    case ResourceOperator::LEGACY_BACKHAUL_ORDER:
+    case ResourceOperator::CANONICAL_BACKHAUL_ORDER:
       result[index] = state.route_has_backhaul ? 1.0f : 0.0f;
       break;
-    case ResourceOperator::LEGACY_PICKUP_DELIVERY:
+    case ResourceOperator::CANONICAL_PICKUP_DELIVERY:
       result[index] = unit(static_cast<double>(state.open_pickups) /
                            std::max(pair_count_, 1));
       break;
-    case ResourceOperator::LEGACY_PRIZE_QUOTA:
+    case ResourceOperator::CANONICAL_PRIZE_QUOTA:
       result[index] = unit(1.0 - state.collected_prize /
                                      std::max(problem_.prize_quota, EPS));
       break;
@@ -1725,20 +1726,20 @@ void RoutingDecoder::build_model_features() {
       const float state_time = time + problem_.service_time[node];
       float *live = incumbent_live_state_.data() +
                     static_cast<size_t>(node) * resource_count();
-      const auto set_legacy = [&](FieldChannel channel, float value) {
-        const int32_t slot = legacy_resource_index(channel);
+      const auto set_canonical = [&](FieldChannel channel, float value) {
+        const int32_t slot = canonical_resource_index(channel);
         if (slot >= 0)
           live[slot] = value;
       };
-      set_legacy(FieldChannel::CAPACITY, 1.0f - features[14]);
-      set_legacy(FieldChannel::TIME_WINDOW, unit(state_time / time_scale_));
-      set_legacy(FieldChannel::ROUTE_LIMIT, unit(distance / route_scale));
-      set_legacy(FieldChannel::TOUR_LIMIT, unit(distance / tour_scale));
-      set_legacy(FieldChannel::BACKHAUL_ORDER, backhaul ? 1.0f : 0.0f);
-      set_legacy(FieldChannel::PICKUP_DELIVERY, features[17]);
-      set_legacy(FieldChannel::PRIZE_QUOTA,
-                 unit(1.0 - cumulative_prize /
-                                std::max<double>(problem_.prize_quota, EPS)));
+      set_canonical(FieldChannel::CAPACITY, 1.0f - features[14]);
+      set_canonical(FieldChannel::TIME_WINDOW, unit(state_time / time_scale_));
+      set_canonical(FieldChannel::ROUTE_LIMIT, unit(distance / route_scale));
+      set_canonical(FieldChannel::TOUR_LIMIT, unit(distance / tour_scale));
+      set_canonical(FieldChannel::BACKHAUL_ORDER, backhaul ? 1.0f : 0.0f);
+      set_canonical(FieldChannel::PICKUP_DELIVERY, features[17]);
+      set_canonical(FieldChannel::PRIZE_QUOTA,
+                    unit(1.0 - cumulative_prize /
+                                   std::max<double>(problem_.prize_quota, EPS)));
       time = state_time;
       previous = node;
     }
@@ -1847,10 +1848,10 @@ void RoutingDecoder::build_model_features() {
       float *features = edge_features_.data() +
                         static_cast<size_t>(edge) * EDGE_FEATURE_COUNT;
       features[0] = unit(problem_.dist(from, to) / distance_scale_);
-      for (int32_t legacy = 0; legacy < FIELD_CHANNEL_COUNT; ++legacy) {
-        const int32_t slot = legacy_resource_index(
-            static_cast<FieldChannel>(legacy));
-        features[1 + legacy] = slot >= 0 ? resources[slot] : 0.0f;
+      for (int32_t channel = 0; channel < FIELD_CHANNEL_COUNT; ++channel) {
+        const int32_t slot = canonical_resource_index(
+            static_cast<FieldChannel>(channel));
+        features[1 + channel] = slot >= 0 ? resources[slot] : 0.0f;
       }
       features[8] = incumbent_edges[edge] ? 1.0f : 0.0f;
       features[9] = reverse_incumbent_edges[edge] ? 1.0f : 0.0f;
@@ -1894,7 +1895,7 @@ RoutingDecoder::State RoutingDecoder::initial_state(int32_t start_node) const {
   state.load = problem_.capacity;
   state.algebra_state.resize(resource_count(), 0.0f);
   for (int32_t index = 0; index < resource_count(); ++index) {
-    if (!resource(index).is_legacy())
+    if (!resource(index).is_canonical())
       state.algebra_state[index] = resource(index).initial;
   }
 
@@ -1925,7 +1926,7 @@ bool RoutingDecoder::algebra_transition_feasible(const State &state,
                                                   int32_t resource_index,
                                                   float *next_value) const {
   const ResourceSpec &spec = resource(resource_index);
-  if (spec.is_legacy())
+  if (spec.is_canonical())
     return true;
   float value = state.algebra_state[resource_index];
   const bool depot = next < problem_.depot_count;
@@ -2061,7 +2062,7 @@ bool RoutingDecoder::transition(State &state, int32_t next,
   }
   std::vector<float> next_algebra = state.algebra_state;
   for (int32_t index = 0; index < resource_count(); ++index) {
-    if (!resource(index).is_legacy()) {
+    if (!resource(index).is_canonical()) {
       (void)algebra_transition_feasible(state, next, index,
                                         &next_algebra[index]);
     }
@@ -2219,7 +2220,7 @@ Solution RoutingDecoder::finish(State state) const {
     const int32_t end =
         problem_.depot_count == 0 ? state.start_node : state.route_depot;
     for (int32_t index = 0; index < resource_count(); ++index) {
-      if (resource(index).is_legacy())
+      if (resource(index).is_canonical())
         continue;
       float value = state.algebra_state[index];
       if (!algebra_transition_feasible(state, end, index, &value)) {
@@ -2232,7 +2233,7 @@ Solution RoutingDecoder::finish(State state) const {
   }
   for (int32_t index = 0; index < resource_count(); ++index) {
     const ResourceSpec &spec = resource(index);
-    if (!spec.is_legacy() &&
+    if (!spec.is_canonical() &&
         (spec.bound_check == BoundCheck::SOLUTION_END ||
          spec.bound_check == BoundCheck::ROUTE_END)) {
       const float value = state.algebra_state[index];
@@ -3564,7 +3565,7 @@ Solution RoutingDecoder::scope_restricted_refine(
   static constexpr size_t MAX_SCREENING_LABELS = 512;
   // Planned summaries exactly certify capacity, time-window, route/tour-limit,
   // prize, and depot assignment for customer-only route edits. Custom algebra
-  // rows are replayed below without rebuilding the legacy evaluator state.
+  // rows are replayed below without rebuilding the canonical evaluator state.
   const bool has_negative_demand = std::any_of(
       problem_.demand.begin() + problem_.depot_count,
       problem_.demand.end(),
@@ -6124,13 +6125,13 @@ Solution RoutingDecoder::evaluate(const std::vector<int32_t> &route) const {
       ++off_graph_edges;
   }
 
-  // The legacy evaluator above remains the frozen parity oracle. Explicit
+  // The canonical evaluator above remains the frozen parity oracle. Explicit
   // algebra rows are replayed alongside it from the same route so schema-only
   // resources participate in incumbent validation and SRR fallback checks.
   std::vector<float> algebra(resource_count(), 0.0f);
   for (int32_t resource_index = 0; resource_index < resource_count();
        ++resource_index) {
-    if (!resource(resource_index).is_legacy())
+    if (!resource(resource_index).is_canonical())
       algebra[resource_index] = resource(resource_index).initial;
   }
   int32_t algebra_current = route.front();
@@ -6139,7 +6140,7 @@ Solution RoutingDecoder::evaluate(const std::vector<int32_t> &route) const {
     for (int32_t resource_index = 0; resource_index < resource_count();
          ++resource_index) {
       const ResourceSpec &spec = resource(resource_index);
-      if (spec.is_legacy())
+      if (spec.is_canonical())
         continue;
       float value = algebra[resource_index];
       const bool event_reset =
@@ -6184,7 +6185,7 @@ Solution RoutingDecoder::evaluate(const std::vector<int32_t> &route) const {
   for (int32_t resource_index = 0; resource_index < resource_count();
        ++resource_index) {
     const ResourceSpec &spec = resource(resource_index);
-    if (!spec.is_legacy() && spec.bound_check == BoundCheck::SOLUTION_END &&
+    if (!spec.is_canonical() && spec.bound_check == BoundCheck::SOLUTION_END &&
         (algebra[resource_index] < spec.lower - FEASIBILITY_EPS ||
          algebra[resource_index] > spec.upper + FEASIBILITY_EPS)) {
       failed.error = "terminal resource bound failed: " + spec.name;

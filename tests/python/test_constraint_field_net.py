@@ -10,6 +10,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
 
 import prism_decoder  # noqa: E402
+from problem_data import problem_schema  # noqa: E402
 from net import (  # noqa: E402
     EDGE_FEATURE_COUNT,
     FIELD_CHANNEL_COUNT,
@@ -27,6 +28,13 @@ from train import (  # noqa: E402
 )
 
 
+def make_decoder(problem: dict, *args, **kwargs):
+    """Materialize explicit fixture semantics before calling the native API."""
+    explicit = problem_schema(str(problem.get("name", "schema")))
+    explicit.update(problem)
+    return prism_decoder.Decoder(explicit, *args, **kwargs)
+
+
 def test_constraint_field_net_uses_normalized_decoder_contract() -> None:
     rng = np.random.default_rng(301)
     coordinates = rng.random((30, 2), dtype=np.float32)
@@ -34,7 +42,7 @@ def test_constraint_field_net_uses_normalized_decoder_contract() -> None:
         coordinates[:, None] - coordinates[None, :], axis=-1
     ).astype(np.float32)
     demand = np.r_[0.0, rng.uniform(0.01, 0.06, 29)].astype(np.float32)
-    decoder = prism_decoder.Decoder(
+    decoder = make_decoder(
         {
             "name": "cvrp",
             "coordinates": coordinates,
@@ -135,7 +143,7 @@ def test_constraint_field_net_rejects_unnormalized_inputs() -> None:
     distance = np.linalg.norm(
         coordinates[:, None] - coordinates[None, :], axis=-1
     ).astype(np.float32)
-    decoder = prism_decoder.Decoder(
+    decoder = make_decoder(
         {"name": "tsp", "coordinates": coordinates, "distance": distance},
         n_rollouts=1,
     )
@@ -155,7 +163,7 @@ def test_typed_field_accepts_unseen_runtime_resource_without_new_weights() -> No
     ).astype(np.float32)
 
     def make(resource_name: str):
-        return prism_decoder.Decoder(
+        return make_decoder(
             {
                 "name": "cvrp",
                 "coordinates": coordinates,
@@ -225,11 +233,11 @@ def test_objective_conditioning_reaches_descriptor_and_field() -> None:
     ).astype(np.float32)
     prize = np.r_[0.0, rng.uniform(0.05, 1.0, 17)].astype(np.float32)
 
-    distance_problem = prism_decoder.Decoder(
+    distance_problem = make_decoder(
         {"name": "tsp", "coordinates": coordinates, "distance": distance},
         n_rollouts=1,
     )
-    prize_problem = prism_decoder.Decoder(
+    prize_problem = make_decoder(
         {
             "name": "op",
             "coordinates": coordinates,
@@ -267,10 +275,10 @@ def test_objective_conditioning_reaches_descriptor_and_field() -> None:
 def test_depot_conditioning_reaches_descriptor_and_field() -> None:
     import problem_data
 
-    single = prism_decoder.Decoder(
+    single = make_decoder(
         problem_data.generated_problem("ocvrp", 16), n_rollouts=1
     )
-    multi = prism_decoder.Decoder(
+    multi = make_decoder(
         problem_data.generated_problem("mdocvrp", 16), n_rollouts=1
     )
     single_data = build_decoder_data(single)
@@ -307,7 +315,7 @@ def test_resource_attention_handles_no_active_constraint_tokens() -> None:
     distance = np.linalg.norm(
         coordinates[:, None] - coordinates[None, :], axis=-1
     ).astype(np.float32)
-    decoder = prism_decoder.Decoder(
+    decoder = make_decoder(
         {"name": "tsp", "coordinates": coordinates, "distance": distance},
         n_rollouts=1,
     )
@@ -332,7 +340,7 @@ def test_model_output_drives_field_decoder_iteration() -> None:
         coordinates[:, None] - coordinates[None, :], axis=-1
     ).astype(np.float32)
     demand = np.r_[0.0, rng.uniform(0.01, 0.05, 25)].astype(np.float32)
-    decoder = prism_decoder.Decoder(
+    decoder = make_decoder(
         {
             "name": "cvrp",
             "coordinates": coordinates,
@@ -366,7 +374,7 @@ def test_cpp_trace_replays_exact_state_dependent_policy() -> None:
         coordinates[:, None] - coordinates[None, :], axis=-1
     ).astype(np.float32)
     demand = np.r_[0.0, rng.uniform(0.01, 0.05, 31)].astype(np.float32)
-    decoder = prism_decoder.Decoder(
+    decoder = make_decoder(
         {
             "name": "cvrp",
             "coordinates": coordinates,

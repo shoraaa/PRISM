@@ -1,7 +1,7 @@
 #include "decoder.h"
-#include "legacy_schema.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <limits>
 #include <stdexcept>
@@ -136,75 +136,41 @@ Objective parse_objective(const py::dict &data) {
   throw std::invalid_argument("unknown objective: " + objective);
 }
 
-struct NormalizedProblemInput {
-  py::dict data;
-  bool used_legacy_adapter = false;
-};
-
-NormalizedProblemInput normalize_problem_schema(const py::dict &source) {
-  NormalizedProblemInput result;
+py::dict normalize_problem_schema(const py::dict &source) {
+  py::dict result;
   for (const auto &item : source)
-    result.data[item.first] = item.second;
+    result[item.first] = item.second;
 
-  const bool has_legacy_name = source.contains("name");
-  prism::LegacySchemaDefaults legacy;
-  if (has_legacy_name) {
-    legacy = prism::legacy_schema_defaults(
-        source["name"].cast<std::string>());
+  if (source.contains("name")) {
+    std::string name = source["name"].cast<std::string>();
+    std::transform(name.begin(), name.end(), name.begin(),
+                   [](unsigned char c) {
+                     return static_cast<char>(std::tolower(c));
+                   });
+    result["name"] = std::move(name);
   } else {
-    legacy.name = "schema";
+    result["name"] = "schema";
   }
-  result.data["name"] = legacy.name;
 
-  const auto require_name_for_missing = [&](const char *key) {
-    if (!has_legacy_name)
-      throw std::invalid_argument(
-          std::string("explicit schema without 'name' is missing '") + key +
-          "'");
-  };
-
-  if (!source.contains("constraints")) {
-    require_name_for_missing("constraints");
-    result.data["constraints"] =
-        prism::constraint_names(legacy.constraints);
-    result.used_legacy_adapter = true;
-  }
-  if (!source.contains("objective")) {
-    require_name_for_missing("objective");
-    result.data["objective"] = prism::objective_name(legacy.objective);
-    result.used_legacy_adapter = true;
-  }
-  if (!source.contains("depot_count")) {
-    require_name_for_missing("depot_count");
-    result.data["depot_count"] = legacy.depot_count;
-    result.used_legacy_adapter = true;
-  }
-  if (!source.contains("multi_route")) {
-    require_name_for_missing("multi_route");
-    result.data["multi_route"] = legacy.multi_route;
-    result.used_legacy_adapter = true;
-  }
-  if (!source.contains("open_route")) {
-    require_name_for_missing("open_route");
-    result.data["open_route"] = legacy.open_route;
-    result.used_legacy_adapter = true;
+  for (const char *key : {"constraints", "objective", "depot_count",
+                          "multi_route", "open_route"}) {
+    if (!source.contains(key))
+      throw std::invalid_argument(std::string("explicit schema is missing '") +
+                                  key + "'");
   }
 
   if (!source.contains("capacity"))
-    result.data["capacity"] = 1.0f;
+    result["capacity"] = 1.0f;
   if (!source.contains("route_limit"))
-    result.data["route_limit"] = std::numeric_limits<float>::infinity();
+    result["route_limit"] = std::numeric_limits<float>::infinity();
   if (!source.contains("prize_quota"))
-    result.data["prize_quota"] = 1.0f;
+    result["prize_quota"] = 1.0f;
   if (!source.contains("tour_limit")) {
-    const uint32_t constraints = parse_constraints(result.data);
-    if ((constraints & static_cast<uint32_t>(TOUR_LIMIT)) != 0) {
-      require_name_for_missing("tour_limit");
-      result.data["tour_limit"] = legacy.tour_limit;
-      result.used_legacy_adapter = true;
-    } else {
-      result.data["tour_limit"] = std::numeric_limits<float>::infinity();
-    }
+    const uint32_t constraints = parse_constraints(result);
+    if ((constraints & static_cast<uint32_t>(TOUR_LIMIT)) != 0)
+      throw std::invalid_argument(
+          "explicit tour_limit constraint is missing 'tour_limit'");
+    result["tour_limit"] = std::numeric_limits<float>::infinity();
   }
   return result;
 }
@@ -415,12 +381,9 @@ void set_pickup_delivery_relations(Problem &problem, const py::dict &data) {
 }
 
 Problem parse_problem(const py::dict &data) {
-  const NormalizedProblemInput input = normalize_problem_schema(data);
-  const py::dict &schema = input.data;
+  const py::dict schema = normalize_problem_schema(data);
   Problem problem;
   problem.name = schema["name"].cast<std::string>();
-  problem.schema_source =
-      input.used_legacy_adapter ? "legacy_compat" : "explicit";
   if (schema.contains("distance") && !schema["distance"].is_none())
     problem.distance = required_matrix(schema, "distance", problem.node_count);
   problem.coordinates = optional_coordinates(schema, problem.node_count);
@@ -929,7 +892,6 @@ public:
     const Problem &problem = solver_.problem();
     py::dict result;
     result["name"] = problem.name;
-    result["schema_source"] = problem.schema_source;
     result["node_count"] = problem.node_count;
     result["customer_count"] = problem.customer_count();
     result["depot_count"] = problem.depot_count;
@@ -1007,7 +969,7 @@ public:
       row["name"] = resource.name;
       row["active"] = resource.active;
       row["state_dim"] = resource.state_dim;
-      row["legacy"] = resource.is_legacy();
+      row["canonical"] = resource.is_canonical();
       resource_rows.append(std::move(row));
     }
     result["resources"] = std::move(resource_rows);
@@ -1170,7 +1132,7 @@ PYBIND11_MODULE(prism_decoder, module) {
   module.def("get_max_threads", []() { return omp_get_max_threads(); });
   module.def("get_available_threads", []() { return omp_get_num_procs(); });
   module.def("normalize_problem_schema", [](const py::dict &problem) {
-    return normalize_problem_schema(problem).data;
+    return normalize_problem_schema(problem);
   });
 
   py::class_<PyDecoder>(module, "Decoder")

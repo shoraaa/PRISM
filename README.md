@@ -121,13 +121,12 @@ positions are excluded. Resource tensors grow with the registry, while the
 canonical seven rows remain at their historical indices so the distance-only
 control path retains exact behavior.
 
-Native execution consumes a normalized schema. `problem_data.py` supplies that
-schema explicitly; direct users of the historical pybind API may still pass a
-legacy URS name, but only the boundary compatibility adapter interprets it.
-`prism_decoder.normalize_problem_schema(problem)` exposes the exact normalized
-dictionary, and decoder metadata reports `schema_source` as `explicit` or
-`legacy_compat`. A complete explicit schema may omit `name` (metadata then uses
-`schema`). Once normalized, `Problem::name` is metadata only.
+Native execution requires an explicit normalized schema. `constraints`,
+`objective`, `depot_count`, `multi_route`, and `open_route` must be declared;
+`name` is optional metadata and never supplies solver semantics. Incomplete
+name-only inputs are rejected. `prism_decoder.normalize_problem_schema(problem)`
+exposes the exact normalized dictionary and fills only schema-independent
+numeric defaults. `problem_data.py` owns benchmark-name-to-schema conversion.
 
 The canonical constraints are registered as compiled kernels with their schema
 name, stable field-channel slot, resource operator, and search capabilities
@@ -247,7 +246,7 @@ whose load-order certificate cannot be proven still retain full replay.
 `srr_candidate_limit`,
 `srr_first_improvement`,
 `srr_dont_look`, and `srr_extended_operators` expose the policy and permit an
-exhaustive legacy ablation.
+exhaustive historical ablation.
 
 Accepted plans replace only the affected route caches. Edge membership uses
 reference counts, resource extrema use versioned heaps, and the repair scope is

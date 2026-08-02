@@ -34,13 +34,13 @@ enum class FieldChannel : uint8_t {
 };
 
 enum class ResourceOperator : uint8_t {
-  LEGACY_CAPACITY,
-  LEGACY_TIME_WINDOW,
-  LEGACY_ROUTE_LIMIT,
-  LEGACY_TOUR_LIMIT,
-  LEGACY_BACKHAUL_ORDER,
-  LEGACY_PICKUP_DELIVERY,
-  LEGACY_PRIZE_QUOTA,
+  CANONICAL_CAPACITY,
+  CANONICAL_TIME_WINDOW,
+  CANONICAL_ROUTE_LIMIT,
+  CANONICAL_TOUR_LIMIT,
+  CANONICAL_BACKHAUL_ORDER,
+  CANONICAL_PICKUP_DELIVERY,
+  CANONICAL_PRIZE_QUOTA,
   AFFINE_ACCUMULATOR,
 };
 
@@ -53,7 +53,7 @@ enum class BoundCheck : uint8_t { TRANSITION, ROUTE_END, SOLUTION_END };
 // never calls Python and never performs string lookup.
 struct ResourceSpec {
   std::string name;
-  // Canonical legacy rows remain present, even when their constraint is not
+  // Canonical rows remain present, even when their constraint is not
   // active, so v1 tensor/channel ordering stays losslessly aligned. Runtime
   // schema rows are always active and append after those compatibility rows.
   bool active = true;
@@ -75,7 +75,7 @@ struct ResourceSpec {
   std::vector<float> node_values;
   std::vector<uint8_t> reset_nodes;
 
-  bool is_legacy() const {
+  bool is_canonical() const {
     return op != ResourceOperator::AFFINE_ACCUMULATOR;
   }
 };
@@ -126,7 +126,6 @@ const ConstraintKernelSpec *constraint_kernel(const std::string &schema_name);
 
 struct Problem {
   std::string name;
-  std::string schema_source = "explicit";
   int32_t node_count = 0;
   int32_t depot_count = 0;
   uint32_t constraints = 0;
@@ -155,7 +154,7 @@ struct Problem {
   std::vector<int32_t> delivery_of_pickup;
   std::vector<int32_t> pickup_of_delivery;
 
-  // Empty for the legacy input contract. RoutingDecoder materializes the seven
+  // Empty for the inferred input contract. RoutingDecoder materializes the seven
   // canonical compatibility rows, marks them from `constraints`, then appends
   // explicit algebra rows.
   std::vector<ResourceSpec> resources;
@@ -397,7 +396,7 @@ private:
   uint32_t active_kernel_capabilities_ = 0;
   std::array<uint8_t, FIELD_CHANNEL_COUNT> active_field_channels_{};
   std::vector<ResourceSpec> resources_;
-  std::array<int32_t, FIELD_CHANNEL_COUNT> legacy_resource_index_{};
+  std::array<int32_t, FIELD_CHANNEL_COUNT> canonical_resource_index_{};
   CandidateConfig candidate_config_;
   SearchConfig search_config_;
   int32_t n_rollouts_;
@@ -449,7 +448,7 @@ private:
                               const float *edge_additive) const;
   void build_model_features();
   bool field_channel_active(int32_t channel) const;
-  int32_t legacy_resource_index(FieldChannel channel) const;
+  int32_t canonical_resource_index(FieldChannel channel) const;
   const ResourceSpec &resource(int32_t index) const;
   void build_resource_registry();
   void build_constraint_kernel_set();
