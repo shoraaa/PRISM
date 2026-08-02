@@ -540,6 +540,8 @@ py::dict solution_to_dict(const Solution &solution, Objective objective) {
   result["srr_scope_nodes"] = solution.srr_scope_nodes;
   result["srr_revisits"] = solution.srr_revisits;
   result["srr_evaluations"] = solution.srr_evaluations;
+  result["srr_certified_evaluations"] =
+      solution.srr_certified_evaluations;
   result["srr_incremental_rebuilds"] = solution.srr_incremental_rebuilds;
   result["srr_full_rebuilds"] = solution.srr_full_rebuilds;
   result["srr_rebuilt_nodes"] = solution.srr_rebuilt_nodes;

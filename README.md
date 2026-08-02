@@ -216,11 +216,13 @@ local link reactivates the node. Its hot loop contains the same compact move
 families (relocate, swap, 2-opt-star, and intra-route 2-opt), while optional-node,
 depot-structure, and pickup-delivery moves remain enabled when their schema
 requires them. These are schema-independent scheduling rules, not a
-CVRP-specialized move evaluator. Single-route static distance/capacity/prize
-plans are certified by the exact planned-resource algebra before replacement;
-multi-route boundaries, stateful rows (time windows, backhaul,
-pickup-delivery), route/tour limits, and runtime rows additionally use full
-route replay. `srr_candidate_limit`,
+CVRP-specialized move evaluator. For single-depot schemas, an explicit route
+structure check plus exact planned-resource summaries certify multi-route
+capacity, time-window, route/tour-limit, and prize changes before replacement.
+Custom reset, battery, and other runtime algebra rows replay only their own
+state over the materialized candidate. Multi-depot, pickup-delivery, and
+backhaul schemas retain full route replay because their state can cross the
+independently planned route pieces. `srr_candidate_limit`,
 `srr_first_improvement`,
 `srr_dont_look`, and `srr_extended_operators` expose the policy and permit an
 exhaustive legacy ablation.

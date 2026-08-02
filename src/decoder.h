@@ -190,6 +190,7 @@ struct Solution {
   int32_t srr_scope_nodes = 0;
   int32_t srr_revisits = 0;
   int32_t srr_evaluations = 0;
+  int32_t srr_certified_evaluations = 0;
   int32_t srr_incremental_rebuilds = 0;
   int32_t srr_full_rebuilds = 0;
   int64_t srr_rebuilt_nodes = 0;

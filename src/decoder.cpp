@@ -3420,17 +3420,138 @@ Solution RoutingDecoder::scope_restricted_refine(
   rebuild_cache();
   rebuild_resource_cache();
   static constexpr size_t MAX_SCREENING_LABELS = 512;
-  // The planned-resource certificate is exact for the plain distance/capacity
-  // and prize paths. Route/tour limits, backhaul ordering, time windows, and
-  // pickup-delivery retain stateful replay. Runtime algebra rows are
-  // deliberately kept on the full path until their route-piece certificate is
-  // implemented as well.
-  const bool canonical_plan_certificate =
-      resource_count() == FIELD_CHANNEL_COUNT &&
-      !problem_.multi_route && problem_.depot_count <= 1 &&
-      !problem_.has(PICKUP_DELIVERY) && !problem_.has(TIME_WINDOWS) &&
-      !problem_.has(BACKHAUL_ORDER) && !problem_.has(ROUTE_LIMIT) &&
-      !problem_.has(TOUR_LIMIT);
+  // Planned summaries exactly certify the single-depot capacity, time-window,
+  // route/tour-limit, and prize paths. Custom algebra rows are replayed below
+  // without rebuilding the legacy evaluator state. Multi-depot routes,
+  // pickup-delivery precedence, and globally ordered backhauls retain full
+  // replay because their state crosses independently planned route pieces.
+  const bool has_negative_demand = std::any_of(
+      problem_.demand.begin() + problem_.depot_count,
+      problem_.demand.end(),
+      [](float demand) { return demand < -FEASIBILITY_EPS; });
+  const bool planned_commit_certificate =
+      problem_.depot_count <= 1 && !problem_.has(PICKUP_DELIVERY) &&
+      !problem_.has(BACKHAUL_ORDER) && !has_negative_demand;
+  std::vector<int32_t> structure_seen(problem_.node_count, 0);
+  int32_t structure_epoch = 0;
+  const auto route_structure_certificate =
+      [&](const std::vector<int32_t> &trial) {
+        if (trial.empty())
+          return false;
+        if (structure_epoch == std::numeric_limits<int32_t>::max()) {
+          std::fill(structure_seen.begin(), structure_seen.end(), 0);
+          structure_epoch = 1;
+        } else {
+          ++structure_epoch;
+        }
+        int32_t seen_customers = 0;
+        if (problem_.depot_count > 0) {
+          if (trial.front() < 0 || trial.front() >= problem_.depot_count)
+            return false;
+          bool at_depot = true;
+          for (size_t index = 1; index < trial.size(); ++index) {
+            const int32_t node = trial[index];
+            if (node < 0 || node >= problem_.node_count)
+              return false;
+            if (node < problem_.depot_count) {
+              if (at_depot)
+                return false;
+              at_depot = true;
+              continue;
+            }
+            if (structure_seen[node] == structure_epoch)
+              return false;
+            structure_seen[node] = structure_epoch;
+            ++seen_customers;
+            at_depot = false;
+          }
+          if (problem_.multi_route && !at_depot)
+            return false;
+        } else {
+          for (int32_t node : trial) {
+            if (node < 0 || node >= problem_.node_count ||
+                structure_seen[node] == structure_epoch)
+              return false;
+            structure_seen[node] = structure_epoch;
+            ++seen_customers;
+          }
+        }
+        if (problem_.has(VISIT_ALL) &&
+            seen_customers != problem_.customer_count())
+          return false;
+        return true;
+      };
+  const auto runtime_resource_certificate =
+      [&](const std::vector<int32_t> &trial) {
+        if (resource_count() == FIELD_CHANNEL_COUNT)
+          return true;
+        std::vector<float> algebra(resource_count(), 0.0f);
+        for (int32_t index = FIELD_CHANNEL_COUNT; index < resource_count();
+             ++index)
+          algebra[index] = resource(index).initial;
+        int32_t current = trial.front();
+        int32_t route_depot = problem_.depot_count > 0 ? current : -1;
+        bool at_depot = problem_.depot_count > 0;
+        const auto extend = [&](int32_t next, bool force_route_end) {
+          const bool depot = next < problem_.depot_count;
+          for (int32_t index = FIELD_CHANNEL_COUNT; index < resource_count();
+               ++index) {
+            const ResourceSpec &spec = resource(index);
+            float value = algebra[index];
+            const bool event_reset =
+                !spec.reset_nodes.empty() && spec.reset_nodes[next];
+            if (spec.edge_uses_distance)
+              value += spec.edge_coefficient * problem_.dist(current, next);
+            if (!spec.edge_values.empty())
+              value += spec.edge_coefficient *
+                       spec.edge_values[static_cast<size_t>(current) *
+                                            problem_.node_count +
+                                        next];
+            if (!spec.node_values.empty())
+              value += spec.node_coefficient * spec.node_values[next];
+            const bool check =
+                spec.bound_check == BoundCheck::TRANSITION ||
+                ((depot || force_route_end) &&
+                 spec.bound_check == BoundCheck::ROUTE_END);
+            if (check && (value < spec.lower - FEASIBILITY_EPS ||
+                          value > spec.upper + FEASIBILITY_EPS))
+              return false;
+            if ((depot && spec.reset_at_depot) || event_reset)
+              value = spec.reset_value;
+            else if (depot && spec.scope == ResourceScope::ROUTE)
+              value = spec.initial;
+            algebra[index] = value;
+          }
+          current = next;
+          if (depot) {
+            route_depot = next;
+            at_depot = true;
+          } else {
+            at_depot = false;
+          }
+          return true;
+        };
+        for (size_t index = 1; index < trial.size(); ++index) {
+          if (!extend(trial[index], false))
+            return false;
+        }
+        if (problem_.has(VISIT_ALL) && !problem_.multi_route && !at_depot &&
+            !problem_.open_route) {
+          const int32_t end =
+              problem_.depot_count == 0 ? trial.front() : route_depot;
+          if (!extend(end, true))
+            return false;
+        }
+        for (int32_t index = FIELD_CHANNEL_COUNT; index < resource_count();
+             ++index) {
+          const ResourceSpec &spec = resource(index);
+          if (spec.bound_check == BoundCheck::SOLUTION_END &&
+              (algebra[index] < spec.lower - FEASIBILITY_EPS ||
+               algebra[index] > spec.upper + FEASIBILITY_EPS))
+            return false;
+        }
+        return true;
+      };
   ResourceEvaluation current_resource;
   if (trace != nullptr)
     current_resource = evaluate_resources(solution.route);
@@ -4329,6 +4450,7 @@ Solution RoutingDecoder::scope_restricted_refine(
 
   int32_t moves = 0;
   int32_t full_evaluations = 0;
+  int32_t certified_evaluations = 0;
   int32_t incremental_rebuilds = 0;
   int32_t full_rebuilds = 0;
   int64_t rebuilt_nodes = 0;
@@ -4453,13 +4575,15 @@ Solution RoutingDecoder::scope_restricted_refine(
               feasible = false;
             }
           }
-          const bool needs_planned_resource =
-              canonical_plan_certificate ||
-              (trace != nullptr &&
-               (trace->screened_edges.size() < MAX_SCREENING_LABELS ||
-                search_config_.verify_screening_resources));
-          const std::optional<ResourceEvaluation> planned_resource =
-              needs_planned_resource
+          // Screening labels need resource values immediately, but the commit
+          // certificate does not: defer its exact stateful work until the
+          // cheap objective and guidance gates identify a promising move.
+          const bool needs_screening_resource =
+              trace != nullptr &&
+              (trace->screened_edges.size() < MAX_SCREENING_LABELS ||
+               search_config_.verify_screening_resources);
+          std::optional<ResourceEvaluation> planned_resource =
+              needs_screening_resource
                   ? evaluate_planned_resources(
                         plans, planned_sequences, affected_routes)
                   : std::nullopt;
@@ -4550,15 +4674,31 @@ Solution RoutingDecoder::scope_restricted_refine(
           std::vector<int32_t> trial;
           if (!materialize(trial))
             return;
+          if (planned_commit_certificate && !planned_resource.has_value()) {
+            planned_resource = evaluate_planned_resources(
+                plans, planned_sequences, affected_routes);
+          }
+          bool planned_resources_feasible = planned_resource.has_value();
+          if (planned_resources_feasible) {
+            for (int32_t channel = 0; channel < FIELD_CHANNEL_COUNT;
+                 ++channel) {
+              if (planned_resource->violation[channel] >
+                  FEASIBILITY_EPS /
+                      std::max(resource_scale(channel), EPS)) {
+                planned_resources_feasible = false;
+                break;
+              }
+            }
+          }
           const bool certificate_feasible =
-              canonical_plan_certificate && planned_resource.has_value() &&
+              planned_commit_certificate && planned_resource.has_value() &&
               planned_resource->structurally_valid &&
-              std::all_of(
-                  planned_resource->violation.begin(),
-                  planned_resource->violation.end(),
-                  [](float violation) { return violation <= FEASIBILITY_EPS; });
+              route_structure_certificate(trial) &&
+              runtime_resource_certificate(trial) &&
+              planned_resources_feasible;
           Solution candidate;
           if (certificate_feasible) {
+            ++certified_evaluations;
             // `scored` was produced from the same exact sequence summaries;
             // attach the materialized route for cache replacement without
             // replaying every transition a second time.
@@ -5169,6 +5309,7 @@ Solution RoutingDecoder::scope_restricted_refine(
   }
   solution.srr_moves = moves;
   solution.srr_evaluations = full_evaluations;
+  solution.srr_certified_evaluations = certified_evaluations;
   solution.srr_incremental_rebuilds = incremental_rebuilds;
   solution.srr_full_rebuilds = full_rebuilds;
   solution.srr_rebuilt_nodes = rebuilt_nodes;
