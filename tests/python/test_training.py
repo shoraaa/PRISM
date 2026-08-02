@@ -50,7 +50,6 @@ def _args() -> Namespace:
         seed=404,
         device="cpu",
         search_iterations=2,
-        option_max_steps=2,
         infeasible_penalty=10.0,
         reward_clip=1.0,
         smdp_gamma=0.99,
@@ -137,7 +136,7 @@ def test_event_driven_option_rollout_and_pretrain_update(
     assert torch.count_nonzero(rollout.steps[0].graph.x[:, 12]) == 0
     assert rollout.steps[0].transition_rollout is not None
     assert all(
-        1 <= step.duration <= args.option_max_steps for step in rollout.steps
+        1 <= step.duration <= args.search_iterations for step in rollout.steps
     )
     assert all(
         step.old_logp.numel() == int(step.decisions.sum())
@@ -527,6 +526,7 @@ def test_stagnant_options_reuse_field_and_skip_fallback_labels() -> None:
     assert bootstrap.resource_delta is not None
     assert all(step.trace["screened_edges"].size > 0 for step in refinement)
     assert all(step.resource_delta is None for step in refinement)
+    assert all(step.duration == args.search_iterations for step in refinement)
 
 
 def test_inference_is_deterministic() -> None:

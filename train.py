@@ -652,9 +652,7 @@ def collect_instance_rollout(
         transition_reward = 0.0
         transition_step = None
         winner_rollout = None
-        for _ in range(args.option_max_steps):
-            if iteration >= args.search_iterations:
-                break
+        while iteration < args.search_iterations:
             decoder_start = time.perf_counter()
             batch = decoder.sample_traced(**guidance)
             decoder_seconds += time.perf_counter() - decoder_start
@@ -2313,7 +2311,6 @@ def parse_args() -> argparse.Namespace:
             "field for the complete search budget"
         ),
     )
-    parser.add_argument("--option-max-steps", type=int, default=4)
     parser.add_argument("--improvement-epsilon", type=float, default=0.0)
     parser.add_argument("--smdp-gamma", type=float, default=0.99)
     parser.add_argument(
