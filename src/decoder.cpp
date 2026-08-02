@@ -3420,6 +3420,16 @@ Solution RoutingDecoder::scope_restricted_refine(
   rebuild_cache();
   rebuild_resource_cache();
   static constexpr size_t MAX_SCREENING_LABELS = 512;
+  // The planned-resource certificate is exact for the plain distance/capacity
+  // and prize paths. Route/tour limits, backhaul ordering, time windows, and
+  // pickup-delivery retain stateful replay. Runtime algebra rows are
+  // deliberately kept on the full path until their route-piece certificate is
+  // implemented as well.
+  const bool canonical_plan_certificate =
+      resource_count() == FIELD_CHANNEL_COUNT &&
+      !problem_.has(PICKUP_DELIVERY) && !problem_.has(TIME_WINDOWS) &&
+      !problem_.has(BACKHAUL_ORDER) && !problem_.has(ROUTE_LIMIT) &&
+      !problem_.has(TOUR_LIMIT);
   ResourceEvaluation current_resource;
   if (trace != nullptr)
     current_resource = evaluate_resources(solution.route);
@@ -4443,9 +4453,10 @@ Solution RoutingDecoder::scope_restricted_refine(
             }
           }
           const bool needs_planned_resource =
-              trace != nullptr &&
-              (trace->screened_edges.size() < MAX_SCREENING_LABELS ||
-               search_config_.verify_screening_resources);
+              canonical_plan_certificate ||
+              (trace != nullptr &&
+               (trace->screened_edges.size() < MAX_SCREENING_LABELS ||
+                search_config_.verify_screening_resources));
           const std::optional<ResourceEvaluation> planned_resource =
               needs_planned_resource
                   ? evaluate_planned_resources(
@@ -4538,8 +4549,25 @@ Solution RoutingDecoder::scope_restricted_refine(
           std::vector<int32_t> trial;
           if (!materialize(trial))
             return;
-          ++full_evaluations;
-          Solution candidate = evaluate(trial);
+          const bool certificate_feasible =
+              canonical_plan_certificate && planned_resource.has_value() &&
+              planned_resource->structurally_valid &&
+              std::all_of(
+                  planned_resource->violation.begin(),
+                  planned_resource->violation.end(),
+                  [](float violation) { return violation <= FEASIBILITY_EPS; });
+          Solution candidate;
+          if (certificate_feasible) {
+            // `scored` was produced from the same exact sequence summaries;
+            // attach the materialized route for cache replacement without
+            // replaying every transition a second time.
+            candidate = std::move(scored);
+            candidate.route = std::move(trial);
+            candidate.raw_objective = candidate.objective;
+          } else {
+            ++full_evaluations;
+            candidate = evaluate(trial);
+          }
           if (planned_resource.has_value()) {
             record_planned_screening(plans, *planned_resource);
           } else {
