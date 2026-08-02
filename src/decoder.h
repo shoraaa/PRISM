@@ -10,6 +10,7 @@
 namespace prism {
 
 static constexpr int32_t FIELD_CHANNEL_COUNT = 7;
+static constexpr int32_t CANONICAL_CONSTRAINT_COUNT = 8;
 static constexpr int32_t LIVE_STATE_FEATURE_COUNT = FIELD_CHANNEL_COUNT;
 static constexpr int32_t NODE_FEATURE_COUNT = 24;
 static constexpr int32_t EDGE_FEATURE_COUNT = 11;
@@ -96,8 +97,36 @@ enum Constraint : uint32_t {
   PRIZE_QUOTA = 1u << 7,
 };
 
+// Capabilities describe semantic properties needed by generic search
+// operators. They are registered once with each canonical compiled kernel,
+// instead of being reconstructed from variant names or ad-hoc flag lists.
+enum ConstraintCapability : uint32_t {
+  KERNEL_ROUTE_STATE = 1u << 0,
+  KERNEL_SOLUTION_STATE = 1u << 1,
+  KERNEL_ORDER_SENSITIVE = 1u << 2,
+  KERNEL_REVERSAL_SENSITIVE = 1u << 3,
+  KERNEL_RELATIONAL = 1u << 4,
+};
+
+struct ConstraintKernelSpec {
+  Constraint constraint;
+  const char *schema_name;
+  // VISIT_ALL has no learned resource row and therefore uses -1.
+  int32_t field_channel;
+  const char *resource_name;
+  ResourceOperator resource_operator;
+  uint32_t capabilities;
+};
+
+const std::array<ConstraintKernelSpec, CANONICAL_CONSTRAINT_COUNT> &
+constraint_kernel_registry();
+const ConstraintKernelSpec *constraint_kernel(Constraint constraint);
+const ConstraintKernelSpec *field_channel_kernel(int32_t channel);
+const ConstraintKernelSpec *constraint_kernel(const std::string &schema_name);
+
 struct Problem {
   std::string name;
+  std::string schema_source = "explicit";
   int32_t node_count = 0;
   int32_t depot_count = 0;
   uint32_t constraints = 0;
@@ -132,6 +161,7 @@ struct Problem {
   std::vector<ResourceSpec> resources;
 
   bool has(Constraint constraint) const;
+  bool has_capability(ConstraintCapability capability) const;
   float dist(int32_t from, int32_t to) const;
   int32_t customer_count() const;
   void validate() const;
@@ -295,6 +325,10 @@ public:
   int32_t objective_multiplier() const { return resource_count(); }
   int32_t live_state_feature_count() const { return resource_count(); }
   const std::vector<ResourceSpec> &resources() const { return resources_; }
+  const std::vector<const ConstraintKernelSpec *> &active_constraint_kernels()
+      const {
+    return active_constraint_kernels_;
+  }
   const std::vector<float> &resource_descriptors() const {
     return resource_descriptors_;
   }
@@ -359,6 +393,9 @@ private:
   };
 
   Problem problem_;
+  std::vector<const ConstraintKernelSpec *> active_constraint_kernels_;
+  uint32_t active_kernel_capabilities_ = 0;
+  std::array<uint8_t, FIELD_CHANNEL_COUNT> active_field_channels_{};
   std::vector<ResourceSpec> resources_;
   std::array<int32_t, FIELD_CHANNEL_COUNT> legacy_resource_index_{};
   CandidateConfig candidate_config_;
@@ -415,6 +452,7 @@ private:
   int32_t legacy_resource_index(FieldChannel channel) const;
   const ResourceSpec &resource(int32_t index) const;
   void build_resource_registry();
+  void build_constraint_kernel_set();
   void build_resource_descriptors();
   float resource_state_feature(const State &state, int32_t resource) const;
   bool algebra_transition_feasible(const State &state, int32_t next,

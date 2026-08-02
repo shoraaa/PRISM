@@ -263,8 +263,79 @@ bool finite_nonnegative(float value) {
 
 } // namespace
 
+const std::array<ConstraintKernelSpec, CANONICAL_CONSTRAINT_COUNT> &
+constraint_kernel_registry() {
+  static const std::array<ConstraintKernelSpec,
+                          CANONICAL_CONSTRAINT_COUNT>
+      kernels = {{
+          {VISIT_ALL, "visit_all", -1, nullptr,
+           ResourceOperator::AFFINE_ACCUMULATOR, KERNEL_SOLUTION_STATE},
+          {CAPACITY, "capacity", static_cast<int32_t>(FieldChannel::CAPACITY),
+           "capacity", ResourceOperator::LEGACY_CAPACITY,
+           KERNEL_ROUTE_STATE},
+          {BACKHAUL_ORDER, "backhaul_order",
+           static_cast<int32_t>(FieldChannel::BACKHAUL_ORDER),
+           "backhaul_order", ResourceOperator::LEGACY_BACKHAUL_ORDER,
+           KERNEL_ROUTE_STATE | KERNEL_ORDER_SENSITIVE |
+               KERNEL_REVERSAL_SENSITIVE},
+          {PICKUP_DELIVERY, "pickup_delivery",
+           static_cast<int32_t>(FieldChannel::PICKUP_DELIVERY),
+           "pickup_delivery", ResourceOperator::LEGACY_PICKUP_DELIVERY,
+           KERNEL_ROUTE_STATE | KERNEL_ORDER_SENSITIVE |
+               KERNEL_REVERSAL_SENSITIVE | KERNEL_RELATIONAL},
+          {ROUTE_LIMIT, "route_limit",
+           static_cast<int32_t>(FieldChannel::ROUTE_LIMIT), "route_limit",
+           ResourceOperator::LEGACY_ROUTE_LIMIT, KERNEL_ROUTE_STATE},
+          {TIME_WINDOWS, "time_windows",
+           static_cast<int32_t>(FieldChannel::TIME_WINDOW), "time_window",
+           ResourceOperator::LEGACY_TIME_WINDOW,
+           KERNEL_ROUTE_STATE | KERNEL_ORDER_SENSITIVE |
+               KERNEL_REVERSAL_SENSITIVE},
+          {TOUR_LIMIT, "tour_limit",
+           static_cast<int32_t>(FieldChannel::TOUR_LIMIT), "tour_limit",
+           ResourceOperator::LEGACY_TOUR_LIMIT, KERNEL_SOLUTION_STATE},
+          {PRIZE_QUOTA, "prize_quota",
+           static_cast<int32_t>(FieldChannel::PRIZE_QUOTA), "prize_quota",
+           ResourceOperator::LEGACY_PRIZE_QUOTA, KERNEL_SOLUTION_STATE},
+      }};
+  return kernels;
+}
+
+const ConstraintKernelSpec *constraint_kernel(Constraint constraint) {
+  for (const ConstraintKernelSpec &kernel : constraint_kernel_registry()) {
+    if (kernel.constraint == constraint)
+      return &kernel;
+  }
+  return nullptr;
+}
+
+const ConstraintKernelSpec *field_channel_kernel(int32_t channel) {
+  for (const ConstraintKernelSpec &kernel : constraint_kernel_registry()) {
+    if (kernel.field_channel == channel)
+      return &kernel;
+  }
+  return nullptr;
+}
+
+const ConstraintKernelSpec *constraint_kernel(const std::string &schema_name) {
+  for (const ConstraintKernelSpec &kernel : constraint_kernel_registry()) {
+    if (schema_name == kernel.schema_name)
+      return &kernel;
+  }
+  return nullptr;
+}
+
 bool Problem::has(Constraint constraint) const {
   return (constraints & static_cast<uint32_t>(constraint)) != 0;
+}
+
+bool Problem::has_capability(ConstraintCapability capability) const {
+  for (const ConstraintKernelSpec &kernel : constraint_kernel_registry()) {
+    if (has(kernel.constraint) &&
+        (kernel.capabilities & static_cast<uint32_t>(capability)) != 0)
+      return true;
+  }
+  return false;
 }
 
 float Problem::dist(int32_t from, int32_t to) const {
@@ -459,16 +530,10 @@ const char *objective_direction(Objective objective) {
 }
 
 std::vector<std::string> constraint_names(uint32_t constraints) {
-  const std::pair<Constraint, const char *> known[] = {
-      {VISIT_ALL, "visit_all"},           {CAPACITY, "capacity"},
-      {BACKHAUL_ORDER, "backhaul_order"}, {PICKUP_DELIVERY, "pickup_delivery"},
-      {ROUTE_LIMIT, "route_limit"},       {TIME_WINDOWS, "time_windows"},
-      {TOUR_LIMIT, "tour_limit"},         {PRIZE_QUOTA, "prize_quota"},
-  };
   std::vector<std::string> result;
-  for (const auto &[flag, name] : known) {
-    if ((constraints & static_cast<uint32_t>(flag)) != 0) {
-      result.emplace_back(name);
+  for (const ConstraintKernelSpec &kernel : constraint_kernel_registry()) {
+    if ((constraints & static_cast<uint32_t>(kernel.constraint)) != 0) {
+      result.emplace_back(kernel.schema_name);
     }
   }
   return result;
@@ -509,9 +574,12 @@ std::vector<std::string> node_feature_names() {
 }
 
 std::vector<std::string> field_channel_names() {
-  return {"capacity",       "time_window",     "route_limit",
-          "tour_limit",     "backhaul_order",  "pickup_delivery",
-          "prize_quota"};
+  std::vector<std::string> result(FIELD_CHANNEL_COUNT);
+  for (const ConstraintKernelSpec &kernel : constraint_kernel_registry()) {
+    if (kernel.field_channel >= 0)
+      result[kernel.field_channel] = kernel.resource_name;
+  }
+  return result;
 }
 
 RoutingDecoder::RoutingDecoder(Problem problem, CandidateConfig candidate_config,
@@ -528,6 +596,7 @@ RoutingDecoder::RoutingDecoder(Problem problem, CandidateConfig candidate_config
   if (beta_ < 0.0f) {
     throw std::invalid_argument("beta must be non-negative");
   }
+  build_constraint_kernel_set();
   for (float value : problem_.distance) {
     if (std::isfinite(value))
       distance_scale_ = std::max(distance_scale_, value);
@@ -555,9 +624,8 @@ RoutingDecoder::RoutingDecoder(Problem problem, CandidateConfig candidate_config
     pair_count_ += problem_.delivery_of_pickup[node] >= 0 ? 1 : 0;
   }
   time_scale_ = std::max(time_scale_, distance_scale_);
-  reversal_safe_ = !problem_.has(TIME_WINDOWS) &&
-                   !problem_.has(BACKHAUL_ORDER) &&
-                   !problem_.has(PICKUP_DELIVERY);
+  reversal_safe_ =
+      (active_kernel_capabilities_ & KERNEL_REVERSAL_SENSITIVE) == 0;
   for (int32_t from = 0;
        !problem_.distance.empty() && reversal_safe_ &&
        from < problem_.node_count;
@@ -577,6 +645,20 @@ RoutingDecoder::RoutingDecoder(Problem problem, CandidateConfig candidate_config
   build_candidate_graph({});
 }
 
+void RoutingDecoder::build_constraint_kernel_set() {
+  active_constraint_kernels_.clear();
+  active_kernel_capabilities_ = 0;
+  active_field_channels_.fill(0);
+  for (const ConstraintKernelSpec &kernel : constraint_kernel_registry()) {
+    if (!problem_.has(kernel.constraint))
+      continue;
+    active_constraint_kernels_.push_back(&kernel);
+    active_kernel_capabilities_ |= kernel.capabilities;
+    if (kernel.field_channel >= 0)
+      active_field_channels_[kernel.field_channel] = 1;
+  }
+}
+
 void RoutingDecoder::build_resource_registry() {
   resources_.clear();
   legacy_resource_index_.fill(-1);
@@ -591,22 +673,13 @@ void RoutingDecoder::build_resource_registry() {
     resources_.push_back(std::move(spec));
     legacy_resource_index_[static_cast<int32_t>(channel)] = index;
   };
-  add_legacy(FieldChannel::CAPACITY, ResourceOperator::LEGACY_CAPACITY,
-             "capacity", problem_.has(CAPACITY));
-  add_legacy(FieldChannel::TIME_WINDOW, ResourceOperator::LEGACY_TIME_WINDOW,
-             "time_window", problem_.has(TIME_WINDOWS));
-  add_legacy(FieldChannel::ROUTE_LIMIT, ResourceOperator::LEGACY_ROUTE_LIMIT,
-             "route_limit", problem_.has(ROUTE_LIMIT));
-  add_legacy(FieldChannel::TOUR_LIMIT, ResourceOperator::LEGACY_TOUR_LIMIT,
-             "tour_limit", problem_.has(TOUR_LIMIT));
-  add_legacy(FieldChannel::BACKHAUL_ORDER,
-             ResourceOperator::LEGACY_BACKHAUL_ORDER, "backhaul_order",
-             problem_.has(BACKHAUL_ORDER));
-  add_legacy(FieldChannel::PICKUP_DELIVERY,
-             ResourceOperator::LEGACY_PICKUP_DELIVERY, "pickup_delivery",
-             problem_.has(PICKUP_DELIVERY));
-  add_legacy(FieldChannel::PRIZE_QUOTA, ResourceOperator::LEGACY_PRIZE_QUOTA,
-             "prize_quota", problem_.has(PRIZE_QUOTA));
+  for (int32_t channel = 0; channel < FIELD_CHANNEL_COUNT; ++channel) {
+    const ConstraintKernelSpec *kernel = field_channel_kernel(channel);
+    if (kernel == nullptr)
+      throw std::logic_error("missing canonical field-channel kernel");
+    add_legacy(static_cast<FieldChannel>(channel), kernel->resource_operator,
+               kernel->resource_name, active_field_channels_[channel] != 0);
+  }
 
   for (const ResourceSpec &spec : problem_.resources) {
     if (std::any_of(resources_.begin(), resources_.end(),
@@ -824,23 +897,8 @@ float RoutingDecoder::classical_proximity(int32_t from, int32_t to) const {
 }
 
 bool RoutingDecoder::field_channel_active(int32_t channel) const {
-  switch (static_cast<FieldChannel>(channel)) {
-  case FieldChannel::CAPACITY:
-    return problem_.has(CAPACITY);
-  case FieldChannel::TIME_WINDOW:
-    return problem_.has(TIME_WINDOWS);
-  case FieldChannel::ROUTE_LIMIT:
-    return problem_.has(ROUTE_LIMIT);
-  case FieldChannel::TOUR_LIMIT:
-    return problem_.has(TOUR_LIMIT);
-  case FieldChannel::BACKHAUL_ORDER:
-    return problem_.has(BACKHAUL_ORDER);
-  case FieldChannel::PICKUP_DELIVERY:
-    return problem_.has(PICKUP_DELIVERY);
-  case FieldChannel::PRIZE_QUOTA:
-    return problem_.has(PRIZE_QUOTA);
-  }
-  return false;
+  return channel >= 0 && channel < FIELD_CHANNEL_COUNT &&
+         active_field_channels_[channel] != 0;
 }
 
 float RoutingDecoder::objective_edge_cost(int32_t from, int32_t to) const {

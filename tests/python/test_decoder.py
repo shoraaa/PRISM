@@ -8,7 +8,11 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
 import prism_decoder  # noqa: E402
-from problem_data import generated_problem  # noqa: E402
+from problem_data import (  # noqa: E402
+    BENCHMARK_VARIANTS,
+    generated_problem,
+    problem_schema,
+)
 
 
 def euclidean_problem(size: int, seed: int) -> tuple[np.ndarray, np.ndarray]:
@@ -139,6 +143,141 @@ def test_search_configuration_is_exposed() -> None:
         "verify_screening_resources": False,
         "verify_incremental_srr": False,
     }
+
+
+@pytest.mark.parametrize(
+    "variant",
+    [
+        "tsp",
+        "aop",
+        "pctsp",
+        "cvrpbp",
+        "mdcvrptw",
+        "pdtsp",
+        "opdcvrp",
+    ],
+)
+def test_legacy_name_adapter_is_lossless_against_normalized_schema(
+    variant: str,
+) -> None:
+    problem = generated_problem("op" if variant == "aop" else variant, 16, 50)
+    if variant == "aop":
+        problem = dict(problem, name="aop", tour_limit=1.0)
+    legacy = dict(problem)
+    for key in (
+        "constraints",
+        "objective",
+        "depot_count",
+        "multi_route",
+        "open_route",
+    ):
+        legacy.pop(key, None)
+    if variant in {"op", "aop"}:
+        legacy.pop("tour_limit", None)
+
+    explicit = prism_decoder.normalize_problem_schema(legacy)
+    legacy_solver = prism_decoder.Decoder(legacy, n_rollouts=2)
+    explicit_solver = prism_decoder.Decoder(explicit, n_rollouts=2)
+
+    assert legacy_solver.metadata["schema_source"] == "legacy_compat"
+    assert explicit_solver.metadata["schema_source"] == "explicit"
+    for key in (
+        "depot_count",
+        "constraints",
+        "constraint_kernels",
+        "objective",
+        "multi_route",
+        "open_route",
+        "resources",
+        "field_channel_names",
+    ):
+        assert legacy_solver.metadata[key] == explicit_solver.metadata[key]
+    for attribute in (
+        "edge_index",
+        "heuristic",
+        "proximity",
+        "edge_features",
+        "node_features",
+        "resource_features",
+        "resource_descriptors",
+    ):
+        assert np.array_equal(
+            getattr(legacy_solver, attribute),
+            getattr(explicit_solver, attribute),
+        )
+
+    legacy_solver.seed(20260803)
+    explicit_solver.seed(20260803)
+    for _ in range(2):
+        legacy_solution = legacy_solver.solve(1)
+        explicit_solution = explicit_solver.solve(1)
+        assert legacy_solution.keys() == explicit_solution.keys()
+        for key, expected in legacy_solution.items():
+            actual = explicit_solution[key]
+            if isinstance(expected, np.ndarray):
+                assert np.array_equal(expected, actual)
+            else:
+                assert expected == actual
+
+
+def test_legacy_adapter_matches_all_110_explicit_benchmark_schemas() -> None:
+    for variant in BENCHMARK_VARIANTS:
+        legacy = prism_decoder.normalize_problem_schema({"name": variant})
+        explicit = problem_schema(variant)
+        for key in (
+            "name",
+            "constraints",
+            "objective",
+            "depot_count",
+            "multi_route",
+            "open_route",
+            "capacity",
+            "prize_quota",
+        ):
+            assert legacy[key] == explicit[key], (variant, key)
+        expected_tour_limit = 1.0 if variant == "aop" else 4.0
+        if "tour_limit" in explicit["constraints"]:
+            assert legacy["tour_limit"] == expected_tour_limit
+        else:
+            assert np.isinf(legacy["tour_limit"])
+
+
+def test_explicit_schema_execution_is_independent_of_variant_name() -> None:
+    named = generated_problem("mdcvrptw", 16, 50)
+    renamed = dict(named, name="custom_stateful_schema")
+    nameless = dict(named)
+    nameless.pop("name")
+    named_solver = prism_decoder.Decoder(named, n_rollouts=2)
+    renamed_solver = prism_decoder.Decoder(renamed, n_rollouts=2)
+    nameless_solver = prism_decoder.Decoder(nameless, n_rollouts=2)
+
+    assert named_solver.metadata["schema_source"] == "explicit"
+    assert renamed_solver.metadata["schema_source"] == "explicit"
+    assert nameless_solver.metadata["schema_source"] == "explicit"
+    assert nameless_solver.metadata["name"] == "schema"
+    assert named_solver.metadata["constraint_kernels"] == renamed_solver.metadata[
+        "constraint_kernels"
+    ]
+    assert np.array_equal(named_solver.edge_features, renamed_solver.edge_features)
+    assert np.array_equal(named_solver.edge_features, nameless_solver.edge_features)
+
+    named_solver.seed(20260803)
+    renamed_solver.seed(20260803)
+    nameless_solver.seed(20260803)
+    for _ in range(2):
+        named_solution = named_solver.solve(1)
+        renamed_solution = renamed_solver.solve(1)
+        nameless_solution = nameless_solver.solve(1)
+        assert np.array_equal(named_solution["route"], renamed_solution["route"])
+        assert np.array_equal(named_solution["route"], nameless_solution["route"])
+        assert named_solution["objective"] == renamed_solution["objective"]
+        assert named_solution["objective"] == nameless_solution["objective"]
+        assert named_solution["srr_evaluations"] == renamed_solution[
+            "srr_evaluations"
+        ]
+        assert named_solution["srr_evaluations"] == nameless_solution[
+            "srr_evaluations"
+        ]
 
 
 def test_candidate_graph_uses_only_kd_tree_distance_and_is_incumbent_stable(

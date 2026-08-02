@@ -14,7 +14,7 @@ else:
 ext_modules = [
     Extension(
         "prism_decoder",
-        ["src/binding.cpp", "src/decoder.cpp"],
+        ["src/binding.cpp", "src/decoder.cpp", "src/legacy_schema.cpp"],
         include_dirs=[
             pybind11.get_include(),
             "src",

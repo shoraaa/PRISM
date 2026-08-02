@@ -1,4 +1,5 @@
 #include "decoder.h"
+#include "legacy_schema.h"
 
 #include <algorithm>
 #include <cmath>
@@ -104,91 +105,25 @@ std::vector<float> optional_coordinates(const py::dict &data,
   return std::vector<float>(values, values + 2 * node_count);
 }
 
-bool contains(const std::string &value, const std::string &part) {
-  return value.find(part) != std::string::npos;
-}
-
-bool is_pctsp(const std::string &name) { return contains(name, "pctsp"); }
-
-bool is_orienteering(const std::string &name) {
-  return name == "op" || name == "aop";
-}
-
-bool is_vrp(const std::string &name) { return contains(name, "cvrp"); }
-
-bool is_open_vrp(const std::string &name) {
-  return contains(name, "ocvrp") || contains(name, "opdcvrp");
-}
-
-uint32_t urs_constraints(const std::string &name) {
-  uint32_t flags = 0;
-  if (!is_orienteering(name) && !is_pctsp(name)) {
-    flags |= VISIT_ALL;
-  }
-  if (is_vrp(name)) {
-    flags |= CAPACITY;
-  }
-  if (contains(name, "bp")) {
-    flags |= BACKHAUL_ORDER;
-  }
-  if (contains(name, "pd")) {
-    flags |= PICKUP_DELIVERY;
-  }
-  if (contains(name, "tw")) {
-    flags |= TIME_WINDOWS;
-  }
-  if (contains(name, "l")) {
-    flags |= ROUTE_LIMIT;
-  }
-  if (is_orienteering(name)) {
-    flags |= TOUR_LIMIT;
-  }
-  if (is_pctsp(name)) {
-    flags |= PRIZE_QUOTA;
-  }
-  return flags;
-}
-
-constexpr std::pair<const char *, Constraint> CONSTRAINT_BY_NAME[] = {
-    {"visit_all", VISIT_ALL},           {"capacity", CAPACITY},
-    {"backhaul_order", BACKHAUL_ORDER}, {"pickup_delivery", PICKUP_DELIVERY},
-    {"route_limit", ROUTE_LIMIT},       {"time_windows", TIME_WINDOWS},
-    {"tour_limit", TOUR_LIMIT},         {"prize_quota", PRIZE_QUOTA},
-};
-
-uint32_t parse_constraints(const py::dict &data, const std::string &name) {
-  if (!data.contains("constraints")) {
-    return urs_constraints(name);
-  }
+uint32_t parse_constraints(const py::dict &data) {
+  if (!data.contains("constraints"))
+    throw std::invalid_argument("normalized schema is missing 'constraints'");
   uint32_t flags = 0;
   for (const std::string &constraint :
        data["constraints"].cast<std::vector<std::string>>()) {
-    bool found = false;
-    for (const auto &[candidate, value] : CONSTRAINT_BY_NAME) {
-      if (constraint == candidate) {
-        flags |= value;
-        found = true;
-        break;
-      }
-    }
-    if (!found) {
+    const prism::ConstraintKernelSpec *kernel =
+        prism::constraint_kernel(constraint);
+    if (kernel == nullptr)
       throw std::invalid_argument("unknown constraint: " + constraint);
-    }
+    flags |= kernel->constraint;
   }
   return flags;
 }
 
-Objective parse_objective(const py::dict &data, const std::string &name) {
-  std::string objective;
-  if (data.contains("objective")) {
-    objective = data["objective"].cast<std::string>();
-  } else if (is_orienteering(name)) {
-    objective = "prize";
-  } else if (is_pctsp(name)) {
-    objective = "distance_plus_penalty";
-  } else {
-    objective = "distance";
-  }
+Objective parse_objective(const py::dict &data) {
+  if (!data.contains("objective"))
+    throw std::invalid_argument("normalized schema is missing 'objective'");
+  const std::string objective = data["objective"].cast<std::string>();
   if (objective == "distance") {
     return Objective::MIN_DISTANCE;
   }
@@ -199,6 +134,79 @@ Objective parse_objective(const py::dict &data, const std::string &name) {
     return Objective::MIN_DISTANCE_PLUS_PENALTY;
   }
   throw std::invalid_argument("unknown objective: " + objective);
+}
+
+struct NormalizedProblemInput {
+  py::dict data;
+  bool used_legacy_adapter = false;
+};
+
+NormalizedProblemInput normalize_problem_schema(const py::dict &source) {
+  NormalizedProblemInput result;
+  for (const auto &item : source)
+    result.data[item.first] = item.second;
+
+  const bool has_legacy_name = source.contains("name");
+  prism::LegacySchemaDefaults legacy;
+  if (has_legacy_name) {
+    legacy = prism::legacy_schema_defaults(
+        source["name"].cast<std::string>());
+  } else {
+    legacy.name = "schema";
+  }
+  result.data["name"] = legacy.name;
+
+  const auto require_name_for_missing = [&](const char *key) {
+    if (!has_legacy_name)
+      throw std::invalid_argument(
+          std::string("explicit schema without 'name' is missing '") + key +
+          "'");
+  };
+
+  if (!source.contains("constraints")) {
+    require_name_for_missing("constraints");
+    result.data["constraints"] =
+        prism::constraint_names(legacy.constraints);
+    result.used_legacy_adapter = true;
+  }
+  if (!source.contains("objective")) {
+    require_name_for_missing("objective");
+    result.data["objective"] = prism::objective_name(legacy.objective);
+    result.used_legacy_adapter = true;
+  }
+  if (!source.contains("depot_count")) {
+    require_name_for_missing("depot_count");
+    result.data["depot_count"] = legacy.depot_count;
+    result.used_legacy_adapter = true;
+  }
+  if (!source.contains("multi_route")) {
+    require_name_for_missing("multi_route");
+    result.data["multi_route"] = legacy.multi_route;
+    result.used_legacy_adapter = true;
+  }
+  if (!source.contains("open_route")) {
+    require_name_for_missing("open_route");
+    result.data["open_route"] = legacy.open_route;
+    result.used_legacy_adapter = true;
+  }
+
+  if (!source.contains("capacity"))
+    result.data["capacity"] = 1.0f;
+  if (!source.contains("route_limit"))
+    result.data["route_limit"] = std::numeric_limits<float>::infinity();
+  if (!source.contains("prize_quota"))
+    result.data["prize_quota"] = 1.0f;
+  if (!source.contains("tour_limit")) {
+    const uint32_t constraints = parse_constraints(result.data);
+    if ((constraints & static_cast<uint32_t>(TOUR_LIMIT)) != 0) {
+      require_name_for_missing("tour_limit");
+      result.data["tour_limit"] = legacy.tour_limit;
+      result.used_legacy_adapter = true;
+    } else {
+      result.data["tour_limit"] = std::numeric_limits<float>::infinity();
+    }
+  }
+  return result;
 }
 
 template <typename T>
@@ -407,54 +415,45 @@ void set_pickup_delivery_relations(Problem &problem, const py::dict &data) {
 }
 
 Problem parse_problem(const py::dict &data) {
-  if (!data.contains("name")) {
-    throw std::invalid_argument("missing required field 'name'");
-  }
+  const NormalizedProblemInput input = normalize_problem_schema(data);
+  const py::dict &schema = input.data;
   Problem problem;
-  problem.name = data["name"].cast<std::string>();
-  std::transform(
-      problem.name.begin(), problem.name.end(), problem.name.begin(),
-      [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-  if (data.contains("distance") && !data["distance"].is_none())
-    problem.distance = required_matrix(data, "distance", problem.node_count);
-  problem.coordinates = optional_coordinates(data, problem.node_count);
+  problem.name = schema["name"].cast<std::string>();
+  problem.schema_source =
+      input.used_legacy_adapter ? "legacy_compat" : "explicit";
+  if (schema.contains("distance") && !schema["distance"].is_none())
+    problem.distance = required_matrix(schema, "distance", problem.node_count);
+  problem.coordinates = optional_coordinates(schema, problem.node_count);
   if (problem.node_count == 0) {
     throw std::invalid_argument(
         "one of 'distance' or 'coordinates' must be provided");
   }
 
-  const bool no_depot = problem.name == "tsp" || problem.name == "atsp";
-  const int32_t default_depots =
-      no_depot ? 0 : (contains(problem.name, "md") ? 3 : 1);
-  problem.depot_count = value_or<int32_t>(data, "depot_count", default_depots);
-  problem.constraints = parse_constraints(data, problem.name);
-  problem.objective = parse_objective(data, problem.name);
-  problem.multi_route =
-      value_or<bool>(data, "multi_route", is_vrp(problem.name));
-  problem.open_route =
-      value_or<bool>(data, "open_route", is_open_vrp(problem.name));
+  problem.depot_count = schema["depot_count"].cast<int32_t>();
+  problem.constraints = parse_constraints(schema);
+  problem.objective = parse_objective(schema);
+  problem.multi_route = schema["multi_route"].cast<bool>();
+  problem.open_route = schema["open_route"].cast<bool>();
 
-  problem.capacity = value_or<float>(data, "capacity", 1.0f);
-  problem.route_limit = value_or<float>(data, "route_limit",
-                                        std::numeric_limits<float>::infinity());
-  const float default_tour_limit = problem.name == "aop" ? 1.0f : 4.0f;
-  problem.tour_limit = value_or<float>(
-      data, "tour_limit",
-      problem.has(TOUR_LIMIT) ? default_tour_limit
-                              : std::numeric_limits<float>::infinity());
-  problem.prize_quota = value_or<float>(data, "prize_quota", 1.0f);
+  problem.capacity = schema["capacity"].cast<float>();
+  problem.route_limit = schema["route_limit"].cast<float>();
+  problem.tour_limit = schema["tour_limit"].cast<float>();
+  problem.prize_quota = schema["prize_quota"].cast<float>();
 
-  problem.demand = optional_vector(data, "demand", problem.node_count, 0.0f);
-  problem.prize = optional_vector(data, "prize", problem.node_count, 0.0f);
-  problem.penalty = optional_vector(data, "penalty", problem.node_count, 0.0f);
+  problem.demand =
+      optional_vector(schema, "demand", problem.node_count, 0.0f);
+  problem.prize =
+      optional_vector(schema, "prize", problem.node_count, 0.0f);
+  problem.penalty =
+      optional_vector(schema, "penalty", problem.node_count, 0.0f);
   problem.tw_start =
-      optional_vector(data, "tw_start", problem.node_count, 0.0f);
-  problem.tw_end = optional_vector(data, "tw_end", problem.node_count,
+      optional_vector(schema, "tw_start", problem.node_count, 0.0f);
+  problem.tw_end = optional_vector(schema, "tw_end", problem.node_count,
                                    std::numeric_limits<float>::infinity());
   problem.service_time =
-      optional_vector(data, "service_time", problem.node_count, 0.0f);
-  set_pickup_delivery_relations(problem, data);
-  problem.resources = parse_resource_algebra(data, problem.node_count);
+      optional_vector(schema, "service_time", problem.node_count, 0.0f);
+  set_pickup_delivery_relations(problem, schema);
+  problem.resources = parse_resource_algebra(schema, problem.node_count);
   return problem;
 }
 
@@ -930,10 +929,35 @@ public:
     const Problem &problem = solver_.problem();
     py::dict result;
     result["name"] = problem.name;
+    result["schema_source"] = problem.schema_source;
     result["node_count"] = problem.node_count;
     result["customer_count"] = problem.customer_count();
     result["depot_count"] = problem.depot_count;
     result["constraints"] = prism::constraint_names(problem.constraints);
+    py::list kernel_rows;
+    for (const prism::ConstraintKernelSpec *kernel :
+         solver_.active_constraint_kernels()) {
+      py::dict row;
+      row["name"] = kernel->schema_name;
+      row["field_channel"] = kernel->field_channel;
+      row["resource"] = kernel->resource_name == nullptr
+                            ? py::none()
+                            : py::cast(kernel->resource_name);
+      py::list capabilities;
+      if ((kernel->capabilities & prism::KERNEL_ROUTE_STATE) != 0)
+        capabilities.append("route_state");
+      if ((kernel->capabilities & prism::KERNEL_SOLUTION_STATE) != 0)
+        capabilities.append("solution_state");
+      if ((kernel->capabilities & prism::KERNEL_ORDER_SENSITIVE) != 0)
+        capabilities.append("order_sensitive");
+      if ((kernel->capabilities & prism::KERNEL_REVERSAL_SENSITIVE) != 0)
+        capabilities.append("reversal_sensitive");
+      if ((kernel->capabilities & prism::KERNEL_RELATIONAL) != 0)
+        capabilities.append("relational");
+      row["capabilities"] = std::move(capabilities);
+      kernel_rows.append(std::move(row));
+    }
+    result["constraint_kernels"] = std::move(kernel_rows);
     result["objective"] = prism::objective_name(problem.objective);
     result["objective_scale"] = solver_.objective_scale();
     result["direction"] = prism::objective_direction(problem.objective);
@@ -1145,6 +1169,9 @@ PYBIND11_MODULE(prism_decoder, module) {
   });
   module.def("get_max_threads", []() { return omp_get_max_threads(); });
   module.def("get_available_threads", []() { return omp_get_num_procs(); });
+  module.def("normalize_problem_schema", [](const py::dict &problem) {
+    return normalize_problem_schema(problem).data;
+  });
 
   py::class_<PyDecoder>(module, "Decoder")
       .def(py::init<py::dict, py::dict, py::dict, int32_t, float>(),

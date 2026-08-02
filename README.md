@@ -121,6 +121,24 @@ positions are excluded. Resource tensors grow with the registry, while the
 canonical seven rows remain at their historical indices so the distance-only
 control path retains exact behavior.
 
+Native execution consumes a normalized schema. `problem_data.py` supplies that
+schema explicitly; direct users of the historical pybind API may still pass a
+legacy URS name, but only the boundary compatibility adapter interprets it.
+`prism_decoder.normalize_problem_schema(problem)` exposes the exact normalized
+dictionary, and decoder metadata reports `schema_source` as `explicit` or
+`legacy_compat`. A complete explicit schema may omit `name` (metadata then uses
+`schema`). Once normalized, `Problem::name` is metadata only.
+
+The canonical constraints are registered as compiled kernels with their schema
+name, stable field-channel slot, resource operator, and search capabilities
+(route/solution state, ordering, reversal sensitivity, and relations). The
+decoder selects its active kernel set from the declared `constraints`; generic
+operators consult those capabilities instead of variant-name lists. The kernel
+bodies remain specialized native code so capacity, time windows,
+pickup-delivery, backhaul, and multi-depot search retain their existing speed
+and exact behavior. Algebra-declared resources append generic `extend + bound`
+kernels after the seven stable compatibility rows.
+
 Candidate construction is itself schema-driven, so it extends to a new resource
 with no per-variant tuning. In the default `schema` mode, native admission ranks
 edges by a registry-derived relevance (consumption and reset signals from each
