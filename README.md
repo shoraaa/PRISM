@@ -31,28 +31,28 @@ The network defines the search policy: for candidate edge `e` in search state
 `s`, PRISM ranks moves by the energy
 
 ```text
-E(e | s) = w_obj(s) * c(e)
-         + sum_r lambda_r(s) * [field_r(e) + a_r(e)]_+
+E(e | s) = c(e) + delta_obj(e)
+         + sum_r lambda_r(s) * [field_r(e) + a_r(e)]
          + kappa * q(e),
 ```
 
 and samples the next node from `softmax(-beta * E)`. Every term is produced by
 the network:
 
-- `c(e)` is the objective edge cost, entered through a learned,
-  state-conditioned weight `w_obj(s)` rather than a hard unit coefficient;
+- `c(e)` is the exact canonical objective edge cost and `delta_obj(e)` is its
+  signed, objective-family-conditioned learned residual;
 - `field_r(e)` and `a_r(e)` are the learned per-edge field and additive term for
   resource `r` (scaled to that resource's units);
 - `lambda_r(s)` is the learned, live-state-modulated intensity of resource `r`,
   a Lagrangian-style multiplier shaped by search reward rather than supervision;
 - `q(e)` is an optional learned continuation-risk potential.
 
-Nothing in the ranking is hand-tuned. Analytic resource pressure — the classical
-signal a heuristic would multiply in here — is **not** a term in the energy; it
-is exposed to the GNN only as an input edge feature, so the network must *learn*
-where each resource matters instead of scaling a supplied pressure. The plain
-objective cost is likewise only recovered as an ablation (`lambda_r = 0,
-w_obj = 1`), not assumed.
+Analytic resource pressure is **not** automatically charged in the energy; it is
+exposed to the GNN only as an input edge feature. Resource fields and the
+objective residual initialize exactly at zero, so the initial policy is the
+plain objective `E = c(e)` and every deviation from it must be learned. This
+initial policy is distinct from the fields-off baseline, which flattens the
+field to an identical value on every edge (`E = 1`).
 
 Resource-token attention lets capacity, time windows, route limits, backhaul,
 pickup-delivery, and prize requirements change one another's learned intensities,
@@ -145,25 +145,32 @@ row's `extend + bound`) and fills the remaining budget by distance. The
 per-resource allocation is a uniform equal-share prior over the active rows plus
 an implicit geometric slot -- a single variant-agnostic rule, not a table of
 hand-tuned quotas -- so a freshly declared resource is covered before its quota
-head has ever been trained. `--learned-candidate-quotas` lets the typed
+head has ever been trained. `--learned-candidate-quotas`
+(**EXPERIMENTAL** — off by default; may be removed or evolved in the future)
+lets the typed
 multinomial policy (trained with the same winner-gated PPO return) *reweight*
 that allocation rather than enable it; the schema neighborhood is present either
 way. `--candidate-mode geometric` is an explicit ablation that drops the resource
 channels and keeps only the k-d-tree distance neighborhood plus the required
 depot overlay. Because the fields-off baseline shares the same candidate mode as
 the field, field-on-vs-off stays a clean ablation of the field alone. The more
-invasive learned edge-scorer stage remains gated on the documented
-known-resource noninferiority criterion rather than silently changing topology.
+invasive learned edge-scorer stage (**EXPERIMENTAL**) remains gated on the
+documented known-resource noninferiority criterion rather than silently changing
+topology.
 
 ### Compositional field network
 
-The GNN emits one field for each registry resource plus the objective weight.
+The GNN emits one field for each registry resource plus a signed
+objective-energy residual.
 Node, edge, resource-token, and live-state inputs are normalized to `[0, 1]`;
 the decoder is the source of truth for graph dimensions, resource scales, and
 active channels. Active resource tokens attend to one another before producing
-per-edge resource fields, global resource intensities, a state-conditioned
-objective weight, binding predictions, and live-state coupler parameters. The
-decoder first installs one objective-only greedy incumbent, so the network's
+per-edge resource fields, global resource intensities, the objective residual,
+binding predictions, and live-state coupler parameters. The native decoder adds
+the residual to canonical objective edge cost before applying the single
+sampling temperature, so construction, PPO replay, and SRR share one energy
+formula. The decoder first installs one objective-only greedy incumbent, so
+the network's
 first input already contains incumbent route positions, forward/backward resource
 state, and incumbent-edge indicators. The neural policy does not participate in
 initial construction; it starts with perturbation and SRR from that incumbent.
@@ -175,8 +182,9 @@ progress, and other live variables at each stochastic choice.
 The token encoder consumes the native algebra descriptor rather than a
 constraint-identity one-hot. Field, multiplier, quota, and token-to-token state
 coupler heads are shared across rows, so appending a resource adds no model
-parameter. This is a clean `typed_resource_v2` checkpoint boundary: v1 identity
-checkpoints are rejected and must be retrained.
+parameter. This is a clean `typed_resource_v4_signed_resource_energy` checkpoint
+boundary: older checkpoints are rejected and must be retrained because resource
+fields are now signed, zero-neutral energy corrections.
 
 ### Guaranteed-feasible action space
 
@@ -200,11 +208,14 @@ multiplier-to-binding supervision is off by default (`--price-weight 0`) so the
 policy's intensities are learned from search outcome.
 
 Auxiliary resource, binding, and feasibility heads are trained as representation
-pretraining and downweighted to `0.1` during RL fine-tuning (`--aux-rl-scale`);
-they inform the policy but do not define it. Winner-gated Monte Carlo credit
+pretraining. Carrying their loss into RL fine-tuning (`--aux-rl-scale`) is
+**EXPERIMENTAL** and off by default (`--aux-rl-scale 0`); when enabled they
+inform the policy but do not define it. Winner-gated Monte Carlo credit
 connects consecutive incumbent improvements: the rollout that installs the next
 incumbent receives the sampled continuation advantage, preserving temporal
-information after within-option POMO centering. An optional progress-conditioned
+information after within-option POMO centering. An optional
+(**EXPERIMENTAL** — off by default, `--value-loss-weight 0`)
+progress-conditioned
 GAE critic supplies a learned continuation value for longer search horizons. On
 HIP/ROCm, training automatically selects the detached-output small-VRAM update;
 `--no-smallvram` selects the conventional retained-graph update.
@@ -227,13 +238,12 @@ route replay, preserving their full state-dependent semantics. Trace output
 reports both summary and replay evaluation counts.
 
 The default repair policy ports DyNACO's bounded local-search mechanics into
-this unified evaluator: it scans at most 32 ranked edges per affected node,
-accepts the first exact improving move, and uses don't-look bits until a changed
-local link reactivates the node. Its hot loop contains the same compact move
-families (relocate, swap, 2-opt-star, and intra-route 2-opt), while optional-node,
-depot-structure, and pickup-delivery moves remain enabled when their schema
-requires them. These are schema-independent scheduling rules, not a
-CVRP-specialized move evaluator. An explicit route-structure check plus exact
+this unified evaluator: it energy-ranks each bounded candidate row, scans the
+complete row, evaluates the full relocate, Or-opt, exchange, swap, 2-opt-star,
+and intra-route 2-opt neighborhood, and accepts the best exact improving move.
+Optional-node, depot-structure, and pickup-delivery moves remain enabled when
+their schema requires them. These are schema-independent scheduling rules, not
+a CVRP-specialized move evaluator. An explicit route-structure check plus exact
 planned-resource summaries certify single- and multi-depot capacity,
 time-window, route/tour-limit, and prize changes before replacement. A
 route-order certificate handles the capacity-to-empty transition before the
@@ -243,10 +253,6 @@ unaffected routes.
 Custom reset, battery, and other runtime algebra rows replay only their own
 state over the materialized candidate. Depot structural moves and any candidate
 whose load-order certificate cannot be proven still retain full replay.
-`srr_candidate_limit`,
-`srr_first_improvement`,
-`srr_dont_look`, and `srr_extended_operators` expose the policy and permit an
-exhaustive historical ablation.
 
 Accepted plans replace only the affected route caches. Edge membership uses
 reference counts, resource extrema use versioned heaps, and the repair scope is
@@ -309,8 +315,9 @@ distinct variants. Add `--curriculum` to phase those variants by resource count;
 without it, every selected variant is eligible from epoch 0.
 
 Temporal credit is controlled by `--temporal-credit-weight` (default `0.1`). Set
-it to `0` for the local-POMO ablation. The optional critic can be enabled with,
-for example:
+it to `0` for the local-POMO ablation. The optional critic
+(**EXPERIMENTAL** — off by default; may be removed or evolved in the future) can
+be enabled with, for example:
 
 ```bash
 uv run python train.py --gae-lambda 0.95 --value-loss-weight 0.5
@@ -327,25 +334,23 @@ seen/held-out split. Missing entries fail validation unless
 default; use `--val-n-rollouts` to give it a separate rollout budget.
 
 PRISM is scored against an **ablation of itself**: before epoch 0 it evaluates
-the identical decoder and search with the field ablated to pure distance
-(`E = c(e)`), i.e. *PRISM without fields* (`--baseline fields-off`, the default).
-Reported quality uses each aligned saved oracle reference when available. Before
-training, instances without a saved oracle are solved once by the hand-tuned
-classical-proximity decoder under the matched validation budget, and that result
-is cached as their reference. The fields-off ablation remains a separate paired
-comparison rather than becoming the fallback reference. W&B records per-variant
-objective, feasibility, oracle-or-classical reference gap, and paired field
-improvement, together with `val_summary/macro_gap`,
+the identical decoder and search with the field flattened to an identical value
+on every edge (`E = 1`), i.e. *PRISM without any field guidance*.
+Reported gap uses only each aligned saved oracle reference; instances without a
+saved oracle remain in validation for cost and feasibility metrics but are
+excluded from gap aggregation. No classical fallback reference is cached, so
+changing the search budget cannot change the gap target. The fields-off ablation
+remains a separate paired comparison rather than becoming a reference.
+W&B records per-variant objective, feasibility, saved-oracle reference gap, and
+paired field improvement, plus saved/missing reference counts and gap coverage,
+together with `val_summary/macro_gap`,
 `val_summary/macro_improvement`, and `val_summary/macro_score`.
 
-`best.pt` is selected solely by the lowest variant-macro reference gap: average
-the normalized per-instance gaps within each variant, then give every variant
-equal weight. Feasibility and paired fields-off improvement remain logged
-diagnostics but do not enter checkpoint ranking.
+`best.pt` is selected by the lowest mean canonical best cost across feasible
+validation instances. The oracle-only macro gap remains a reporting diagnostic;
+feasibility and paired fields-off improvement do not enter checkpoint ranking.
 
-The hand-tuned classical-proximity ranking is used as the cached reference only
-where a saved oracle is unavailable. `--baseline classical` can also select it
-as the paired comparison instead of the default fields-off ablation.
+The fields-off decoder is the sole paired comparison baseline.
 
 ## Evaluation
 
@@ -360,8 +365,8 @@ uv run python tests/urs_one_each.py --rollouts 1 --threads 1 --iterations 2 \
 ```
 
 `--guidance field` exercises the typed-field interface with a neutral field.
-Evaluate the trained policy against PRISM with its field ablated (distance-only)
-on every benchmark composition with:
+Evaluate the trained policy against PRISM with its field ablated to a flat,
+identical value (`E = 1`) on every benchmark composition with:
 
 ```bash
 PYTHONPATH=src uv run --no-sync python test.py \
@@ -374,8 +379,7 @@ saved instances of each, reporting overall results plus separate `SEEN` and
 `HELDOUT` splits. The learned policy and its fields-off ablation share the same
 paired per-instance seed, candidate budget, rollout count, post-bootstrap
 iteration count, and oracle reference, so the only difference is the learned
-field (`--baseline` selects the reference; `fields-off` is the default). Dynamic
-field refinement is enabled by default. For a focused subset, use
+field. Dynamic field refinement is enabled by default. For a focused subset, use
 `--val-size 1 --variants tsp,cvrp,cvrptw`; use `--static-field` to evaluate one
 frozen field for the full solve. The report and optional CSV record the data
 split, mean objective, field improvement, oracle gap, runtime, field mode, and
@@ -396,6 +400,9 @@ with resource-indexed pools, and the GNN uses direct single-graph reductions.
 Training enables activation checkpointing automatically from `n=1000`, while
 inference remains checkpoint-free.
 
-The feasibility look-ahead defaults to two steps and its search penalty to
-`10.0` objective units. Configure them with `--feasibility-lookahead-depth` and
-`--feasibility-risk-penalty`.
+The feasibility look-ahead defaults to two steps. Its learned risk classifier
+is trained and reported, and its detached search penalty defaults to `1.0`.
+A measured ablation with
+`--feasibility-risk-penalty 0` disables this ranking term while retaining exact
+decoder legality and risk-head training. Configure these controls with
+`--feasibility-lookahead-depth` and `--feasibility-risk-penalty`.

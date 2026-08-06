@@ -25,3 +25,8 @@ data
 tmp_models
 *.pdf
 csv
+# GPU core dumps (multi-GB) and LaTeX/run build artifacts
+gpucore.*
+*.aux
+*.log
+result.log

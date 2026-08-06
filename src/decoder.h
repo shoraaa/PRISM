@@ -16,11 +16,10 @@ static constexpr int32_t LIVE_STATE_FEATURE_COUNT = FIELD_CHANNEL_COUNT;
 static constexpr int32_t NODE_FEATURE_COUNT = 24;
 static constexpr int32_t EDGE_FEATURE_COUNT = 11;
 static constexpr int32_t RESOURCE_DESCRIPTOR_DIM = 32;
-// One learned multiplier slot beyond the resource channels carries the
-// state-conditioned objective weight w_obj applied to the objective edge cost,
-// so the objective enters the search energy through a learned coefficient
-// rather than a hard-coded additive term. The multiplier, coupler-weight, and
-// coupler-bias guidance arrays therefore have MULTIPLIER_COUNT entries.
+// One multiplier slot beyond the resource channels carries the objective
+// weight applied to the objective edge cost. ConstraintFieldNet fixes this slot
+// to one (and its coupler to zero). A signed learned objective residual is
+// added to the canonical edge cost inside the same energy formula.
 static constexpr int32_t OBJECTIVE_MULTIPLIER = FIELD_CHANNEL_COUNT;
 static constexpr int32_t MULTIPLIER_COUNT = FIELD_CHANNEL_COUNT + 1;
 
@@ -199,12 +198,14 @@ struct SearchConfig {
   int32_t max_perturb_attempts = 64;
   int32_t or_opt_max_segment = 3;
   int32_t feasibility_lookahead_depth = 2;
-  int32_t srr_candidate_limit = 32;
   bool use_srr = true;
   bool classical_behavior = true;
-  bool srr_first_improvement = true;
-  bool srr_dont_look = true;
-  bool srr_extended_operators = false;
+  // Fields-off baseline: break equal-energy ties in the SRR edge ranking by edge
+  // index rather than classical_proximity, so a flat/identical field (E = 1)
+  // carries no resource-aware heuristic. Without this, a constant energy makes
+  // every edge tie and the sort silently falls through to classical_proximity,
+  // turning the "no field" reference into a proximity-guided one.
+  bool neutral_ranking = false;
   bool verify_screening_resources = false;
   bool verify_incremental_srr = false;
 
@@ -273,6 +274,7 @@ public:
                                const float *multipliers = nullptr,
                                const float *coupler_weights = nullptr,
                                const float *coupler_bias = nullptr,
+                               const float *objective_residual = nullptr,
                                const float *edge_risk = nullptr,
                                float risk_penalty = 0.0f,
                                DecisionTrace *trace = nullptr);
@@ -281,6 +283,7 @@ public:
                          const float *multipliers = nullptr,
                          const float *coupler_weights = nullptr,
                          const float *coupler_bias = nullptr,
+                         const float *objective_residual = nullptr,
                          const float *edge_risk = nullptr,
                          float risk_penalty = 0.0f) const;
   Solution solve(int32_t iterations, const float *edge_field = nullptr,
@@ -288,6 +291,7 @@ public:
                  const float *multipliers = nullptr,
                  const float *coupler_weights = nullptr,
                  const float *coupler_bias = nullptr,
+                 const float *objective_residual = nullptr,
                  const float *edge_risk = nullptr,
                  float risk_penalty = 0.0f);
   Solution evaluate(const std::vector<int32_t> &route) const;
@@ -437,6 +441,7 @@ private:
   void build_candidate_graph(const std::vector<int32_t> &incumbent,
                              std::vector<float> *edge_field = nullptr,
                              std::vector<float> *edge_additive = nullptr,
+                             std::vector<float> *objective_residual = nullptr,
                              std::vector<float> *edge_risk = nullptr);
   std::vector<int32_t> rank_by_distance(int32_t from, int32_t limit) const;
   float resource_proximity(int32_t from, int32_t to, int metric) const;
@@ -471,6 +476,7 @@ private:
                          const float *multipliers,
                          const float *coupler_weights,
                          const float *coupler_bias,
+                         const float *objective_residual,
                          const float *edge_risk,
                          float risk_penalty) const;
   std::vector<float> live_state_features(const State &state) const;
@@ -500,6 +506,7 @@ private:
                      const float *coupler_weights = nullptr,
                      const float *coupler_bias = nullptr,
                      const float *live_state = nullptr,
+                     const float *objective_residual = nullptr,
                      const float *edge_risk = nullptr,
                      float risk_penalty = 0.0f) const;
   int32_t find_edge(int32_t from, int32_t to) const;
@@ -518,13 +525,15 @@ private:
                      const float *edge_additive,
                      const float *multipliers,
                      const float *coupler_weights,
-                     const float *coupler_bias, const float *edge_risk,
+                     const float *coupler_bias, const float *objective_residual,
+                     const float *edge_risk,
                      float risk_penalty, RolloutTrace *trace,
                      bool greedy = false) const;
   Solution perturb(uint64_t rollout_seed, const float *edge_field,
                    const float *edge_additive, const float *multipliers,
                    const float *coupler_weights, const float *coupler_bias,
-                   const float *edge_risk, float risk_penalty, RolloutTrace *trace,
+                   const float *objective_residual, const float *edge_risk,
+                   float risk_penalty, RolloutTrace *trace,
                    bool greedy = false) const;
   Solution
   scope_restricted_refine(Solution solution,
@@ -534,6 +543,7 @@ private:
                           const float *multipliers,
                           const float *coupler_weights,
                           const float *coupler_bias,
+                          const float *objective_residual,
                           const float *edge_risk, float risk_penalty,
                           RolloutTrace *trace) const;
   int32_t select_next(State &state, std::mt19937_64 &rng,
@@ -541,7 +551,8 @@ private:
                       const float *edge_additive,
                       const float *multipliers,
                       const float *coupler_weights,
-                      const float *coupler_bias, const float *edge_risk,
+                      const float *coupler_bias, const float *objective_residual,
+                      const float *edge_risk,
                       float risk_penalty, RolloutTrace *trace,
                       bool greedy = false) const;
   std::vector<OrderedChoice>
@@ -549,7 +560,8 @@ private:
                      std::mt19937_64 &rng, const float *edge_field,
                      const float *edge_additive, const float *multipliers,
                      const float *coupler_weights, const float *coupler_bias,
-                     const float *edge_risk, float risk_penalty,
+                     const float *objective_residual, const float *edge_risk,
+                     float risk_penalty,
                      bool greedy = false) const;
   std::vector<int32_t> changed_scope(const std::vector<int32_t> &source,
                                      const std::vector<int32_t> &candidate,

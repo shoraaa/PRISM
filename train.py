@@ -30,18 +30,24 @@ if str(SRC) not in sys.path:
 
 import prism_decoder
 from net import (
+    BatchedRelocate,
     ConstraintFieldNet,
     MODEL_SCHEMA,
     build_decoder_data,
     load_constraint_field_state_dict,
+    schema_vector,
 )
+from route_eval import RouteEvaluator
+from refine import neural_refine_solve, candidate_adjacency
 from problem_data import (
     ALL_VARIANTS,
     DEFAULT_DATASET_DIR,
     SavedProblems,
     TRAIN_VARIANTS,
     VariantCurriculum,
+    channel_balanced_weights,
     generated_problem,
+    problem_schema,
 )
 from utils import MetricsCollector, get_logger, init_logger
 
@@ -66,6 +72,9 @@ class OptionStep:
     value_target: Optional[float] = None
     quota_counts: Optional[torch.Tensor] = None
     old_quota_logp: Optional[torch.Tensor] = None
+    # Algebra descriptor [SCHEMA_FEATURE_DIM] for the schema-conditioned advantage
+    # scale g_phi(schema); populated in ppo_update only when --schema-adv-scale.
+    schema: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -78,6 +87,112 @@ class InstanceRollout:
     improvements: int
     neural_seconds: float
     decoder_seconds: float
+    # Joint-training refiner supervision (CaR unified-encoder): a best-improvement
+    # teacher trajectory whose imitation loss is added to the same backward, so
+    # the shared GNN encoder is trained by construction RL AND refinement CE.
+    refiner: Optional["RefinerSupervision"] = None
+
+
+@dataclass
+class RefinerSupervision:
+    graph: Any  # decoder graph (build_decoder_data) at the bootstrap state
+    live: torch.Tensor  # [T, N, C] per-state node resource features
+    rt: torch.Tensor  # [T, L] teacher-visited route states
+    valid: torch.Tensor  # [T, L] bool
+    rm_pos: torch.Tensor  # [T] teacher removal / segment-start position
+    gap: torch.Tensor  # [T] teacher reinsertion gap
+    schema: torch.Tensor  # [SCHEMA_FEATURE_DIM] schema descriptor
+    depot_count: int
+    evaluator: Any  # RouteEvaluator (holds gap_feas_fn)
+    oropt: bool = False  # or-opt teacher (segment) vs relocate-1
+    seg_len: Optional[torch.Tensor] = None  # [T] segment length (or-opt)
+    rev: Optional[torch.Tensor] = None  # [T] reversal flag (or-opt)
+
+
+# The relocate refiner only models the min-distance visit-all family; op/pctsp
+# (subset/maximize) need an add/drop operator, so joint supervision skips them.
+def _refiner_supported(problem: dict) -> bool:
+    return (
+        problem.get("objective", "distance") == "distance"
+        and "visit_all" in problem.get("constraints", [])
+        and problem.get("multi_route", False)
+    )
+
+
+def build_refiner_supervision(
+    decoder, problem: dict, incumbent: dict, args: argparse.Namespace,
+    max_steps: int = 40,
+) -> Optional[RefinerSupervision]:
+    """Best-improvement teacher trajectory from the bootstrap incumbent, computed
+    entirely in torch. Uses OR-OPT (best_oropt: segment relocate) when
+    --refiner-max-seg>1, else relocate-1 (best_relocate). None if the schema is
+    unsupported or the bootstrap is already a local optimum."""
+    if not _refiner_supported(problem):
+        return None
+    device = args.device
+    try:
+        ev = RouteEvaluator(problem, device=device)
+    except NotImplementedError:
+        return None
+    max_seg = getattr(args, "refiner_max_seg", 1)
+    oropt = max_seg > 1
+    # Candidate-restricted teachers (O(L*K) not O(L^2)) -- far faster than the
+    # exact all-gaps teacher and no OOM at n=1000. `local` is the fully
+    # incremental Δ path (no evaluate) for the cvrp family; `restricted` uses the
+    # exact scan (correct for tw/route_limit/backhaul/pd/md/open) on the same
+    # candidate set. Both need the candidate neighbour lists.
+    use_local = (
+        not oropt
+        and int(problem.get("depot_count", 1)) == 1
+        and not problem.get("open_route", False)
+        and set(problem.get("constraints", [])) <= {"visit_all", "capacity"}
+    )
+    nbr = None
+    if not oropt:
+        adj = candidate_adjacency(decoder, device)  # [N,N] bool
+        Kc = min(int(adj.sum(1).max().item()) if adj.numel() else 1, adj.shape[1])
+        Kc = max(Kc, 1)
+        vals, idx = adj.float().topk(Kc, dim=1)
+        nbr = torch.where(vals > 0, idx, torch.full_like(idx, -1))
+    start = list(incumbent["route"])
+    L = len(start)
+    rt = torch.tensor(start, dtype=torch.long, device=device).view(1, L)
+    valid = torch.ones(1, L, dtype=torch.bool, device=device)
+    s_rt, s_valid, s_rm, s_gap, s_len, s_rev = [], [], [], [], [], []
+    for _ in range(max_steps):
+        res = (ev.best_oropt(rt, valid, max_seg=max_seg) if oropt
+               else ev.best_relocate_local(rt, valid, nbr) if use_local
+               else ev.best_relocate_restricted(rt, valid, nbr))
+        if not bool(res["improved"][0]):
+            break
+        s_rt.append(rt)
+        s_valid.append(valid)
+        s_gap.append(res["gap"])
+        if oropt:
+            s_rm.append(res["seg_pos"])
+            s_len.append(res["seg_len"])
+            s_rev.append(res["rev"])
+        else:
+            s_rm.append(res["rm_pos"])
+        rt, valid = res["new_rt"], res["new_valid"]
+    if not s_rt:
+        return None
+    rt_b = torch.cat(s_rt)
+    valid_b = torch.cat(s_valid)
+    return RefinerSupervision(
+        graph=build_decoder_data(decoder, device=device),
+        live=ev.node_state_batch(rt_b, valid_b),
+        rt=rt_b,
+        valid=valid_b,
+        rm_pos=torch.cat(s_rm),
+        gap=torch.cat(s_gap),
+        schema=schema_vector(problem, device=device),
+        depot_count=int(decoder.metadata["depot_count"]),
+        evaluator=ev,
+        oropt=oropt,
+        seg_len=torch.cat(s_len) if oropt else None,
+        rev=torch.cat(s_rev) if oropt else None,
+    )
 
 
 @dataclass
@@ -154,25 +269,30 @@ def replay_decision_logp_from_cpp_batch_trace(
         field_multiplier = torch.zeros_like(field_multiplier)
         objective_weight = torch.ones_like(objective_weight)
     feasibility_risk = output["feasibility_risk"].detach()
-    # Pressure is no longer a multiplicative gate: the residual is the direct
-    # resource-scaled field, matching the C++ energy max(field + additive, 0),
-    # and the objective enters through the learned weight w_obj.
-    field_term = torch.clamp_min(scales * (residual + additive), 0.0)
-    energy = objective_weight.unsqueeze(1) * objective + (
+    # Match the native signed, zero-neutral resource-energy contract.
+    field_term = scales * (residual + additive)
+    objective_residual = output["objective_residual"][global_edge]
+    if not field_enabled:
+        objective_residual = torch.zeros_like(objective_residual)
+    energy = objective_weight.unsqueeze(1) * (
+        objective + objective_residual
+    ) + (
         field_multiplier.unsqueeze(1) * field_term
     ).sum(dim=-1)
     energy = energy + float(risk_penalty) * feasibility_risk[global_edge]
     logits = (-float(beta) * energy).masked_fill(~valid, -torch.inf)
 
     chosen_edge = edge_offsets[current[selected]] + chosen[selected]
-    chosen_field = torch.clamp_min(
-        scales
-        * (output["residual"][chosen_edge] + output["additive"][chosen_edge]),
-        0.0,
+    chosen_field = scales * (
+        output["residual"][chosen_edge] + output["additive"][chosen_edge]
     )
-    chosen_energy = objective_weight[selected] * graph.objective_edge_costs.to(
-        device
-    )[chosen_edge] + (field_multiplier[selected] * chosen_field).sum(dim=-1)
+    chosen_objective_residual = output["objective_residual"][chosen_edge]
+    if not field_enabled:
+        chosen_objective_residual = torch.zeros_like(chosen_objective_residual)
+    chosen_energy = objective_weight[selected] * (
+        graph.objective_edge_costs.to(device)[chosen_edge]
+        + chosen_objective_residual
+    ) + (field_multiplier[selected] * chosen_field).sum(dim=-1)
     chosen_energy = (
         chosen_energy
         + float(risk_penalty) * feasibility_risk[chosen_edge]
@@ -224,6 +344,11 @@ def _guidance_numpy(
         multipliers[:-1] = 0.0
     scales = graph.resource_scales.unsqueeze(0)
     return {
+        "objective_residual": (
+            output["objective_residual"]
+            if field_enabled
+            else torch.zeros_like(output["objective_residual"])
+        ).detach().cpu().numpy(),
         "edge_field": (output["residual"] * scales).detach().cpu().numpy(),
         "edge_additive": (output["additive"] * scales).detach().cpu().numpy(),
         "multipliers": multipliers.detach().cpu().numpy(),
@@ -242,7 +367,10 @@ def _neutral_guidance(decoder) -> dict:
     multiplier_values = np.zeros(multipliers, dtype=np.float32)
     multiplier_values[channels] = 1.0
     return {
-        "edge_field": np.ones(
+        "objective_residual": np.zeros(
+            decoder.metadata["edge_count"], dtype=np.float32
+        ),
+        "edge_field": np.zeros(
             (decoder.metadata["edge_count"], channels), dtype=np.float32
         ),
         "edge_additive": np.zeros(
@@ -257,6 +385,25 @@ def _neutral_guidance(decoder) -> dict:
         "edge_risk": np.zeros(decoder.metadata["edge_count"], dtype=np.float32),
         "risk_penalty": 0.0,
     }
+
+
+def _fields_off_guidance(decoder) -> dict:
+    """Fields-off baseline guidance: a flat, identical field (E = 1 everywhere).
+
+    Unlike neutral guidance, this also zeros the objective multiplier, so the
+    objective term drops out and edge_energy collapses to the same constant on
+    every edge. The baseline therefore ranks moves with no objective or distance
+    signal at all -- "PRISM without fields" is uniform guidance, not distance
+    guidance. It differs from PRISM by the field alone: the shared neutral
+    bootstrap, candidate graph, seed, and budget stay identical, so the paired
+    comparison still isolates the learned field.
+    """
+    guidance = _neutral_guidance(decoder)
+    # Zero the objective weight (final multiplier slot) too. A constant energy is
+    # identical for every candidate, so the concrete value is immaterial to every
+    # ranking (softmax and the SRR edge sort); this is the E = 1 flat field.
+    guidance["multipliers"][:] = 0.0
+    return guidance
 
 
 def _better(candidate: dict, incumbent: dict) -> bool:
@@ -297,34 +444,6 @@ def _best_feasible_solution(
     return best, winner
 
 
-def _construction_rewards(
-    solutions: list[dict], infeasible_penalty: float
-) -> np.ndarray:
-    """Return scale-free POMO rewards for an incumbent-free construction batch."""
-    feasible_costs = np.asarray(
-        [
-            _canonical_cost(solution)
-            for solution in solutions
-            if solution["feasible"]
-        ],
-        dtype=np.float32,
-    )
-    if feasible_costs.size == 0:
-        return np.full(len(solutions), -float(infeasible_penalty), dtype=np.float32)
-    scale = max(float(np.mean(np.abs(feasible_costs))), 1e-6)
-    center = float(np.mean(feasible_costs))
-    rewards = np.empty(len(solutions), dtype=np.float32)
-    feasible_rewards = (center - feasible_costs) / scale
-    feasible_floor = float(feasible_rewards.min())
-    for rollout, solution in enumerate(solutions):
-        rewards[rollout] = (
-            (center - _canonical_cost(solution)) / scale
-            if solution["feasible"]
-            else feasible_floor - float(infeasible_penalty)
-        )
-    return rewards
-
-
 def _gain(incumbent: dict, candidate: dict, infeasible_penalty: float) -> float:
     if not candidate["feasible"]:
         return -float(infeasible_penalty)
@@ -334,10 +453,10 @@ def _gain(incumbent: dict, candidate: dict, infeasible_penalty: float) -> float:
     return (incumbent["objective"] - candidate["objective"]) / scale
 
 
-def setup_decoder(
-    problem: dict, args: argparse.Namespace, deterministic: bool = False
+def _new_decoder(
+    problem: dict, args: argparse.Namespace, deterministic: bool = False,
+    use_srr: bool = True, neutral_ranking: bool = False,
 ):
-    """Create an empty decoder; the caller supplies the bootstrap policy."""
     decoder = prism_decoder.Decoder(
         problem,
         candidate_config={
@@ -346,7 +465,11 @@ def setup_decoder(
         },
         search_config={
             "classical_behavior": False,
-            "use_srr": True,
+            "use_srr": use_srr,
+            # The fields-off baseline runs a flat, identical field (E = 1);
+            # breaking SRR ties by edge index keeps it from silently inheriting
+            # the classical_proximity ordering. Guided search leaves this off.
+            "neutral_ranking": neutral_ranking,
             "feasibility_lookahead_depth": getattr(
                 args, "feasibility_lookahead_depth", 2
             ),
@@ -358,6 +481,55 @@ def setup_decoder(
         args.seed if deterministic else args.seed + random.randrange(1 << 30)
     )
     return decoder
+
+
+def setup_decoder(
+    problem: dict, args: argparse.Namespace, deterministic: bool = False
+):
+    decoder = _new_decoder(problem, args, deterministic=deterministic)
+    if deterministic:
+        incumbent = decoder.sample_greedy(**_neutral_guidance(decoder))
+        if incumbent["feasible"]:
+            decoder.set_incumbent(incumbent["route"])
+    else:
+        incumbent = decoder.solve(1, **_neutral_guidance(decoder))
+    if not incumbent["feasible"]:
+        raise RuntimeError(f"bootstrap failed: {incumbent['error']}")
+    return decoder, incumbent
+
+
+def setup_decoder_resampling(
+    problem: dict,
+    variant: str,
+    args: argparse.Namespace,
+    deterministic: bool = False,
+    max_attempts: int = 8,
+):
+    """Bootstrap a decoder, resampling the instance on infeasible generation.
+
+    A handful of constraint intersections (e.g. asymmetric multi-depot backhaul
+    with a route limit *and* time windows) occasionally emit a generated
+    instance that has no feasible solution at all -- even the all-singleton
+    routing violates a resource. That is a property of the sampled instance, not
+    the solver, so the correct response is to draw a fresh instance rather than
+    abort a multi-hour run. URS does the same for its own time-window generator.
+    """
+    last_error = ""
+    for _ in range(max_attempts):
+        try:
+            decoder, incumbent = setup_decoder(
+                problem, args, deterministic=deterministic
+            )
+            return decoder, incumbent, problem
+        except RuntimeError as exc:
+            if "bootstrap failed" not in str(exc):
+                raise
+            last_error = str(exc)
+            problem = generated_problem(variant, args.n_node, args.capacity)
+    raise RuntimeError(
+        f"bootstrap failed for {variant} after {max_attempts} resamples: "
+        f"{last_error}"
+    )
 
 
 def _resource_deltas(decoder, incumbent: dict, solutions: list[dict]) -> np.ndarray:
@@ -372,21 +544,6 @@ def _resource_deltas(decoder, incumbent: dict, solutions: list[dict]) -> np.ndar
         binding = np.asarray(evaluation["binding"], dtype=np.float32)
         violation = np.asarray(evaluation["violation"], dtype=np.float32)
         labels.append(np.clip(binding - base_binding + violation, 0.0, 1.0))
-    return np.stack(labels)
-
-
-def _construction_resource_targets(decoder, solutions: list[dict]) -> np.ndarray:
-    """Resource supervision for the incumbent-free construction transition."""
-    channels = int(decoder.metadata["resource_count"])
-    labels = []
-    for solution in solutions:
-        if not solution["feasible"]:
-            labels.append(np.ones(channels, dtype=np.float32))
-            continue
-        evaluation = decoder.evaluate_resources(solution["route"])
-        binding = np.asarray(evaluation["binding"], dtype=np.float32)
-        violation = np.asarray(evaluation["violation"], dtype=np.float32)
-        labels.append(np.clip(binding + violation, 0.0, 1.0))
     return np.stack(labels)
 
 
@@ -462,13 +619,27 @@ def collect_instance_rollout(
     risk_penalty: float = 0.0,
 ) -> InstanceRollout:
     model.train()
-    decoder = setup_decoder(problem, args)
+    # Match the successful refinement-only pipeline: build a neutral feasible
+    # incumbent first, then train the learned field on post-bootstrap search
+    # decisions. Native construction mixes greedy rollouts (which have no
+    # policy log-probabilities) with stochastic rollouts and has a much larger
+    # reward scale; including it in the pooled POMO batch suppresses the
+    # refinement signal that rh1gudc1 learned from.
+    decoder, incumbent, problem = setup_decoder_resampling(problem, variant, args)
+    # Joint-training: capture the refiner teacher trajectory from the bootstrap
+    # state (before the C++ search perturbs the incumbent / decoder features).
+    refiner_sup = None
+    if getattr(args, "joint_refiner", False):
+        refiner_sup = build_refiner_supervision(
+            decoder, problem, incumbent, args,
+            max_steps=getattr(args, "refiner_teacher_steps", 40),
+        )
     steps: list[OptionStep] = []
     emissions = 0
     improvements = 0
     neural_seconds = 0.0
     decoder_seconds = 0.0
-    last_solutions: list[dict] = []
+    last_solutions: list[dict] = [incumbent]
     outcomes: list[OptionOutcome] = []
     cached_version = -1
     cached_graph = None
@@ -479,118 +650,6 @@ def collect_instance_rollout(
     cached_quota_logp = None
     cached_quota_fractions = None
     iteration = 0
-
-    # Construct the first solution with the field policy itself. This remains a
-    # traced PPO transition so initial construction is learned rather than a
-    # hand-designed state silently injected before policy optimization.
-    graph = build_decoder_data(decoder, args.device)
-    neural_start = time.perf_counter()
-    with torch.no_grad():
-        old_output = model(graph)
-    neural_seconds += time.perf_counter() - neural_start
-    guidance = _guidance_numpy(
-        old_output,
-        graph,
-        field_enabled=field_enabled,
-        risk_penalty=risk_penalty,
-    )
-    decoder_start = time.perf_counter()
-    bootstrap_batch = decoder.sample_traced(**guidance)
-    decoder_seconds += time.perf_counter() - decoder_start
-    bootstrap_solutions = list(bootstrap_batch["solutions"])
-    incumbent, bootstrap_winner = _best_feasible_solution(
-        bootstrap_solutions, context="model bootstrap"
-    )
-    bootstrap_trace = bootstrap_batch["trace"]
-    if field_enabled and args.rl_weight != 0.0:
-        with torch.no_grad():
-            bootstrap_logp, bootstrap_rollouts, bootstrap_decisions = (
-                replay_decision_logp_from_cpp_batch_trace(
-                    bootstrap_trace,
-                    graph,
-                    old_output,
-                    model,
-                    args.beta,
-                    field_enabled=field_enabled,
-                    risk_penalty=risk_penalty,
-                )
-            )
-    else:
-        bootstrap_logp = torch.empty(0, device=args.device)
-        bootstrap_rollouts = torch.empty(0, dtype=torch.long, device=args.device)
-        bootstrap_decisions = torch.zeros(
-            args.n_rollouts, dtype=torch.long, device=args.device
-        )
-    bootstrap_resource_target = None
-    if bootstrap_trace["screened_edges"].size == 0:
-        bootstrap_resource_target = torch.as_tensor(
-            _construction_resource_targets(decoder, bootstrap_solutions),
-            dtype=torch.float32,
-            device=args.device,
-        )
-    bootstrap_binding = torch.as_tensor(
-        decoder.evaluate_resources(incumbent["route"])["binding"],
-        dtype=torch.float32,
-        device=args.device,
-    )
-    bootstrap_rewards = torch.as_tensor(
-        _construction_rewards(bootstrap_solutions, args.infeasible_penalty),
-        dtype=torch.float32,
-        device=args.device,
-    )
-    if args.reward_clip > 0.0:
-        bootstrap_rewards = bootstrap_rewards.clamp(
-            -args.reward_clip, args.reward_clip
-        )
-    bootstrap_rewards -= args.neural_call_cost
-    with torch.no_grad():
-        bootstrap_value = float(model.value(old_output, 0.0).reshape(-1)[0])
-    bootstrap_step = OptionStep(
-        graph=graph,
-        trace=bootstrap_trace,
-        old_logp=bootstrap_logp.detach(),
-        decisions=bootstrap_decisions.detach(),
-        rewards=torch.zeros(args.n_rollouts, device=args.device),
-        resource_delta=bootstrap_resource_target,
-        binding_target=bootstrap_binding,
-        duration=0,
-        decision_rollouts=bootstrap_rollouts.detach(),
-        field_enabled=field_enabled,
-        risk_penalty=risk_penalty,
-        search_progress=0.0,
-    )
-    if getattr(args, "learned_candidate_quotas", False) and field_enabled:
-        quota_policy = torch.distributions.Multinomial(
-            total_count=args.candidates,
-            logits=old_output["candidate_quota_logits"][0],
-        )
-        quota_counts = quota_policy.sample()
-        bootstrap_step.quota_counts = quota_counts.detach()
-        bootstrap_step.old_quota_logp = quota_policy.log_prob(
-            quota_counts
-        ).detach()
-        decoder.set_candidate_resource_quotas(
-            (quota_counts[:-1] / float(args.candidates))
-            .detach()
-            .cpu()
-            .numpy()
-            .astype(np.float32)
-        )
-    decoder.set_incumbent(incumbent["route"])
-    steps.append(bootstrap_step)
-    last_solutions = bootstrap_solutions
-    outcomes.append(
-        OptionOutcome(
-            [bootstrap_step],
-            bootstrap_rewards,
-            1,
-            transition_reward=float(bootstrap_rewards[bootstrap_winner]),
-            old_value=bootstrap_value,
-            transition_step=bootstrap_step,
-            winner_rollout=bootstrap_winner,
-        )
-    )
-    emissions = 1
 
     while iteration < args.search_iterations:
         version = int(decoder.graph_version)
@@ -652,7 +711,9 @@ def collect_instance_rollout(
         transition_reward = 0.0
         transition_step = None
         winner_rollout = None
-        while iteration < args.search_iterations:
+        for _ in range(args.option_max_steps):
+            if iteration >= args.search_iterations:
+                break
             decoder_start = time.perf_counter()
             batch = decoder.sample_traced(**guidance)
             decoder_seconds += time.perf_counter() - decoder_start
@@ -777,6 +838,7 @@ def collect_instance_rollout(
         improvements=improvements,
         neural_seconds=neural_seconds,
         decoder_seconds=decoder_seconds,
+        refiner=refiner_sup,
     )
 
 
@@ -853,13 +915,9 @@ def _dual_loss(step: OptionStep, output: dict) -> torch.Tensor:
         target = torch.as_tensor(
             step.trace["screened_resource_delta"], device=device
         ).float()
-        normalized_pressure = step.graph.edge_attr.to(device)[
-            screened_edges, 1 : 1 + prism_decoder.FIELD_CHANNEL_COUNT
-        ]
-        prediction = torch.clamp_min(
-            normalized_pressure * output["residual"][screened_edges]
-            + output["additive"][screened_edges],
-            0.0,
+        prediction = (
+            output["residual"][screened_edges]
+            + output["additive"][screened_edges]
         )
         active = output["active_channels"][0].bool().expand_as(prediction)
         if active.any():
@@ -877,14 +935,7 @@ def _dual_loss(step: OptionStep, output: dict) -> torch.Tensor:
         return output["residual"].sum() * 0.0
     rollout_index = _decision_rollout_index(step.trace, device)
     edge = step.graph.edge_offsets.to(device)[current] + chosen
-    normalized_pressure = step.graph.edge_attr.to(device)[
-        edge, 1 : 1 + prism_decoder.FIELD_CHANNEL_COUNT
-    ]
-    prediction = torch.clamp_min(
-        normalized_pressure * output["residual"][edge]
-        + output["additive"][edge],
-        0.0,
-    )
+    prediction = output["residual"][edge] + output["additive"][edge]
     if step.resource_delta is None:
         raise RuntimeError("missing fallback resource-delta labels")
     target = step.resource_delta.to(device)[rollout_index]
@@ -976,6 +1027,7 @@ def _detached_output(
     detached = dict(output)
     links = []
     for key in (
+        "objective_residual",
         "residual",
         "additive",
         "feasibility_logits",
@@ -994,6 +1046,33 @@ def _detached_output(
     return detached, links
 
 
+def _objective_residual_loss(step: OptionStep, output: dict) -> torch.Tensor:
+    """Anchor policy-relevant objective-energy residual differences.
+
+    A constant added to every outgoing edge cancels in the decoder softmax, so
+    center each source row before penalizing the learned residual.
+    """
+    residuals = output["objective_residual"]
+    offsets = step.graph.edge_offsets.to(residuals.device)
+    counts = offsets[1:] - offsets[:-1]
+    source = torch.repeat_interleave(
+        torch.arange(counts.numel(), device=residuals.device), counts
+    )
+    sums = residuals.new_zeros(counts.numel()).scatter_add(0, source, residuals)
+    means = sums / counts.to(residuals.dtype).clamp_min(1.0)
+    centered = residuals - means[source]
+    return centered.square().mean()
+
+
+def _disable_objective_residual(model: ConstraintFieldNet) -> None:
+    """Fix the objective-energy residual at its neutral zero value."""
+    with torch.no_grad():
+        model.objective_energy_residual_head.weight.zero_()
+        model.objective_energy_residual_head.bias.zero_()
+    for parameter in model.objective_energy_residual_head.parameters():
+        parameter.requires_grad_(False)
+
+
 def _step_loss(
     model: ConstraintFieldNet,
     step: OptionStep,
@@ -1001,12 +1080,13 @@ def _step_loss(
     args: argparse.Namespace,
     rl_weight: float,
     auxiliary_scale: float,
-    imitation_scale: float,
     class_weights: Optional[dict[str, torch.Tensor]] = None,
     adv_scale: Optional[torch.Tensor] = None,
     temporal_adv_scale: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, dict[str, float | torch.Tensor]]:
     zero = output["residual"].sum() * 0.0
+    schema_scale_loss = zero
+    schema_scale_pred = zero
     temporal_credit_weight = float(
         getattr(args, "temporal_credit_weight", 0.0)
     )
@@ -1059,11 +1139,39 @@ def _step_loss(
         # variance dominate and near-degenerate options contribute little.
         rollout_advantage = rollout_reward - rollout_reward.mean()
         if not args.no_adv_norm:
-            scale = (
+            base_scale = (
                 adv_scale
                 if adv_scale is not None
                 else rollout_advantage.std(unbiased=False) + 1e-8
             )
+            if getattr(args, "schema_adv_scale", False) and step.schema is not None:
+                # g_phi(schema) is a per-schema RELATIVE multiplier on the
+                # batch-pooled scale, not an absolute dispersion predictor. The
+                # pooled scale supplies the stationary global magnitude; g_phi only
+                # corrects each schema's dispersion relative to the batch. It is
+                # initialised at 1.0, so scale == base_scale and enabling this is an
+                # exact no-op until fitted -- an absolute-dispersion head instead
+                # starts ~1/base_scale off and ramps the effective step size by
+                # orders of magnitude over training, which diverges. The divisor is
+                # detached (the policy cannot game it) and depends only on the
+                # schema, so degenerate low-variance options are not amplified.
+                eps = rollout_advantage.new_tensor(1e-6)
+                pred_scale = model.reward_scale(
+                    step.schema.to(rollout_advantage.device)
+                )
+                # Bound the target and the applied multiplier to a sane band: a
+                # degenerate near-zero-dispersion option must not drag g_phi toward
+                # zero and re-amplify advantages. The relative correction lives in
+                # [0.25, 4]x of the pooled scale; anything outside is a mis-fit, not
+                # signal, so the effective step size can never diverge.
+                target_rel = (reward_std.detach() / base_scale).clamp(0.1, 10.0)
+                schema_scale_loss = F.smooth_l1_loss(
+                    pred_scale.clamp_min(eps).log(), target_rel.log()
+                )
+                schema_scale_pred = pred_scale.detach()
+                scale = base_scale * pred_scale.detach().clamp(0.25, 4.0)
+            else:
+                scale = base_scale
             rollout_advantage = rollout_advantage / scale
         temporal_rollout_advantage = torch.zeros_like(rollout_advantage)
         if temporal_enabled and step.transition_rollout is not None:
@@ -1195,28 +1303,20 @@ def _step_loss(
         None if class_weights is None else class_weights["binding"],
     )
     price = _price_loss(model, step, output)
-    # Feasibility predicts hard dead-ends from the decoder's own lookahead.  Its
-    # labels are state-dependent while this legacy head is edge-only, so the
-    # post-warm-start scale defaults to zero; it remains available as an ablation.
-    feasibility_aux = args.feasibility_weight * feasibility
-    # Dual/binding/price regress the *ranking* (field_r, lambda_r) onto analytic
-    # per-constraint resource pressure and binding indicators -- they teach the
-    # network to imitate a hand-authored heuristic. Optimizing them ties each
-    # channel's meaning to a formula every new constraint would have to supply,
-    # which is exactly what blocks constraint generalization. They are therefore
-    # a warm-start signal only: imitation_scale defaults to zero once PPO begins,
-    # so the reported model's ranking is shaped purely by search reward.
-    imitation = (
+    objective_residual_loss = _objective_residual_loss(step, output)
+    auxiliary = (
         args.dual_weight * dual
+        + args.feasibility_weight * feasibility
         + args.binding_weight * binding
         + args.price_weight * price
     )
     loss = (
         rl_weight * rl_loss
         + rl_weight * temporal_credit_weight * quota_rl_loss
-        + auxiliary_scale * feasibility_aux
-        + imitation_scale * imitation
+        + auxiliary_scale * auxiliary
+        + float(getattr(args, "objective_residual_l2", 0.1)) * objective_residual_loss
         + float(getattr(args, "value_loss_weight", 0.0)) * critic_loss
+        + float(getattr(args, "schema_scale_weight", 0.1)) * schema_scale_loss
         - args.entropy_weight * entropy
     )
     with torch.no_grad():
@@ -1241,6 +1341,10 @@ def _step_loss(
             "quota_ratio": quota_ratio.detach(),
             "quota_entropy": quota_entropy.detach(),
             "reward_std": reward_std.detach(),
+            "schema_scale_loss": schema_scale_loss.detach(),
+            "schema_scale_pred": schema_scale_pred.detach()
+            if torch.is_tensor(schema_scale_pred)
+            else schema_scale_pred,
             "advantage_abs": advantage_abs.detach(),
             "temporal_advantage_abs": temporal_advantage_abs.detach(),
             "critic_loss": critic_loss.detach(),
@@ -1251,10 +1355,9 @@ def _step_loss(
             "feasibility_loss": feasibility.detach(),
             "binding_loss": binding.detach(),
             "price_loss": price.detach(),
-            "auxiliary_loss": (feasibility_aux + imitation).detach(),
+            "objective_residual_loss": objective_residual_loss.detach(),
+            "auxiliary_loss": auxiliary.detach(),
             "auxiliary_scale": float(auxiliary_scale),
-            "imitation_loss": imitation.detach(),
-            "imitation_scale": float(imitation_scale),
             "feasibility_labels": float(risk_labels.numel()),
             "feasibility_positive_rate": (
                 risk_labels.mean().detach() if risk_labels.numel() else 0.0
@@ -1274,16 +1377,73 @@ def _step_loss(
     return loss, metrics
 
 
+def joint_parameters(model, refiner):
+    """Deduplicated parameter list over field + refiner (shared emb_net counted
+    once) for the optimizer and grad clipping."""
+    params = list(model.parameters())
+    if refiner is not None:
+        seen = {id(p) for p in params}
+        params += [p for p in refiner.parameters() if id(p) not in seen]
+    return params
+
+
+def _refiner_batch_loss(refiner, rollouts, args):
+    """Mean imitation CE over the batch's teacher trajectories, forwarding
+    through the SHARED encoder so the joint backward trains it. None if no
+    rollout carried refiner supervision."""
+    losses = []
+    for rollout in rollouts:
+        sup = getattr(rollout, "refiner", None)
+        if sup is None:
+            continue
+        node_emb = refiner.encode_static(sup.graph)  # shared emb_net forward
+        if sup.oropt:
+            losses.append(
+                refiner.oropt_imitation_loss(
+                    node_emb, sup.live, sup.rt, sup.valid, sup.evaluator,
+                    seg_pos=sup.rm_pos, seg_len=sup.seg_len, gap=sup.gap,
+                    rev=sup.rev, depot_count=sup.depot_count, schema=sup.schema,
+                )
+            )
+        else:
+            losses.append(
+                refiner.imitation_loss(
+                    node_emb, sup.live, sup.rt, sup.valid, adj=None,
+                    rm_pos=sup.rm_pos, gap_target=sup.gap,
+                    depot_count=sup.depot_count,
+                    gap_feas_fn=sup.evaluator.insertion_feasible,
+                    schema=sup.schema,
+                )
+            )
+    if not losses:
+        return None
+    return torch.stack(losses).mean()
+
+
 def ppo_update(
     model: ConstraintFieldNet,
     optimizer: torch.optim.Optimizer,
     rollouts: list[InstanceRollout],
     args: argparse.Namespace,
     epoch: int,
+    refiner: Optional[BatchedRelocate] = None,
 ) -> dict[str, float]:
     steps = [step for rollout in rollouts for step in rollout.steps]
     if not steps:
         return {}
+    if getattr(args, "schema_adv_scale", False):
+        # Attach the per-variant algebra descriptor to each step so _step_loss can
+        # normalise advantages by g_phi(schema). Cached per variant per update.
+        schema_cache: dict[str, torch.Tensor] = {}
+        for rollout in rollouts:
+            descriptor = schema_cache.get(rollout.variant)
+            if descriptor is None:
+                descriptor = schema_vector(
+                    problem_schema(rollout.variant), device=args.device
+                )
+                schema_cache[rollout.variant] = descriptor
+            for step in rollout.steps:
+                step.schema = descriptor
     option_groups: list[list[OptionStep]] = []
     for step in steps:
         if not option_groups or option_groups[-1][0].graph is not step.graph:
@@ -1294,12 +1454,6 @@ def ppo_update(
     rl_weight = 0.0 if pretraining else args.rl_weight
     auxiliary_scale = (
         args.pretrain_aux_scale if pretraining else args.aux_rl_scale
-    )
-    # Auxiliary heads warm-start during an explicitly requested pretraining
-    # phase, then switch off for RL by default so the converged field is trained
-    # by search reward rather than state-aliased or hand-authored targets.
-    imitation_scale = (
-        args.pretrain_aux_scale if pretraining else args.imitation_rl_scale
     )
     class_weights = _rollout_class_weights(steps)
     # Batch-pooled advantage scale: centre each option, pool the residuals over
@@ -1355,7 +1509,6 @@ def ppo_update(
                         args,
                         rl_weight,
                         auxiliary_scale,
-                        imitation_scale,
                         class_weights,
                         adv_scale,
                         temporal_adv_scale,
@@ -1396,7 +1549,6 @@ def ppo_update(
                         args,
                         rl_weight,
                         auxiliary_scale,
-                        imitation_scale,
                         class_weights,
                         adv_scale,
                         temporal_adv_scale,
@@ -1411,9 +1563,18 @@ def ppo_update(
             synchronize()
             timing["backward"] += time.perf_counter() - phase_started
 
+        # Joint refiner loss: accumulate its gradient onto the SAME step, so one
+        # optimizer.step() trains the shared encoder with construction RL + the
+        # refinement CE (CaR unified-encoder joint objective).
+        if refiner is not None:
+            refiner_ce = _refiner_batch_loss(refiner, rollouts, args)
+            if refiner_ce is not None:
+                (args.refiner_ce_weight * refiner_ce).backward()
+                collector.add_dict({"refiner_ce": float(refiner_ce.detach())})
+
         phase_started = time.perf_counter()
         gradient_norm = torch.nn.utils.clip_grad_norm_(
-            model.parameters(), args.grad_clip
+            joint_parameters(model, refiner), args.grad_clip
         )
         gradient_norms.append(float(gradient_norm))
         optimizer.step()
@@ -1500,11 +1661,17 @@ def _training_variant_schedule(
     schedule_epochs = args.epochs if args.curriculum else epoch + 1
     eligible = curriculum.eligible(epoch, schedule_epochs) or curriculum.variants
     group_size = min(args.grad_accum_variants, len(eligible))
+    weights = (
+        channel_balanced_weights(curriculum.variants)
+        if getattr(args, "channel_balanced_sampling", False)
+        else None
+    )
     return curriculum.schedule(
         epoch,
         schedule_epochs,
         args.steps_per_epoch,
         group_size,
+        weights=weights,
     )
 
 
@@ -1534,6 +1701,7 @@ def train_epoch(
     args: argparse.Namespace,
     curriculum: VariantCurriculum,
     ema: Optional["WeightEMA"] = None,
+    refiner: Optional[BatchedRelocate] = None,
 ) -> tuple[int, float, float, float, float, dict[str, float]]:
     """Accumulate mixed-variant rollouts before each optimizer update."""
     logger = get_logger()
@@ -1577,7 +1745,7 @@ def train_epoch(
             costs.append(rollout.average_cost)
             neural_seconds += rollout.neural_seconds
             decoder_seconds += rollout.decoder_seconds
-        metrics = ppo_update(model, optimizer, rollouts, args, epoch)
+        metrics = ppo_update(model, optimizer, rollouts, args, epoch, refiner=refiner)
         if ema is not None:
             ema.update(model)
         ppo_seconds += metrics.get("ppo_seconds", 0.0)
@@ -1660,48 +1828,116 @@ def train_epoch(
     )
 
 
+def train_refiner_only_epoch(
+    model, refiner, optimizer, global_step, epoch, args, curriculum,
+    ema=None,
+):
+    """Refiner-only epoch: NO field RL / C++ search. Per accumulation group,
+    bootstrap a cheap construction, build the best-improvement teacher trajectory,
+    and take one imitation step (which also trains the shared encoder). Much
+    faster than joint since it skips collect_instance_rollout + ppo_update."""
+    logger = get_logger()
+    started = time.perf_counter()
+    variant_schedule = _training_variant_schedule(curriculum, args, epoch)
+    accum = _training_accumulation_size(curriculum, args, epoch)
+    completed = 0
+    ces = []
+    progress = tqdm(total=args.steps_per_epoch, desc="Epoch(refiner)", leave=True)
+    while completed < args.steps_per_epoch:
+        group = min(accum, args.steps_per_epoch - completed)
+        rollouts = []
+        for variant in variant_schedule[completed: completed + group]:
+            problem = generated_problem(variant, args.n_node, args.capacity)
+            try:
+                decoder, incumbent = setup_decoder(problem, args, deterministic=True)
+            except RuntimeError:
+                continue
+            sup = build_refiner_supervision(
+                decoder, problem, incumbent, args,
+                max_steps=args.refiner_teacher_steps,
+            )
+            if sup is not None:
+                rollouts.append(InstanceRollout(
+                    variant, [], 0.0, 0.0, 0, 0, 0.0, 0.0, refiner=sup))
+        optimizer.zero_grad(set_to_none=True)
+        ce = _refiner_batch_loss(refiner, rollouts, args)
+        if ce is not None:
+            (args.refiner_ce_weight * ce).backward()
+            torch.nn.utils.clip_grad_norm_(joint_parameters(model, refiner), args.grad_clip)
+            optimizer.step()
+            if ema is not None:
+                ema.update(model)
+            ces.append(float(ce.detach()))
+            logger.log_metrics({"refiner_ce": ces[-1]}, step=global_step)
+        completed += group
+        global_step += 1
+        progress.update(group)
+    progress.close()
+    epoch_time = time.perf_counter() - started
+    mean_ce = float(np.mean(ces)) if ces else 0.0
+    return global_step, mean_ce, 0.0, 0.0, epoch_time, {"refiner_ce": mean_ce}
+
+
 @torch.no_grad()
 def infer_instance(
     model: Optional[ConstraintFieldNet],
     problem: dict,
     args: argparse.Namespace,
+    refiner: Optional[BatchedRelocate] = None,
 ) -> tuple[float, dict, dict[str, float]]:
-    # Bootstrap from a rollout batch: learned inference uses the model field,
-    # while fields-off uses the identical decoder with neutral objective energy.
+    # Both branches bootstrap from the same neutral rollout batch. Training also
+    # installs a neutral feasible incumbent before exposing the model to search,
+    # so inference must not ask an untrained field to construct from an empty
+    # graph. This also makes fields-off a paired ablation with an identical
+    # starting incumbent.
     if args.search_iterations < 1:
         raise ValueError("search_iterations must be positive")
-    if model is None:
-        baseline_mode = getattr(args, "baseline", "fields-off")
-        if baseline_mode == "classical":
-            # Legacy non-neural reference: the hand-tuned classical-proximity
-            # ranking. Retained for diagnostics, not the headline baseline.
-            decoder = prism_decoder.Decoder(
-                problem,
-                candidate_config={"max_candidates": args.candidates},
-                search_config={},
-                n_rollouts=args.n_rollouts,
-                beta=args.beta,
+    # Neural-refinement deployment: REPLACE hand-designed SRR. Build the decoder
+    # with SRR off (C++ only constructs) and refine with the trained refiner.
+    if getattr(args, "neural_refine", False) and refiner is not None:
+        if _refiner_supported(problem):
+            srr_decoder = _new_decoder(
+                problem, args, deterministic=True, use_srr=False
             )
-            decoder.seed(args.seed)
-            best = decoder.solve(args.search_iterations)
-            return _canonical_cost(best), best, {"emissions": 0.0}
-        # "fields-off" ablation: the identical neural decoder and SRR driven by a
-        # fixed distance-only field (lambda=0, w_obj=1 => E = c(e)). PRISM and
-        # this baseline differ only by the learned field, so the comparison is a
-        # clean ablation of PRISM's own guidance rather than a neural-vs-heuristic
-        # contest.
-        decoder = setup_decoder(problem, args, deterministic=True)
-        initial = list(decoder.sample(**_neutral_guidance(decoder)))
-        incumbent, _winner = _best_feasible_solution(
-            initial, context="fields-off bootstrap"
-        )
-        decoder.set_incumbent(incumbent["route"])
+            # construct the incumbent (SRR off) from the neutral bootstrap, the
+            # same start the SRR path uses; refinement is then purely neural.
+            initial = list(srr_decoder.sample(**_neutral_guidance(srr_decoder)))
+            incumbent, _ = _best_feasible_solution(
+                initial, context="neutral bootstrap"
+            )
+            solution = neural_refine_solve(
+                srr_decoder, problem, refiner,
+                start_route=incumbent["route"],
+                group_size=args.neural_refine_group,
+                improve_steps=args.neural_refine_steps,
+                device=args.device,
+            )
+            return _canonical_cost(solution), solution, {"emissions": 0.0}
+        # op/pctsp etc.: refiner has no operator yet -> fall through to SRR.
+    # The fields-off baseline (model is None) breaks equal-energy SRR ties by edge
+    # index so its flat E = 1 field never inherits classical_proximity. The flag
+    # only changes tie resolution under a constant energy, so the shared neutral
+    # (distance) bootstrap below is byte-identical to PRISM's -- pairing holds.
+    decoder = _new_decoder(
+        problem, args, deterministic=True, neutral_ranking=(model is None)
+    )
+    initial = list(decoder.sample(**_neutral_guidance(decoder)))
+    incumbent, _winner = _best_feasible_solution(
+        initial, context="neutral bootstrap"
+    )
+    decoder.set_incumbent(incumbent["route"])
+
+    if model is None:
+        # Fields-off baseline: the identical decoder and SRR driven by a flat,
+        # identical field (E = 1 on every edge). PRISM and this baseline share the
+        # same neutral bootstrap incumbent, candidate graph, seed, and budget, so
+        # they differ only by the learned field -- a clean ablation of PRISM's own
+        # guidance rather than a neural-vs-heuristic contest.
         best = decoder.solve(
-            args.search_iterations, **_neutral_guidance(decoder)
+            args.search_iterations, **_fields_off_guidance(decoder)
         )
         return _canonical_cost(best), best, {"emissions": 0.0}
 
-    decoder = setup_decoder(problem, args, deterministic=True)
     model.eval()
     dynamic = not getattr(args, "static_field", False)
     risk_penalty = args.feasibility_risk_penalty
@@ -1726,29 +1962,6 @@ def infer_instance(
     neural_seconds = 0.0
     decoder_seconds = 0.0
     net_evals = 0
-
-    # Let the model construct the initial incumbent from the empty graph. The
-    # installed winner then rebuilds the graph before refinement guidance is
-    # evaluated, so no edge-aligned tensor is reused across graph versions.
-    start = time.perf_counter()
-    initial_graph = build_decoder_data(decoder, args.device)
-    initial_output = model(initial_graph)
-    initial_guidance = _guidance_numpy(
-        initial_output, initial_graph, risk_penalty=risk_penalty
-    )
-    net_evals += 1
-    neural_seconds += time.perf_counter() - start
-    start = time.perf_counter()
-    initial_solutions = list(decoder.sample(**initial_guidance))
-    decoder_seconds += time.perf_counter() - start
-    incumbent, _winner = _best_feasible_solution(
-        initial_solutions, context="model bootstrap"
-    )
-    if getattr(args, "learned_candidate_quotas", False):
-        decoder.set_candidate_resource_quotas(
-            initial_output["candidate_quota"][0].detach().cpu().numpy()
-        )
-    decoder.set_incumbent(incumbent["route"])
 
     start = time.perf_counter()
     guidance, refresh_evals = _refresh_guidance()
@@ -1798,13 +2011,13 @@ def _gap(solution: dict, reference: float) -> float:
 
 
 def _validation_rank(
-    _metrics: dict[str, float], macro_gap: float
+    _metrics: dict[str, float], average_best_cost: float
 ) -> tuple[float]:
-    """Rank checkpoints only by lower variant-macro reference gap."""
-    return (float(macro_gap),)
+    """Rank checkpoints by the mean canonical best cost on validation."""
+    return (float(average_best_cost),)
 
 
-CHECKPOINT_RANK_METRIC = "variant_macro_oracle_or_classical_gap_v1"
+CHECKPOINT_RANK_METRIC = "mean_best_canonical_cost_v1"
 
 
 def _parse_variants(value: str) -> list[str]:
@@ -1826,44 +2039,13 @@ def _parse_variants(value: str) -> list[str]:
     return variants
 
 
-def cache_classical_references(
-    dataset: list[dict], args: argparse.Namespace
-) -> int:
-    """Fill missing saved references once with matched classical solutions."""
-    classical_args = copy.copy(args)
-    classical_args.baseline = "classical"
-    classical_args.n_rollouts = (
-        args.n_rollouts
-        if getattr(args, "val_n_rollouts", None) is None
-        else args.val_n_rollouts
-    )
-    cached = 0
-    for item in tqdm(dataset, desc="Caching classical references", leave=False):
-        if item["reference"] is not None:
-            continue
-        _, solution, _ = infer_instance(None, item["problem"], classical_args)
-        objective = float(solution["objective"])
-        if not solution["feasible"] or not np.isfinite(objective):
-            raise RuntimeError(
-                "classical reference failed for "
-                f"{item['variant']}[{item['instance_index']}]"
-            )
-        item["reference"] = objective
-        item["reference_source"] = "classical"
-        item["classical_reference"] = {
-            "objective": objective,
-            "direction": solution["direction"],
-        }
-        cached += 1
-    return cached
-
-
 def validation(
     model: Optional[ConstraintFieldNet],
     dataset: list[dict],
     args: argparse.Namespace,
     *,
     capture_paired_baseline: bool = False,
+    refiner: Optional[BatchedRelocate] = None,
 ) -> tuple[float, float, float, dict[str, float]]:
     validation_args = copy.copy(args)
     validation_args.n_rollouts = (
@@ -1884,7 +2066,7 @@ def validation(
     variant_best_costs: dict[str, list[float]] = {}
     for item in tqdm(dataset, desc="Validating", leave=False):
         average, best, metrics = infer_instance(
-            model, item["problem"], validation_args
+            model, item["problem"], validation_args, refiner=refiner
         )
         collector.add_dict(metrics)
         variant = item["variant"]
@@ -1934,8 +2116,8 @@ def validation(
         saved_reference_instances=float(
             sum(item.get("reference_source") == "saved" for item in dataset)
         ),
-        classical_reference_instances=float(
-            sum(item.get("reference_source") == "classical" for item in dataset)
+        missing_reference_instances=float(
+            sum(item.get("reference_source") == "missing" for item in dataset)
         ),
     )
     for variant, variant_total in variant_totals.items():
@@ -2013,8 +2195,8 @@ def validation(
             else float("-inf")
         ),
     )
-    # Keep paired-baseline improvement as an ablation diagnostic. Checkpoint
-    # selection uses macro_gap directly.
+    # Keep paired-baseline improvement and oracle-only gap as diagnostics.
+    # Checkpoint selection uses the mean canonical best cost instead.
     result["macro_score"] = result[
         "macro_baseline_improvement_percent"
     ]
@@ -2029,6 +2211,40 @@ def validation(
 def build_validation_data(args: argparse.Namespace) -> list[dict]:
     if args.val_size < 1:
         raise ValueError("val_size must be at least one instance per problem")
+    if getattr(args, "val_generated", False):
+        # Checkpoint selection is the averaged solution cost, so no oracle data
+        # is required. But KEEP saved references where they exist so macrogap is
+        # still reported as the gap over the reference-having subset; only fill
+        # the missing slots with (seeded, held-out) generated instances.
+        saved = SavedProblems(args.n_node, args.dataset_dir)
+        dataset = []
+        rng_state = np.random.get_state()
+        np.random.seed(args.seed + 999_983)
+        for variant in args.variants:
+            for index in range(args.val_size):
+                problem = reference = None
+                try:
+                    problem, reference = saved.load(variant, index=index)
+                except Exception:
+                    problem, reference = None, None
+                if problem is None:
+                    problem = generated_problem(
+                        variant, args.n_node, args.capacity
+                    )
+                    source = "generated"
+                else:
+                    source = "saved" if reference is not None else "missing"
+                dataset.append(
+                    {
+                        "variant": variant,
+                        "instance_index": index,
+                        "problem": problem,
+                        "reference": reference,
+                        "reference_source": source,
+                    }
+                )
+        np.random.set_state(rng_state)
+        return dataset
     saved = SavedProblems(args.n_node, args.dataset_dir)
     dataset = []
     logger = get_logger()
@@ -2040,7 +2256,7 @@ def build_validation_data(args: argparse.Namespace) -> list[dict]:
             except Exception as exc:  # missing data dir/file for this variant
                 missing.append((variant, index, str(exc)))
                 continue
-            reference_source = "saved" if reference is not None else "classical"
+            reference_source = "saved" if reference is not None else "missing"
             dataset.append(
                 {
                     "variant": variant,
@@ -2148,6 +2364,7 @@ def save_checkpoint(
     global_step: int = 0,
     validation_manifest: Optional[tuple[tuple[str, int, str], ...]] = None,
     ema_state: Optional[dict[str, torch.Tensor]] = None,
+    refiner: Optional[BatchedRelocate] = None,
 ) -> None:
     payload = {
         "model_schema": MODEL_SCHEMA,
@@ -2157,6 +2374,8 @@ def save_checkpoint(
         "config": vars(args),
         "global_step": int(global_step),
     }
+    if refiner is not None:
+        payload["refiner_state_dict"] = refiner.state_dict()
     if ema_state is not None:
         payload["ema_state_dict"] = ema_state
     if val_gap is not None:
@@ -2176,8 +2395,8 @@ def _load_optimizer_state_compat(
 ) -> int:
     """Load optimizer state while initializing newly appended parameters.
 
-    The refresh value head is appended after all legacy model parameters, so
-    their optimizer slots retain the same order.  Returns the number of new
+    New compatibility heads are appended after all legacy model parameters, so
+    their optimizer slots retain the same order. Returns the number of new
     parameters initialized without saved optimizer state.
     """
     current = optimizer.state_dict()
@@ -2223,6 +2442,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--channel-balanced-sampling",
+        action="store_true",
+        help=(
+            "Weight variant sampling by inverse constraint-channel coverage so "
+            "singleton channels (tour_limit via op, prize_quota via pctsp) are "
+            "not starved next to capacity. Off by default (uniform per-variant)."
+        ),
+    )
+    parser.add_argument(
         "--val-size",
         type=int,
         default=8,
@@ -2238,7 +2466,7 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--capacity", type=int, default=50)
-    parser.add_argument("--candidates", type=int, default=32)
+    parser.add_argument("--candidates", type=int, default=64)
     parser.add_argument(
         "--candidate-mode",
         choices=["schema", "geometric"],
@@ -2256,7 +2484,8 @@ def parse_args() -> argparse.Namespace:
         "--learned-candidate-quotas",
         action="store_true",
         help=(
-            "Let the typed multinomial quota policy reweight the schema "
+            "EXPERIMENTAL (off by default; may be removed or evolved in the "
+            "future). Let the typed multinomial quota policy reweight the schema "
             "candidate allocation (schema mode only). Without it the allocation "
             "stays at the uniform equal-share prior; with it the learned "
             "fractions replace that prior. No effect under --candidate-mode "
@@ -2283,24 +2512,26 @@ def parse_args() -> argparse.Namespace:
             "--n-rollouts)"
         ),
     )
-    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--steps-per-epoch", type=int, default=32)
     parser.add_argument(
         "--rollouts-per-update",
         "--grad-accum-variants",
         dest="grad_accum_variants",
         type=int,
-        default=4,
+        default=None,
         help=(
             "Independently generated problem rollouts pooled into each PPO "
-            "optimizer update (default: 4). The legacy "
+            "optimizer update. By default this is chosen to preserve the "
+            "legacy 128 sampled solutions/update (4 instances at 32 "
+            "rollouts), so --n-rollouts 10 uses 13 instances/update. The legacy "
             "--grad-accum-variants spelling is retained as an alias."
         ),
     )
     parser.add_argument(
         "--search-iterations",
         type=int,
-        default=16,
+        default=4,
         help="post-bootstrap perturbation/SRR iterations (default: 16)",
     )
     parser.add_argument(
@@ -2311,6 +2542,7 @@ def parse_args() -> argparse.Namespace:
             "field for the complete search budget"
         ),
     )
+    parser.add_argument("--option-max-steps", type=int, default=4)
     parser.add_argument("--improvement-epsilon", type=float, default=0.0)
     parser.add_argument("--smdp-gamma", type=float, default=0.99)
     parser.add_argument(
@@ -2336,8 +2568,9 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.0,
         help=(
-            "Weight of the optional refresh-state critic loss; the default 0 "
-            "keeps temporal credit critic-free"
+            "EXPERIMENTAL (off by default; may be removed or evolved in the "
+            "future). Weight of the optional refresh-state critic loss; the "
+            "default 0 keeps temporal credit critic-free"
         ),
     )
     parser.add_argument("--neural-call-cost", type=float, default=0.0)
@@ -2358,11 +2591,8 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=0,
         help=(
-            "Number of auxiliary-only epochs before PPO starts. Default 0: the "
-            "field is trained purely from search reward from epoch 0, with no "
-            "analytic-pressure warm start, so a new constraint needs no "
-            "hand-authored supervision. Set >0 to enable the heuristic-imitation "
-            "warm start as an ablation."
+            "Number of auxiliary-only epochs before PPO starts; use 0 to "
+            "disable the pretraining phase"
         ),
     )
     parser.add_argument(
@@ -2370,7 +2600,7 @@ def parse_args() -> argparse.Namespace:
         "--pretraining-lr",
         dest="pretrain_lr",
         type=float,
-        default=1e-5,
+        default=5e-6,
         help="Optimizer learning rate during auxiliary pretraining",
     )
     parser.add_argument(
@@ -2383,48 +2613,120 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--rl-weight", type=float, default=1.0)
     parser.add_argument(
-        "--aux-rl-scale",
-        type=float,
-        default=0.1,
-        help=(
-            "Scale on the edge-only feasibility auxiliary after PPO starts "
-            "(default: 0.1). Its lookahead labels depend on live route state "
-        ),
+        "--joint-refiner",
+        action="store_true",
+        help="EXPERIMENTAL (off by default; may be removed or evolved in the "
+        "future). Jointly train a BatchedRelocate refiner sharing the field GNN "
+        "encoder; its best-improvement imitation loss is added to each PPO step "
+        "(CaR unified-encoder joint training)",
     )
     parser.add_argument(
-        "--imitation-rl-scale",
+        "--refiner-ce-weight",
+        type=float,
+        default=1.0,
+        help="weight of the joint refiner imitation CE in the combined loss",
+    )
+    parser.add_argument(
+        "--refiner-only",
+        action="store_true",
+        help="EXPERIMENTAL (off by default; may be removed or evolved in the "
+        "future). Train ONLY the neural refiner (imitation): skip the field RL / C++ "
+        "search rollout entirely; per step just bootstrap a construction, build "
+        "the teacher trajectory, and take an imitation step. Much faster; the "
+        "field/construction stays neutral (pair with --neural-refine to deploy).",
+    )
+    parser.add_argument(
+        "--refiner-teacher-steps",
+        type=int,
+        default=40,
+        help="max best-improvement teacher trajectory length per instance",
+    )
+    parser.add_argument(
+        "--refiner-max-seg",
+        type=int,
+        default=1,
+        help="OR-OPT neighborhood: relocate contiguous segments of length "
+        "1..max_seg (with reversal for len>1). 1 = single-node relocate.",
+    )
+    parser.add_argument(
+        "--neural-refine",
+        action="store_true",
+        help="EXPERIMENTAL (off by default; may be removed or evolved in the "
+        "future). DEPLOY the trained refiner in place of C++ SRR: validation/"
+        "inference build the decoder with use_srr=False (C++ only constructs) "
+        "and refine with the neural model",
+    )
+    parser.add_argument(
+        "--neural-refine-group",
+        type=int,
+        default=32,
+        help="stochastic rollouts per instance for neural refinement",
+    )
+    parser.add_argument(
+        "--neural-refine-steps",
+        type=int,
+        default=60,
+        help="neural refinement improvement steps per instance",
+    )
+    parser.add_argument(
+        "--aux-rl-scale",
         type=float,
         default=0.0,
-        help=(
-            "Scale on the heuristic-imitation auxiliaries (dual/binding/price) "
-            "after PPO starts. Default 0.0: the ranking (field_r, lambda_r) is "
-            "trained purely from search reward, so no per-constraint analytic "
-            "pressure target is needed and new constraints generalize without "
-            "hand-authored supervision. Set >0 only to ablate that choice."
-        ),
+        help="EXPERIMENTAL (off by default; may be removed or evolved in the "
+        "future). Auxiliary-loss scale after PPO fine-tuning starts; default 0 "
+        "carries no auxiliary-head loss into RL",
     )
     parser.add_argument("--dual-weight", type=float, default=1.0)
     parser.add_argument("--feasibility-weight", type=float, default=1.0)
-    parser.add_argument("--binding-weight", type=float, default=0.25)
+    parser.add_argument("--binding-weight", type=float, default=1.0)
     parser.add_argument(
         "--price-weight",
         type=float,
-        default=0.25,
+        default=0.0,
         help=(
-            "Weight of the multiplier->binding-indicator supervision. Default 0.25:"
+            "Weight of the multiplier->binding-indicator supervision. Default 0:"
             " pinning multipliers to the binding (feasibility) target injects"
+            " harmful ranking distortion (the penalty prices nothing in the"
+            " objective-gated SRR), measured net-negative on distance variants."
+            " Let RL shape the multipliers from search progress instead."
         ),
     )
     parser.add_argument(
         "--gate-multipliers-by-binding",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help=(
-            "Ablation: gate resource multipliers by the binding classifier."
-            " Off by default so RL gradients reach the multipliers directly"
-            " instead of vanishing where the binding head is unsure."
+            "Gate resource multipliers by the binding classifier (the stable"
+            " legacy training behavior; --no-gate-multipliers-by-binding is"
+            " available as an ablation)."
         ),
     )
     parser.add_argument("--entropy-weight", type=float, default=0.001)
+    parser.add_argument(
+        "--objective-residual",
+        "--edge-logit",
+        dest="objective_residual_enabled",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Enable the learned signed objective-energy residual (default: "
+            "enabled). Use --no-objective-residual for the neutral ablation; "
+            "--no-edge-logit remains a compatibility alias."
+        ),
+    )
+    parser.add_argument(
+        "--objective-residual-l2",
+        "--edge-logit-l2",
+        dest="objective_residual_l2",
+        type=float,
+        default=0.1,
+        help=(
+            "L2 anchor on source-centered objective-energy residuals "
+            "(default: 0.1); prevents PPO random walk from overwhelming the "
+            "exact objective energy while leaving row-constant corrections "
+            "unpenalized"
+        ),
+    )
     parser.add_argument(
         "--ppo-epochs",
         type=int,
@@ -2442,23 +2744,49 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--ppo-clip", type=float, default=0.1)
     parser.add_argument("--no-adv-norm", action="store_true")
+    parser.add_argument(
+        "--schema-adv-scale",
+        action="store_true",
+        help=(
+            "Normalise policy-gradient advantages by a learned schema-conditioned "
+            "scale g_phi(schema) instead of a single batch-pooled std. g_phi reads "
+            "the algebra descriptor and is fitted to per-schema reward dispersion, "
+            "so the normaliser generalises to held-out compositions with no "
+            "per-objective grouping. Off by default (pooled std)."
+        ),
+    )
+    parser.add_argument(
+        "--schema-scale-weight",
+        type=float,
+        default=0.1,
+        help=(
+            "Weight on the log-space regression fitting g_phi(schema) to observed "
+            "reward dispersion (used only with --schema-adv-scale)."
+        ),
+    )
     parser.add_argument("--beta", type=float, default=2.0)
     parser.add_argument(
         "--feasibility-lookahead-depth", type=int, default=2
     )
     parser.add_argument(
-        "--feasibility-risk-penalty", type=float, default=10.0
+        "--feasibility-risk-penalty",
+        type=float,
+        default=1.0,
+        help=(
+            "Weight of the detached feasibility-risk classifier in decoder "
+            "ranking (default: 1). "
+            "Use 0 for the measured risk-guidance ablation."
+        ),
     )
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument(
         "--lr-schedule",
         dest="lr_schedule",
         choices=("constant", "cosine"),
-        default="cosine",
+        default="constant",
         help=(
-            "Post-pretrain learning-rate schedule (default: cosine). Cosine "
-            "anneals lr->lr-min so late PPO updates stop random-walking away "
-            "from a useful policy; use 'constant' for the legacy behaviour."
+            "Post-pretrain learning-rate schedule (default: constant). Use "
+            "'cosine' to anneal lr to --lr-min."
         ),
     )
     parser.add_argument(
@@ -2477,7 +2805,7 @@ def parse_args() -> argparse.Namespace:
             "If >0, keep an exponential moving average of the weights (decay "
             "per optimizer update) and run validation + save best.pt from it. "
             "Smooths the jagged val macro-gap into a near-monotone curve. "
-            "Typical: 0.99. Default 0.0 disables (unchanged behaviour)"
+            "Default: 0 (validate raw online weights); enable explicitly"
         ),
     )
     parser.add_argument("--grad-clip", type=float, default=1.0)
@@ -2504,25 +2832,28 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Warn and continue when a selected validation instance is missing",
     )
-    parser.add_argument(
-        "--baseline",
-        choices=["fields-off", "classical"],
-        default="fields-off",
-        help=(
-            "Reference the neural field is scored against. 'fields-off' (default)"
-            " runs the identical decoder with the field ablated to pure distance"
-            " (E = c(e)), an ablation of PRISM's own guidance. 'classical' uses"
-            " the hand-tuned classical-proximity ranking."
-        ),
-    )
     parser.add_argument("--skip-validation", action="store_true")
+    parser.add_argument(
+        "--val-generated",
+        action="store_true",
+        help="validate on freshly generated held-out instances (no saved oracle "
+        "data); checkpoint selection is purely the best averaged cost",
+    )
     parser.add_argument("--save-dir", type=Path, default=Path("pretrained"))
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--no-wandb", action="store_true")
     parser.add_argument("--wandb-project", default="prism-decoder")
     parser.add_argument("--wandb-entity")
     parser.add_argument("--run-name")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.n_rollouts < 1:
+        parser.error("--n-rollouts must be positive")
+    if args.grad_accum_variants is None:
+        legacy_rollout_batch = 4 * 32
+        args.grad_accum_variants = max(
+            1, math.ceil(legacy_rollout_batch / args.n_rollouts)
+        )
+    return args
 
 
 def setup_seeds(seed: int) -> None:
@@ -2543,6 +2874,8 @@ def main() -> None:
         raise ValueError("temporal_credit_weight must be nonnegative")
     if args.value_loss_weight < 0.0:
         raise ValueError("value_loss_weight must be nonnegative")
+    if args.objective_residual_l2 < 0.0:
+        raise ValueError("objective_residual_l2 must be nonnegative")
     if args.typed_noninferiority_margin < 0.0:
         raise ValueError("typed_noninferiority_margin must be nonnegative")
     if args.smallvram is None:
@@ -2575,7 +2908,25 @@ def main() -> None:
         grad_checkpointing=args.grad_checkpointing,
         gate_multipliers_by_binding=args.gate_multipliers_by_binding,
     ).to(args.device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    # Joint refiner (CaR unified-encoder): EXPERIMENTAL, off by default (may be
+    # removed or evolved in the future). Shares model.emb_net so its
+    # imitation gradient trains the same GNN. units MUST match the encoder width.
+    # Build the refiner when jointly TRAINING it (--joint-refiner) OR DEPLOYING
+    # it in place of SRR (--neural-refine); deployment must not require joint
+    # training (a refiner can be loaded via --resume).
+    refiner = None
+    if args.joint_refiner or args.neural_refine or args.refiner_only:
+        refiner = BatchedRelocate(
+            units=model.emb_net.units, emb_net=model.emb_net,
+            grad_checkpointing=args.grad_checkpointing,
+            max_seg=args.refiner_max_seg,
+        ).to(args.device)
+        if args.neural_refine and not args.joint_refiner and not args.resume:
+            get_logger().warning(
+                "--neural-refine without --joint-refiner or --resume: the "
+                "refiner is UNTRAINED; validation/inference will be poor"
+            )
+    optimizer = torch.optim.AdamW(joint_parameters(model, refiner), lr=args.lr)
     start_epoch = 0
     global_step = 0
     checkpoint = None
@@ -2585,28 +2936,34 @@ def main() -> None:
         )
         if checkpoint.get("model_schema") != MODEL_SCHEMA:
             raise RuntimeError(
-                "resume checkpoint is not a typed-resource v2 checkpoint"
+                "resume checkpoint is not a typed-resource v4 signed-resource-energy "
+                "checkpoint"
             )
         upgraded = load_constraint_field_state_dict(
             model, checkpoint["model_state_dict"]
         )
+        if refiner is not None and checkpoint.get("refiner_state_dict") is not None:
+            refiner.load_state_dict(checkpoint["refiner_state_dict"])
         added_optimizer_parameters = _load_optimizer_state_compat(
             optimizer, checkpoint["optimizer_state_dict"]
         )
         if upgraded:
             logger.warning(
-                "resumed a pre-critic checkpoint; initialized the refresh "
-                "value head at zero"
+                "resumed a checkpoint without objective-conditioned edge "
+                "logits; initialized the new signed heads at zero"
             )
         if added_optimizer_parameters:
             logger.warning(
                 "initialized optimizer state for "
-                f"{added_optimizer_parameters} new critic parameters"
+                f"{added_optimizer_parameters} new model parameters"
             )
         start_epoch = int(checkpoint["epoch"]) + 1
         global_step = int(
             checkpoint.get("global_step", start_epoch * args.steps_per_epoch)
         )
+
+    if not args.objective_residual_enabled:
+        _disable_objective_residual(model)
 
     ema = (
         WeightEMA(model, args.val_ema_decay)
@@ -2627,15 +2984,13 @@ def main() -> None:
     validation_data = (
         [] if args.skip_validation else build_validation_data(args)
     )
-    cached_classical_references = (
-        cache_classical_references(validation_data, args)
-        if validation_data
-        else 0
+    missing_references = sum(
+        item.get("reference_source") == "missing" for item in validation_data
     )
-    if cached_classical_references:
+    if missing_references:
         logger.info(
-            f"Cached {cached_classical_references} classical references for "
-            "validation instances without saved oracle references"
+            f"Skipping oracle gap for {missing_references} validation "
+            "instances without saved oracle references"
         )
     validation_manifest = tuple(
         (
@@ -2685,13 +3040,22 @@ def main() -> None:
             _decoder_time,
             epoch_time,
             epoch_timing,
-        ) = train_epoch(
-            model, optimizer, global_step, epoch, args, curriculum, ema=ema
+        ) = (
+            train_refiner_only_epoch(
+                model, refiner, optimizer, global_step, epoch, args, curriculum,
+                ema=ema,
+            )
+            if args.refiner_only
+            else train_epoch(
+                model, optimizer, global_step, epoch, args, curriculum, ema=ema,
+                refiner=refiner,
+            )
         )
         val_best = 0.0
         val_gap = None
         val_metrics = {}
         validation_rank = None
+        is_best = False
         if validation_data:
             # Evaluate and select the checkpoint from the EMA weights (when
             # enabled) so the reported curve and best.pt track the smoothed
@@ -2702,7 +3066,7 @@ def main() -> None:
 
             with _eval_context():
                 val_average, val_best, val_gap, val_metrics = validation(
-                    model, validation_data, args
+                    model, validation_data, args, refiner=refiner
                 )
             typed_gate_pass = (
                 not args.learned_candidate_quotas
@@ -2717,16 +3081,7 @@ def main() -> None:
             val_metrics["typed_neighborhood_gate_pass"] = float(
                 typed_gate_pass
             )
-            logger.log_validation(
-                val_average,
-                val_best,
-                val_gap,
-                epoch,
-                val_metrics,
-                timing=epoch_timing,
-                step=global_step,
-            )
-            validation_rank = _validation_rank(val_metrics, val_gap)
+            validation_rank = _validation_rank(val_metrics, val_best)
             if typed_gate_pass and validation_rank < best_validation_rank:
                 best_validation_rank = validation_rank
                 with _eval_context():
@@ -2741,13 +3096,30 @@ def main() -> None:
                         best_validation_rank=best_validation_rank,
                         global_step=global_step,
                         validation_manifest=validation_manifest,
+                        refiner=refiner,
                     )
+                is_best = True
+                logger.info(
+                    f"Saved BEST checkpoint: {args.save_dir / 'best.pt'} "
+                    f"ValCost={val_best:.4f}"
+                )
+            logger.log_validation(
+                val_average,
+                val_best,
+                val_gap,
+                epoch,
+                val_metrics,
+                is_best=is_best,
+                timing=epoch_timing,
+                step=global_step,
+            )
         logger.log_epoch_summary(
             epoch,
             train_cost,
             val_best,
             val_gap,
             val_metrics.get("feasibility_rate") if validation_data else None,
+            is_best=is_best,
         )
         epoch_timing["epoch_seconds"] = epoch_time
         if args.profile_timing:

@@ -22,6 +22,7 @@ from net import (  # noqa: E402
     load_constraint_field_state_dict,
 )
 from train import (  # noqa: E402
+    _guidance_numpy,
     _neutral_guidance,
     replay_decision_logp_from_cpp_batch_trace,
     replay_logp_from_cpp_batch_trace,
@@ -58,11 +59,21 @@ def test_constraint_field_net_uses_normalized_decoder_contract() -> None:
     data = build_decoder_data(decoder)
     model = ConstraintFieldNet(depth=2, units=16).eval()
     with torch.no_grad():
+        # Legacy objective-head parameters remain loadable but must not reopen
+        # the graph-level temperature shortcut on constrained instances.
+        model.objective_multiplier_head.weight.fill_(3.0)
+        model.objective_multiplier_head.bias.fill_(3.0)
+        model.objective_coupler_query_head.weight.fill_(3.0)
+        model.objective_coupler_query_head.bias.fill_(3.0)
+        model.objective_coupler_bias_head.weight.fill_(3.0)
+        model.objective_coupler_bias_head.bias.fill_(3.0)
         output = model(data)
 
     edge_count = decoder.metadata["edge_count"]
     channel_count = prism_decoder.FIELD_CHANNEL_COUNT
     assert output["residual"].shape == (edge_count, channel_count)
+    assert output["objective_residual"].shape == (edge_count,)
+    assert torch.equal(output["objective_residual"], torch.zeros(edge_count))
     assert output["multipliers"].shape == (1, prism_decoder.MULTIPLIER_COUNT)
     assert output["binding_logits"].shape == (1, channel_count)
     assert output["feasibility_logits"].shape == (edge_count,)
@@ -81,15 +92,28 @@ def test_constraint_field_net_uses_normalized_decoder_contract() -> None:
         (output["feasibility_risk"] >= 0.0)
         & (output["feasibility_risk"] <= 1.0)
     )
-    # The residual is now the direct per-edge field (no pressure gate): it is
-    # non-negative and exactly zero on inactive channels.
+    # Resource fields are signed and exactly zero-neutral at initialization.
+    # Inactive channels remain masked to zero after learning.
     active = torch.as_tensor(decoder.metadata["field_channel_mask"]).bool()
-    assert torch.all(output["residual"] >= 0.0)
+    assert torch.equal(output["residual"], torch.zeros_like(output["residual"]))
+    assert torch.equal(output["additive"], torch.zeros_like(output["additive"]))
     assert torch.all(output["residual"][:, ~active] == 0.0)
     assert torch.all(output["multipliers"] >= 0.0)
-    # The objective weight slot (final) is always on; field channels are gated.
+    # The objective weight slot is a fixed unit anchor; field channels learn
+    # their strength relative to it.
     field_multipliers = output["multipliers"][0, :channel_count]
     assert torch.all(field_multipliers[~active] == 0.0)
+    assert output["multipliers"][0, -1] == 1.0
+    assert torch.equal(
+        output["coupler_weights"][0, -1],
+        torch.zeros_like(output["coupler_weights"][0, -1]),
+    )
+    assert output["coupler_bias"][0, -1] == 0.0
+    live_state = torch.rand(5, channel_count)
+    assert torch.equal(model.couple(output, live_state)[:, -1], torch.ones(5))
+    assert _guidance_numpy(output, data, risk_penalty=10.0)[
+        "risk_penalty"
+    ] == 10.0
 
 
 def test_v2_checkpoint_loader_is_strict_and_rejects_v1_identity() -> None:
@@ -108,6 +132,19 @@ def test_v2_checkpoint_loader_is_strict_and_rejects_v1_identity() -> None:
     with pytest.raises(RuntimeError, match="v1 checkpoint"):
         load_constraint_field_state_dict(restored, v1)
     assert load_constraint_field_state_dict(restored, original.state_dict()) is False
+
+    pre_logit_v2 = {
+        key: value
+        for key, value in original.state_dict().items()
+        if not key.startswith(
+            ("edge_logit_head.", "objective_energy_residual_head.")
+        )
+    }
+    assert load_constraint_field_state_dict(restored, pre_logit_v2) is True
+    assert torch.equal(
+        restored.objective_energy_residual_head.weight,
+        torch.zeros_like(restored.objective_energy_residual_head.weight),
+    )
 
 
 def test_python_dimensions_come_from_cpp_extension() -> None:
@@ -214,7 +251,7 @@ def test_typed_field_accepts_unseen_runtime_resource_without_new_weights() -> No
         output = model(graph)
     scales = graph.resource_scales.unsqueeze(0)
     traced = battery.sample_traced(
-        edge_field=(output["residual"] * scales).numpy(),
+        edge_field=output["residual"].numpy(),
         edge_additive=(output["additive"] * scales).numpy(),
         multipliers=output["multipliers"][0].numpy(),
         coupler_weights=output["coupler_weights"][0].numpy(),
@@ -270,6 +307,31 @@ def test_objective_conditioning_reaches_descriptor_and_field() -> None:
     ) or not torch.allclose(
         distance_output["residual"].mean(0), prize_output["residual"].mean(0)
     )
+
+
+def test_edge_logit_uses_separate_objective_weights() -> None:
+    rng = np.random.default_rng(315)
+    coordinates = rng.random((18, 2), dtype=np.float32)
+    distance = np.linalg.norm(
+        coordinates[:, None] - coordinates[None, :], axis=-1
+    ).astype(np.float32)
+    decoder = make_decoder(
+        {"name": "tsp", "coordinates": coordinates, "distance": distance},
+        n_rollouts=1,
+    )
+    distance_data = build_decoder_data(decoder)
+    prize_data = distance_data.clone()
+    prize_data.objective_type = torch.tensor([[0.0, 1.0, 0.0]])
+    model = ConstraintFieldNet(depth=2, units=16).eval()
+    with torch.no_grad():
+        direction = torch.linspace(-0.2, 0.2, 16)
+        model.objective_energy_residual_head.weight[0].copy_(direction)
+        model.objective_energy_residual_head.weight[1].copy_(-direction)
+        distance_logits = model(distance_data)["objective_residual"]
+        prize_logits = model(prize_data)["objective_residual"]
+
+    assert distance_logits.std() > 0.0
+    assert torch.allclose(distance_logits, -prize_logits)
 
 
 def test_depot_conditioning_reaches_descriptor_and_field() -> None:
@@ -388,6 +450,12 @@ def test_cpp_trace_replays_exact_state_dependent_policy() -> None:
     )
     decoder.seed(3003)
     model = ConstraintFieldNet(depth=2, units=16).eval()
+    with torch.no_grad():
+        model.objective_energy_residual_head.weight.copy_(
+            torch.linspace(-0.2, 0.2, 16)
+            .view(1, -1)
+            .expand(model.objective_energy_residual_head.out_features, -1)
+        )
 
     incumbent = decoder.sample_greedy(**_neutral_guidance(decoder))
     assert incumbent["feasible"]
@@ -396,13 +464,15 @@ def test_cpp_trace_replays_exact_state_dependent_policy() -> None:
     graph = build_decoder_data(decoder)
     with torch.no_grad():
         output = model(graph)
+    assert output["objective_residual"].std() > 0.0
     scales = graph.resource_scales.unsqueeze(0)
     traced = decoder.sample_traced(
-        edge_field=(output["residual"] * scales).detach().numpy(),
+        edge_field=output["residual"].detach().numpy(),
         edge_additive=(output["additive"] * scales).detach().numpy(),
         multipliers=output["multipliers"][0].detach().numpy(),
         coupler_weights=output["coupler_weights"][0].detach().numpy(),
         coupler_bias=output["coupler_bias"][0].detach().numpy(),
+        objective_residual=output["objective_residual"].detach().numpy(),
         edge_risk=output["feasibility_risk"].detach().numpy(),
         risk_penalty=3.0,
     )
@@ -451,3 +521,186 @@ def test_cpp_trace_replays_exact_state_dependent_policy() -> None:
         | (trace["feasibility_risk_labels"] == 1.0)
     )
     assert trace["feasibility_risk_labels"].size > 0
+
+
+def test_tsp_edge_logit_receives_objective_policy_gradient() -> None:
+    rng = np.random.default_rng(304)
+    coordinates = rng.random((24, 2), dtype=np.float32)
+    distance = np.linalg.norm(
+        coordinates[:, None] - coordinates[None, :], axis=-1
+    ).astype(np.float32)
+    decoder = make_decoder(
+        {"name": "tsp", "coordinates": coordinates, "distance": distance},
+        search_config={"classical_behavior": False},
+        n_rollouts=6,
+        beta=2.0,
+    )
+    decoder.seed(3004)
+    graph = build_decoder_data(decoder)
+    model = ConstraintFieldNet(depth=1, units=8)
+    output = model(graph)
+    scales = graph.resource_scales.unsqueeze(0)
+    traced = decoder.sample_traced(
+        edge_field=output["residual"].detach().numpy(),
+        edge_additive=(output["additive"] * scales).detach().numpy(),
+        multipliers=output["multipliers"][0].detach().numpy(),
+        coupler_weights=output["coupler_weights"][0].detach().numpy(),
+        coupler_bias=output["coupler_bias"][0].detach().numpy(),
+        objective_residual=output["objective_residual"].detach().numpy(),
+        edge_risk=output["feasibility_risk"].detach().numpy(),
+    )
+    replayed, _ = replay_logp_from_cpp_batch_trace(
+        traced["trace"], graph, output, model, beta=2.0
+    )
+    advantages = torch.linspace(-1.0, 1.0, replayed.numel())
+    loss = -(replayed * advantages).mean()
+    loss.backward()
+
+    gradient = model.objective_energy_residual_head.weight.grad
+    assert gradient is not None
+    assert torch.isfinite(gradient).all()
+    assert gradient.norm() > 0.0
+    assert not torch.as_tensor(
+        decoder.metadata["field_channel_mask"]
+    ).any()
+
+
+def test_default_depth_tsp_edge_logit_does_not_saturate_constant() -> None:
+    rng = np.random.default_rng(305)
+    coordinates = rng.random((32, 2), dtype=np.float32)
+    distance = np.linalg.norm(
+        coordinates[:, None] - coordinates[None, :], axis=-1
+    ).astype(np.float32)
+    decoder = make_decoder(
+        {"name": "tsp", "coordinates": coordinates, "distance": distance},
+        search_config={"classical_behavior": False},
+        n_rollouts=2,
+    )
+    graph = build_decoder_data(decoder)
+    model = ConstraintFieldNet().eval()
+    with torch.no_grad():
+        model.objective_energy_residual_head.weight.copy_(
+            torch.linspace(
+                -0.2, 0.2, model.objective_energy_residual_head.in_features
+            )
+            .view(1, -1)
+            .expand(model.objective_energy_residual_head.out_features, -1)
+        )
+        output = model(graph)
+
+    assert output["objective_residual"].std() > 1e-4
+    assert output["objective_residual"].amax() > output["objective_residual"].amin()
+    assert output["multipliers"][0, -1] == 1.0
+    assert torch.equal(
+        output["coupler_weights"][0, -1],
+        torch.zeros_like(output["coupler_weights"][0, -1]),
+    )
+    assert output["coupler_bias"][0, -1] == 0.0
+    assert _guidance_numpy(output, graph, risk_penalty=10.0)[
+        "risk_penalty"
+    ] == 10.0
+
+
+def test_objective_view_does_not_change_legacy_dynamic_batch_norm() -> None:
+    rng = np.random.default_rng(1305)
+    coordinates = rng.random((24, 2), dtype=np.float32)
+    distance = np.linalg.norm(
+        coordinates[:, None] - coordinates[None, :], axis=-1
+    ).astype(np.float32)
+    decoder = make_decoder(
+        {
+            "name": "cvrp",
+            "coordinates": coordinates,
+            "distance": distance,
+            "demand": np.r_[0.0, rng.uniform(0.01, 0.06, 23)].astype(
+                np.float32
+            ),
+            "capacity": 0.5,
+        },
+        search_config={"classical_behavior": False},
+        n_rollouts=2,
+    )
+    incumbent = decoder.sample_greedy(**_neutral_guidance(decoder))
+    decoder.set_incumbent(incumbent["route"])
+    graph = build_decoder_data(decoder)
+    model = ConstraintFieldNet(depth=2, units=16)
+    legacy = ConstraintFieldNet(depth=2, units=16)
+    legacy.load_state_dict(model.state_dict())
+    embeddings = []
+    hook = model.emb_net.register_forward_hook(
+        lambda _module, _inputs, output: embeddings.append(output.detach())
+    )
+
+    model.train()
+    model(graph)
+    hook.remove()
+    legacy.train()
+    expected_dynamic = legacy.emb_net(
+        graph.x, graph.edge_index, graph.edge_attr
+    ).detach()
+
+    assert len(embeddings) == 2
+    assert embeddings[0].shape == expected_dynamic.shape
+    assert embeddings[1].shape == expected_dynamic.shape
+    assert torch.allclose(embeddings[0], expected_dynamic)
+    for actual_layer, legacy_layer in zip(
+        model.emb_net.layers, legacy.emb_net.layers
+    ):
+        for actual_norm, legacy_norm in (
+            (actual_layer.v_bn.module, legacy_layer.v_bn.module),
+            (actual_layer.e_bn.module, legacy_layer.e_bn.module),
+        ):
+            assert torch.equal(
+                actual_norm.running_mean, legacy_norm.running_mean
+            )
+            assert torch.equal(
+                actual_norm.running_var, legacy_norm.running_var
+            )
+
+
+def test_edge_logit_is_invariant_to_incumbent_state() -> None:
+    rng = np.random.default_rng(306)
+    coordinates = rng.random((24, 2), dtype=np.float32)
+    distance = np.linalg.norm(
+        coordinates[:, None] - coordinates[None, :], axis=-1
+    ).astype(np.float32)
+    decoder = make_decoder(
+        {
+            "name": "cvrp",
+            "coordinates": coordinates,
+            "distance": distance,
+            "demand": np.r_[0.0, rng.uniform(0.01, 0.06, 23)].astype(
+                np.float32
+            ),
+            "capacity": 0.5,
+        },
+        search_config={"classical_behavior": False},
+        n_rollouts=2,
+    )
+    model = ConstraintFieldNet(depth=2, units=16).eval()
+    with torch.no_grad():
+        model.objective_energy_residual_head.weight.copy_(
+            torch.linspace(-0.2, 0.2, 16)
+            .view(1, -1)
+            .expand(model.objective_energy_residual_head.out_features, -1)
+        )
+        model.field_head.weight.copy_(
+            torch.linspace(-0.2, 0.2, 16).view(1, -1)
+        )
+        empty_graph = build_decoder_data(decoder)
+        empty_output = model(empty_graph)
+        incumbent = decoder.sample_greedy(**_neutral_guidance(decoder))
+        decoder.set_incumbent(incumbent["route"])
+        incumbent_graph = build_decoder_data(decoder)
+        incumbent_output = model(incumbent_graph)
+
+    assert torch.equal(empty_graph.edge_index, incumbent_graph.edge_index)
+    assert torch.count_nonzero(incumbent_graph.x[:, 12]) > 0
+    assert torch.count_nonzero(incumbent_graph.edge_attr[:, 8:10]) > 0
+    assert torch.allclose(
+        empty_output["objective_residual"], incumbent_output["objective_residual"]
+    )
+    # Resource guidance remains state-conditioned.
+    assert not torch.equal(
+        empty_output["residual"], incumbent_output["residual"]
+    )

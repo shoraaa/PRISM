@@ -16,8 +16,13 @@ from train import (
     OptionStep,
     _assign_refresh_gae,
     _assign_smdp_returns,
+    _best_feasible_solution,
+    _disable_objective_residual,
+    _neutral_guidance,
+    _new_decoder,
     _dual_loss,
     _epoch_lr,
+    _objective_residual_loss,
     _feasibility_loss,
     _load_optimizer_state_compat,
     _positive_class_weight,
@@ -27,7 +32,6 @@ from train import (
     _validation_rank,
     _winner_temporal_advantage,
     build_validation_data,
-    cache_classical_references,
     collect_instance_rollout,
     infer_instance,
     parse_args,
@@ -50,6 +54,7 @@ def _args() -> Namespace:
         seed=404,
         device="cpu",
         search_iterations=2,
+        option_max_steps=4,
         infeasible_penalty=10.0,
         reward_clip=1.0,
         smdp_gamma=0.99,
@@ -63,7 +68,6 @@ def _args() -> Namespace:
         value_loss_weight=0.5,
         rl_weight=1.0,
         aux_rl_scale=0.1,
-        imitation_rl_scale=0.0,
         dual_weight=1.0,
         feasibility_weight=1.0,
         binding_weight=0.25,
@@ -78,7 +82,7 @@ def _args() -> Namespace:
     )
 
 
-def test_setup_decoder_starts_without_a_hand_built_incumbent() -> None:
+def test_setup_decoder_installs_a_neutral_greedy_incumbent() -> None:
     rng = np.random.default_rng(403)
     coordinates = rng.random((20, 2), dtype=np.float32)
     problem = {
@@ -93,12 +97,13 @@ def test_setup_decoder_starts_without_a_hand_built_incumbent() -> None:
     problem = problem_schema("cvrp") | problem
     args = _args()
 
-    decoder = setup_decoder(problem, args, deterministic=True)
+    decoder, incumbent = setup_decoder(problem, args, deterministic=True)
 
-    assert not decoder.best_solution["feasible"]
-    assert decoder.best_solution["route"].size == 0
+    assert incumbent["feasible"]
+    assert decoder.best_solution["feasible"]
+    assert decoder.best_solution["route"].size > 0
     graph = build_decoder_data(decoder)
-    assert torch.count_nonzero(graph.x[:, 12]) == 0
+    assert torch.count_nonzero(graph.x[:, 12]) > 0
 
 
 @pytest.mark.parametrize("smallvram", [False, True])
@@ -131,10 +136,14 @@ def test_event_driven_option_rollout_and_pretrain_update(
     rollout = collect_instance_rollout(model, problem, "cvrp", args)
     metrics = ppo_update(model, optimizer, [rollout], args, epoch=0)
 
-    assert 2 <= rollout.emissions <= args.search_iterations + 1
-    assert len(rollout.steps) == args.search_iterations + 1
-    assert torch.count_nonzero(rollout.steps[0].graph.x[:, 12]) == 0
-    assert rollout.steps[0].transition_rollout is not None
+    assert 1 <= rollout.emissions <= args.search_iterations
+    assert len(rollout.steps) == args.search_iterations
+    # Match the successful pipeline: PPO sees only incumbent-conditioned
+    # refinement states after a neutral feasible bootstrap.
+    assert all(
+        torch.count_nonzero(step.graph.x[:, 12]) > 0
+        for step in rollout.steps
+    )
     assert all(
         1 <= step.duration <= args.search_iterations for step in rollout.steps
     )
@@ -145,7 +154,7 @@ def test_event_driven_option_rollout_and_pretrain_update(
     transition_steps = [
         step for step in rollout.steps if step.transition_rollout is not None
     ]
-    assert len(transition_steps) == rollout.improvements + 1
+    assert len(transition_steps) == rollout.improvements
     assert any(step.value_target is not None for step in rollout.steps)
     assert all(0.0 <= step.search_progress < 1.0 for step in rollout.steps)
     assert {
@@ -246,7 +255,14 @@ def test_decision_level_ppo_moves_policy_without_auxiliary_losses(
     policy_before = {
         name: parameter.detach().clone()
         for name, parameter in model.named_parameters()
-        if name.startswith(("field_head", "additive_head", "multiplier_head"))
+        if name.startswith(
+            (
+                "objective_energy_residual_head",
+                "field_head",
+                "additive_head",
+                "multiplier_head",
+            )
+        )
     }
     value_before = model.value_head.weight.detach().clone()
 
@@ -281,7 +297,7 @@ def test_decision_level_ppo_moves_policy_without_auxiliary_losses(
     assert metrics["policy_signal"] > 0.0
     assert metrics["gradient_norm"] > 0.0
     assert rollout.improvements > 0
-    assert metrics["temporal_transitions"] == rollout.improvements + 1
+    assert metrics["temporal_transitions"] == rollout.improvements
     if temporal_credit_weight:
         assert metrics["temporal_policy_signal"] > 0.0
         assert metrics["critic_loss"] > 0.0
@@ -294,6 +310,42 @@ def test_decision_level_ppo_moves_policy_without_auxiliary_losses(
     assert metrics["ppo_reuse_passes"] == 1.0
     assert metrics["ppo_clipping_active"] == 0.0
     assert metrics["auxiliary_scale"] == pytest.approx(args.aux_rl_scale)
+
+
+def test_tsp_refinement_transition_updates_edge_logit_head() -> None:
+    rng = np.random.default_rng(409)
+    coordinates = rng.random((20, 2), dtype=np.float32)
+    problem = problem_schema("tsp") | {
+        "name": "tsp",
+        "coordinates": coordinates,
+        "distance": np.linalg.norm(
+            coordinates[:, None] - coordinates[None, :], axis=-1
+        ).astype(np.float32),
+    }
+    args = _args()
+    args.pretrain_epochs = 0
+    args.ppo_epochs = 1
+    args.temporal_credit_weight = 0.0
+    args.dual_weight = 0.0
+    args.feasibility_weight = 0.0
+    args.binding_weight = 0.0
+    args.price_weight = 0.0
+    args.entropy_weight = 0.0
+    model = ConstraintFieldNet(depth=1, units=8)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    rollout = collect_instance_rollout(model, problem, "tsp", args)
+    refinement = rollout.steps[0]
+    assert torch.count_nonzero(refinement.graph.x[:, 12]) > 0
+    assert refinement.old_logp.numel() > 0
+    refinement.rewards = torch.tensor([-1.0, 1.0])
+    rollout.steps = [refinement]
+    before = model.objective_energy_residual_head.weight.detach().clone()
+
+    ppo_update(model, optimizer, [rollout], args, epoch=0)
+
+    assert not torch.equal(
+        before, model.objective_energy_residual_head.weight.detach()
+    )
 
 
 def test_binding_weight_is_computed_across_rollout_steps() -> None:
@@ -395,7 +447,7 @@ def test_winner_temporal_advantage_is_non_cancelling_pomo_contrast() -> None:
     assert float(advantage.abs().sum()) > 0.0
 
 
-def test_legacy_optimizer_state_initializes_appended_value_head() -> None:
+def test_optimizer_state_initializes_appended_objective_logit_head() -> None:
     model = ConstraintFieldNet(depth=1, units=8)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
     sum(parameter.square().sum() for parameter in model.parameters()).backward()
@@ -426,7 +478,50 @@ def test_positive_class_weight_balances_rare_events() -> None:
     assert _positive_class_weight(torch.zeros(4)) == 1.0
 
 
-def test_additive_dual_head_learns_when_analytic_pressure_is_zero() -> None:
+def test_edge_logit_anchor_ignores_row_constants() -> None:
+    step = SimpleNamespace(
+        graph=SimpleNamespace(edge_offsets=torch.tensor([0, 2, 5]))
+    )
+    constant_rows = torch.tensor(
+        [2.0, 2.0, -3.0, -3.0, -3.0], requires_grad=True
+    )
+    varying_rows = torch.tensor(
+        [1.0, 3.0, -4.0, -3.0, -2.0], requires_grad=True
+    )
+
+    constant_loss = _objective_residual_loss(
+        step, {"objective_residual": constant_rows}
+    )
+    varying_loss = _objective_residual_loss(
+        step, {"objective_residual": varying_rows}
+    )
+
+    assert constant_loss == 0.0
+    assert varying_loss > 0.0
+
+
+def test_feasibility_auxiliary_retains_legacy_unconstrained_supervision() -> None:
+    logits = torch.tensor([0.5, -0.5], requires_grad=True)
+    step = SimpleNamespace(
+        trace={
+            "feasibility_risk_labels": np.array([1.0, 0.0], dtype=np.float32),
+            "feasibility_edges": np.array([0, 1], dtype=np.int32),
+        }
+    )
+    output = {
+        "feasibility_logits": logits,
+        "active_channels": torch.zeros(1, prism_decoder.FIELD_CHANNEL_COUNT),
+    }
+
+    loss = _feasibility_loss(step, output)
+    loss.backward()
+
+    assert loss > 0.0
+    assert logits.grad is not None
+    assert logits.grad.norm() > 0.0
+
+
+def test_direct_dual_heads_learn_when_analytic_pressure_is_zero() -> None:
     channels = prism_decoder.FIELD_CHANNEL_COUNT
     edge_features = torch.zeros(1, prism_decoder.EDGE_FEATURE_COUNT)
     graph = SimpleNamespace(
@@ -449,7 +544,7 @@ def test_additive_dual_head_learns_when_analytic_pressure_is_zero() -> None:
         binding_target=torch.zeros(channels),
         duration=1,
     )
-    residual = torch.ones(1, channels, requires_grad=True)
+    residual = torch.zeros(1, channels, requires_grad=True)
     additive = torch.zeros(1, channels, requires_grad=True)
     output = {
         "residual": residual,
@@ -462,7 +557,7 @@ def test_additive_dual_head_learns_when_analytic_pressure_is_zero() -> None:
     _dual_loss(step, output).backward()
 
     assert additive.grad[0, 0] != 0.0
-    assert residual.grad[0, 0] == 0.0
+    assert residual.grad[0, 0] != 0.0
 
 
 def test_screened_dual_loss_is_zero_without_active_resources() -> None:
@@ -519,14 +614,17 @@ def test_stagnant_options_reuse_field_and_skip_fallback_labels() -> None:
         ConstraintFieldNet(depth=1, units=8), problem, "cvrp", args
     )
 
-    assert rollout.emissions == 2
-    assert len({id(step.graph) for step in rollout.steps}) == 2
-    bootstrap, *refinement = rollout.steps
-    assert bootstrap.trace["screened_edges"].size == 0
-    assert bootstrap.resource_delta is not None
-    assert all(step.trace["screened_edges"].size > 0 for step in refinement)
-    assert all(step.resource_delta is None for step in refinement)
-    assert all(step.duration == args.search_iterations for step in refinement)
+    assert rollout.emissions == 1
+    assert len(rollout.steps) == args.search_iterations
+    assert len({id(step.graph) for step in rollout.steps}) == 1
+    assert all(
+        torch.count_nonzero(step.graph.x[:, 12]) > 0 for step in rollout.steps
+    )
+    assert all(
+        step.trace["screened_edges"].size > 0 for step in rollout.steps
+    )
+    assert all(step.resource_delta is None for step in rollout.steps)
+    assert all(step.duration == args.search_iterations for step in rollout.steps)
 
 
 def test_inference_is_deterministic() -> None:
@@ -558,9 +656,89 @@ def test_inference_is_deterministic() -> None:
     args.static_field = True
     static = infer_instance(model, problem, args)
 
-    # One empty-graph construction field plus one frozen incumbent field.
-    assert static[2]["net_evals"] == 2.0
-    assert static[2]["emissions"] == 2.0
+    # Construction is neutral; only the frozen incumbent field runs the model.
+    assert static[2]["net_evals"] == 1.0
+    assert static[2]["emissions"] == 1.0
+
+
+def test_zero_neutral_model_reproduces_plain_objective_search() -> None:
+    rng = np.random.default_rng(1407)
+    coordinates = rng.random((18, 2), dtype=np.float32)
+    problem = problem_schema("cvrp") | {
+        "name": "cvrp",
+        "coordinates": coordinates,
+        "distance": np.linalg.norm(
+            coordinates[:, None] - coordinates[None, :], axis=-1
+        ).astype(np.float32),
+        "demand": np.r_[0.0, rng.uniform(0.01, 0.05, 17)].astype(np.float32),
+        "capacity": 0.5,
+    }
+    args = _args()
+    model = ConstraintFieldNet(depth=1, units=8).eval()
+
+    # A fresh model reproduces the plain-objective (E = c(e)) neutral search from
+    # its zero-initialized field, which is the policy training departs from.
+    decoder = _new_decoder(problem, args, deterministic=True)
+    initial = list(decoder.sample(**_neutral_guidance(decoder)))
+    incumbent, _ = _best_feasible_solution(initial, context="neutral bootstrap")
+    decoder.set_incumbent(incumbent["route"])
+    plain = decoder.solve(args.search_iterations, **_neutral_guidance(decoder))
+
+    zero_neural = infer_instance(model, problem, args)
+    assert zero_neural[1]["objective"] == plain["objective"]
+    assert np.array_equal(zero_neural[1]["route"], plain["route"])
+
+    # The fields-off baseline is now a flat, identical field (E = 1), a strictly
+    # weaker reference than the plain-objective search, so it need not coincide
+    # with it; it must still return a feasible solution.
+    fields_off = infer_instance(None, problem, args)
+    assert fields_off[1]["feasible"]
+
+
+def test_policy_replay_uses_direct_field_not_analytic_pressure() -> None:
+    channels = prism_decoder.FIELD_CHANNEL_COUNT
+    trace = {
+        "current_nodes": np.array([0], dtype=np.int32),
+        "starts": np.array([0, 1], dtype=np.int32),
+        "stochastic": np.array([1], dtype=np.uint8),
+        "chosen_indices": np.array([0], dtype=np.int32),
+        "live_state": np.zeros(
+            (1, prism_decoder.LIVE_STATE_FEATURE_COUNT), dtype=np.float32
+        ),
+        "valid_offsets": np.array([0, 2], dtype=np.int32),
+        "valid_indices": np.array([0, 1], dtype=np.int32),
+    }
+    graph = SimpleNamespace(
+        edge_offsets=torch.tensor([0, 2], dtype=torch.long),
+        objective_edge_costs=torch.zeros(2),
+        resource_scales=torch.ones(channels),
+        # Deliberately unequal: these must be input features only, not energy.
+        raw_resource_pressure=torch.stack(
+            (torch.full((channels,), 0.1), torch.full((channels,), 0.9))
+        ),
+    )
+    active = torch.zeros(1, channels)
+    active[0, 0] = 1.0
+    residual = torch.zeros(2, channels)
+    residual[:, 0] = 0.5
+    output = {
+        "residual": residual,
+        "additive": torch.zeros_like(residual),
+        "objective_residual": torch.zeros(2),
+        "feasibility_risk": torch.zeros(2),
+        "active_channels": active,
+    }
+
+    class UnitCoupler:
+        @staticmethod
+        def couple(_output, states):
+            return torch.ones(states.shape[0], channels + 1)
+
+    logp, _, _ = replay_decision_logp_from_cpp_batch_trace(
+        trace, graph, output, UnitCoupler(), beta=1.0
+    )
+
+    assert logp.item() == pytest.approx(-np.log(2.0))
 
 
 def test_validation_size_loads_each_requested_instance(monkeypatch) -> None:
@@ -614,9 +792,63 @@ def test_validation_size_defaults_to_eight_instances(monkeypatch) -> None:
     assert args.gae_lambda == pytest.approx(1.0)
     assert args.temporal_credit_weight == pytest.approx(0.1)
     assert args.value_loss_weight == pytest.approx(0.0)
+    assert args.epochs == 100
+    assert args.pretrain_epochs == 0
+    assert args.option_max_steps == 4
+    assert args.smdp_gamma == pytest.approx(0.99)
+    assert args.infeasible_penalty == pytest.approx(10.0)
+    assert args.feasibility_risk_penalty == pytest.approx(1.0)
+    assert args.price_weight == pytest.approx(0.0)
     assert args.grad_accum_variants == 4
-    assert args.aux_rl_scale == pytest.approx(0.1)
-    assert args.lr_schedule == "cosine"
+    assert args.aux_rl_scale == pytest.approx(0.0)
+    assert args.objective_residual_enabled is True
+    assert args.objective_residual_l2 == pytest.approx(0.1)
+    assert args.val_ema_decay == pytest.approx(0.0)
+    assert args.lr_schedule == "constant"
+
+
+def test_no_objective_residual_cli_zeros_and_freezes_objective_head(monkeypatch) -> None:
+    monkeypatch.setattr(sys, "argv", ["train.py", "--no-objective-residual"])
+
+    args = parse_args()
+    model = ConstraintFieldNet(depth=1, units=8)
+    with torch.no_grad():
+        model.objective_energy_residual_head.weight.fill_(1.0)
+        model.objective_energy_residual_head.bias.fill_(1.0)
+
+    _disable_objective_residual(model)
+
+    assert args.objective_residual_enabled is False
+    assert torch.count_nonzero(model.objective_energy_residual_head.weight) == 0
+    assert torch.count_nonzero(model.objective_energy_residual_head.bias) == 0
+    assert all(
+        not parameter.requires_grad
+        for parameter in model.objective_energy_residual_head.parameters()
+    )
+
+
+def test_rollout_accumulation_preserves_legacy_sample_batch(monkeypatch) -> None:
+    monkeypatch.setattr(
+        sys, "argv", ["train.py", "--n-rollouts", "10"]
+    )
+
+    args = parse_args()
+
+    assert args.grad_accum_variants == 13
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "train.py",
+            "--n-rollouts",
+            "10",
+            "--rollouts-per-update",
+            "4",
+        ],
+    )
+    explicit = parse_args()
+    assert explicit.grad_accum_variants == 4
 
 
 def test_default_cosine_lr_decays_to_zero() -> None:
@@ -711,59 +943,29 @@ def test_singular_variant_alias_is_parsed(monkeypatch) -> None:
     assert args.variants == ["tsp", "cvrp"]
 
 
-def test_missing_references_are_cached_from_matched_classical_search(
+def test_missing_references_are_marked_missing_without_classical_cache(
     monkeypatch,
 ) -> None:
+    class FakeSavedProblems:
+        def __init__(self, size: int, dataset_dir) -> None:
+            pass
+
+        def load(self, variant: str, index: int = 0):
+            return {"name": variant}, None
+
     args = _args()
-    args.n_rollouts = 3
-    args.val_n_rollouts = 7
-    calls = []
-    dataset = [
-        {
-            "variant": "tsp",
-            "instance_index": 0,
-            "problem": {"name": "tsp"},
-            "reference": 10.0,
-            "reference_source": "saved",
-        },
-        {
-            "variant": "op",
-            "instance_index": 0,
-            "problem": {"name": "op"},
-            "reference": None,
-            "reference_source": "classical",
-        },
-    ]
+    args.n_node = 20
+    args.dataset_dir = "dataset-root"
+    args.val_size = 1
+    args.variants = ["op"]
+    args.allow_missing_validation = False
+    monkeypatch.setattr("train.SavedProblems", FakeSavedProblems)
 
-    def fake_infer(model, problem, inference_args):
-        calls.append(
-            (model, problem["name"], inference_args.baseline, inference_args.n_rollouts)
-        )
-        return (
-            -20.0,
-            {
-                "objective": 20.0,
-                "direction": "maximize",
-                "feasible": True,
-            },
-            {},
-        )
+    data = build_validation_data(args)
 
-    monkeypatch.setattr("train.infer_instance", fake_infer)
-
-    cached = cache_classical_references(dataset, args)
-
-    assert cached == 1
-    assert calls == [(None, "op", "classical", 7)]
-    assert dataset[0]["reference"] == 10.0
-    assert dataset[0]["reference_source"] == "saved"
-    assert dataset[1]["reference"] == 20.0
-    assert dataset[1]["reference_source"] == "classical"
-    assert dataset[1]["classical_reference"] == {
-        "objective": 20.0,
-        "direction": "maximize",
-    }
-    assert args.n_rollouts == 3
+    assert len(data) == 1
+    assert data[0]["reference"] is None
+    assert data[0]["reference_source"] == "missing"
 
 
 def test_pretraining_hyperparameters_are_configurable(monkeypatch) -> None:
@@ -957,7 +1159,41 @@ def test_validation_macro_score_weights_variants_equally(monkeypatch) -> None:
     ] == pytest.approx(50 / 3)
 
 
-def test_validation_rank_uses_only_macro_reference_gap() -> None:
+def test_validation_macro_gap_uses_saved_references_only(monkeypatch) -> None:
+    dataset = [
+        {
+            "variant": "tsp",
+            "instance_index": 0,
+            "problem": {"name": "tsp", "index": 0},
+            "reference": 10.0,
+            "reference_source": "saved",
+        },
+        {
+            "variant": "tsp",
+            "instance_index": 1,
+            "problem": {"name": "tsp", "index": 1},
+            "reference": None,
+            "reference_source": "missing",
+        },
+    ]
+    solutions = iter(
+        [
+            (11.0, {"objective": 11.0, "direction": "minimize", "feasible": True}, {}),
+            (99.0, {"objective": 99.0, "direction": "minimize", "feasible": True}, {}),
+        ]
+    )
+    monkeypatch.setattr("train.infer_instance", lambda *_: next(solutions))
+
+    _, _, macro_gap, metrics = validation(None, dataset, _args())
+
+    assert macro_gap == pytest.approx(10.0)
+    assert metrics["gap_instances"] == 1.0
+    assert metrics["gap_coverage"] == pytest.approx(0.5)
+    assert metrics["saved_reference_instances"] == 1.0
+    assert metrics["missing_reference_instances"] == 1.0
+
+
+def test_validation_rank_uses_mean_best_cost() -> None:
     complete = {
         "worst_variant_feasibility_rate": 1.0,
         "feasibility_rate": 1.0,
@@ -965,7 +1201,7 @@ def test_validation_rank_uses_only_macro_reference_gap() -> None:
         "macro_score": 2.0,
     }
 
-    # Lower reference gap wins regardless of feasibility or baseline metrics.
+    # Lower mean best cost wins regardless of gap, feasibility, or baseline metrics.
     assert _validation_rank({**complete, "macro_score": 3.0}, 5.0) > (
         _validation_rank(complete, 4.0)
     )
@@ -978,3 +1214,35 @@ def test_validation_rank_uses_only_macro_reference_gap() -> None:
     assert _validation_rank(
         {**complete, "baseline_improvement_coverage": 0.99}, -100.0
     ) < _validation_rank(complete, 100.0)
+
+
+def test_validation_mean_best_cost_canonicalizes_maximize_objectives(
+    monkeypatch,
+) -> None:
+    dataset = [
+        {
+            "variant": "tsp",
+            "instance_index": 0,
+            "problem": {"name": "tsp"},
+            "reference": None,
+            "reference_source": "missing",
+        },
+        {
+            "variant": "op",
+            "instance_index": 0,
+            "problem": {"name": "op"},
+            "reference": None,
+            "reference_source": "missing",
+        },
+    ]
+    solutions = iter(
+        [
+            (5.0, {"objective": 5.0, "direction": "minimize", "feasible": True}, {}),
+            (-12.0, {"objective": 12.0, "direction": "maximize", "feasible": True}, {}),
+        ]
+    )
+    monkeypatch.setattr("train.infer_instance", lambda *_: next(solutions))
+
+    _, average_best_cost, _, _ = validation(None, dataset, _args())
+
+    assert average_best_cost == pytest.approx((5.0 - 12.0) / 2.0)

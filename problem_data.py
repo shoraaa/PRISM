@@ -96,7 +96,11 @@ assert len(BENCHMARK_VARIANTS) == 110
 # open training context (cvrpl/ocvrpl, cvrpbp/ocvrpbp) so every field channel
 # appears in >=2 training problems -- open routes change the route_limit return
 # term and the backhaul-ordering regime, so a single closed base would tie the
-# channel to one context.
+# channel to one context. For the same reason pickup_delivery is trained not
+# only as pdtsp (single-route, capacity-free) but composed with capacity and
+# multi-route in a closed and an open base (cvrp/opdcvrp), so pd never has to
+# interact with the capacity channel for the first time at inference on any
+# pdcvrp* benchmark instance.
 TRAIN_VARIANTS = _sort_variants(
     (
         "atsp",
@@ -115,6 +119,8 @@ TRAIN_VARIANTS = _sort_variants(
         "ocvrp",
         "ocvrptw",
         "pdtsp",
+        "pdcvrp",
+        "opdcvrp",
         "mdocvrp",
         "amdocvrp",
         "mdcvrptw",
@@ -131,7 +137,7 @@ ALL_VARIANTS = _sort_variants(BENCHMARK_VARIANTS + ["vrptw"])
 # the route_limit channel stays probed by acvrpl / mdcvrpl / *ltw.
 VALIDATION_HELDOUT_VARIANTS = (
     "aop",
-    "pdcvrp",
+    "aopdcvrp",
     "ocvrpb",
     "acvrpb",
     "mdcvrp",
@@ -191,7 +197,11 @@ def problem_schema(name: str) -> dict:
     name = name.lower()
     is_pctsp = "pctsp" in name
     is_op = name in {"op", "aop"}
-    has_capacity = "cvrp" in name
+    # EVRP = capacitated VRP whose battery resource enters through the resource
+    # algebra (see decoder_problem), never as a CONSTRAINT_VOCAB entry -- this is
+    # the zero-shot unseen-resource probe, so the schema stays a plain CVRP.
+    is_evrp = name == "evrp"
+    has_capacity = "cvrp" in name or is_evrp
     is_vrp = has_capacity or name == "vrptw"
     constraints = []
     if not is_pctsp and not is_op:
@@ -273,6 +283,31 @@ def decoder_problem(name: str, data: dict) -> dict:
         problem["tour_limit"] = 4.0
     elif name == "aop":
         problem["tour_limit"] = 1.0
+    if name == "evrp":
+        # Battery declared purely through the resource algebra: an edge-consumed,
+        # depot/charger-replenished accumulator bounded at zero. No neural
+        # parameter is battery-specific; the frozen model must interpret it from
+        # these operational primitives alone (edge increment + node-event reset).
+        charger = _first(data["charger"]).astype(np.float32)
+        battery_range = float(_first(data["battery_range"]))
+        problem["node_attributes"] = {"charger": charger}
+        problem["resources"] = [
+            {
+                "name": "battery",
+                "operator": "affine_accumulator",
+                "scope": "route",
+                "direction": "forward",
+                "initial": battery_range,
+                "scale": battery_range,
+                "increment": {"edge_attribute": "distance", "coefficient": -1.0},
+                "reset": {
+                    "value": battery_range,
+                    "at_depot": True,
+                    "node_attribute": "charger",
+                },
+                "bounds": [{"lower": 0.0, "check": "transition"}],
+            }
+        ]
     return problem
 
 
@@ -324,13 +359,13 @@ def generated_problem(name: str, size: int, capacity: int = 50) -> dict:
     name = name.lower()
     supported = set(TRAIN_VARIANTS) | {
         variant for variant in BENCHMARK_VARIANTS if "cvrp" in variant
-    }
+    } | {"spctsp", "apctsp", "aspctsp", "aop", "apdtsp"}
     if name not in supported:
         raise NotImplementedError(f"no random generator for {name}")
     if name == "vrptw":
         return _generated_vrptw(size)
 
-    if name in {"pdtsp", "apdtsp"} and size % 2:
+    if "pd" in name and size % 2:
         size += 1
 
     depot_count = 0 if name in {"tsp", "atsp"} else 3 if "md" in name else 1
@@ -393,16 +428,36 @@ def generated_problem(name: str, size: int, capacity: int = 50) -> dict:
                 (torch.full((1, depot_count), horizon), end), dim=1
             )
         if "l" in name:
-            limit = 0.6 if name.startswith("a") else 3.0
+            if name.startswith("a"):
+                # The tmat metric-closure distances shrink as node count grows,
+                # so a fixed asymmetric budget is simultaneously infeasible at
+                # small sizes and non-binding at large ones. Scale the limit to
+                # the instance's own worst nearest-depot round trip so every
+                # customer stays individually serviceable (feasible) while the
+                # budget still forces multi-route structure (binding) -- the
+                # same design as the symmetric 3.0 sitting just above the worst
+                # unit-square round trip of 2*sqrt(2).
+                matrix = data["dist"][0]
+                out = matrix[:depot_count, depot_count:]
+                back = matrix[depot_count:, :depot_count]
+                worst_round_trip = (out.t() + back).amin(dim=1).amax()
+                limit = float(worst_round_trip) * 1.1
+            else:
+                limit = 3.0
             data["route_limit"] = torch.full((1,), limit)
 
-    if name == "op":
-        xy = data["xy"]
-        radius = torch.linalg.vector_norm(xy[:, :1] - xy, dim=-1)
+    if name in {"op", "aop"}:
+        # Prize scales with remoteness from the depot: euclidean radius when
+        # coordinates exist, otherwise the depot row of the asymmetric metric.
+        if "dist" in data:
+            radius = data["dist"][:, 0, :]
+        else:
+            xy = data["xy"]
+            radius = torch.linalg.vector_norm(xy[:, :1] - xy, dim=-1)
         prize = (1 + (radius / radius.max(dim=-1, keepdim=True).values * 99).int()).float() / 100
         prize[:, 0] = 0
         data["prize"] = prize
-    elif name == "pctsp":
+    elif "pctsp" in name:
         prize = torch.cat((torch.zeros(1, 1), torch.rand(1, size) * 4 / size), dim=1)
         scale = {20: 2, 50: 3, 100: 4, 500: 9, 1000: 12}.get(size, max(2, round(size ** 0.4)))
         penalty = torch.cat(
@@ -442,6 +497,51 @@ def generate_vrptw_validation_data(
         "count": int(count),
         "seed": int(seed),
         "distribution": "generated_problem:vrptw",
+    }
+
+
+def generate_evrp_data(
+    size: int,
+    count: int,
+    seed: int = 0x45565250,
+    capacity: int = 50,
+    charger_fraction: float = 0.15,
+) -> dict[str, torch.Tensor]:
+    """Generate battered EVRP instances in the neutral batched tensor schema.
+
+    EVRP is never in TRAIN_VARIANTS: this is the zero-shot unseen-resource probe.
+    The battery is declared through the resource algebra in ``decoder_problem``.
+    ``battery_range`` is set to ``2.1 * max_i dist(depot, i)`` so the trivial
+    depot->i->depot route is always feasible (guaranteeing a feasible complete
+    solution) while multi-stop routes must respect the battery or charge en
+    route -- chargers reset the battery when served, the depot resets it at every
+    route start.
+    """
+    if size < 1:
+        raise ValueError("evrp requires at least one customer")
+    if count < 1:
+        raise ValueError("evrp count must be positive")
+    state = torch.random.get_rng_state()
+    torch.manual_seed(seed)
+    try:
+        node_count = size + 1
+        xy = torch.rand(count, node_count, 2)
+        demand = torch.randint(1, 10, (count, node_count)).float() / float(capacity)
+        demand[:, 0] = 0.0
+        charger = torch.zeros(count, node_count)
+        k = max(1, int(size * charger_fraction))
+        for row in range(count):
+            picked = torch.randperm(size)[:k] + 1
+            charger[row, picked] = 1.0
+        radius = torch.linalg.vector_norm(xy - xy[:, :1, :], dim=-1)
+        battery_range = 2.1 * radius.max(dim=1).values
+    finally:
+        torch.random.set_rng_state(state)
+    return {
+        "xy": xy,
+        "demand": demand,
+        "charger": charger,
+        "battery_range": battery_range,
     }
 
 
@@ -489,8 +589,17 @@ class VariantCurriculum:
         epochs: int,
         steps: int,
         group_size: int,
+        weights: dict[str, float] | None = None,
     ) -> list[str]:
-        """Build a deterministic, balanced epoch schedule with distinct groups."""
+        """Build a deterministic, balanced epoch schedule with distinct groups.
+
+        With ``weights`` the balance is per-weight instead of uniform: a variant
+        with twice the weight is scheduled roughly twice as often. The sort key
+        becomes the weighted deficit ``count / weight`` so higher-weight
+        variants tolerate more uses before being deprioritised, while the
+        distinct-within-group and reproducibility guarantees are unchanged.
+        ``weights=None`` reproduces the uniform schedule exactly.
+        """
         if steps < 0:
             raise ValueError("steps must be nonnegative")
         if group_size < 1:
@@ -502,6 +611,13 @@ class VariantCurriculum:
             raise ValueError(
                 "group_size cannot exceed the number of eligible variants"
             )
+        weight = {variant: 1.0 for variant in eligible}
+        if weights is not None:
+            for variant in eligible:
+                value = weights.get(variant, 1.0)
+                if value <= 0:
+                    raise ValueError("sampling weights must be positive")
+                weight[variant] = value
 
         # Epoch-local randomness makes resumes reproduce the same schedule
         # without depending on how many RNG calls an earlier epoch consumed.
@@ -514,12 +630,39 @@ class VariantCurriculum:
             current_size = min(group_size, steps - len(result))
             candidates = list(eligible)
             scheduler.shuffle(candidates)
-            candidates.sort(key=counts.__getitem__)
+            candidates.sort(key=lambda variant: counts[variant] / weight[variant])
             selected = candidates[:current_size]
             result.extend(selected)
             for variant in selected:
                 counts[variant] += 1
         return result
+
+
+def channel_balanced_weights(variants: Iterable[str]) -> dict[str, float]:
+    """Sampling weights that stop rare constraint channels being starved.
+
+    Uniform sampling over variant *names* gives each field channel gradient in
+    proportion to how many variants happen to carry it, so a singleton channel
+    (tour_limit via op, prize_quota via pctsp) is starved next to capacity's
+    many carriers. Each variant is weighted by the inverse coverage of its
+    rarest channel -- the channel shared with the fewest other training
+    variants -- which lifts the singletons without downweighting capacity (it
+    rides along on every multi-resource variant). Weights are renormalised to
+    mean 1 so the per-epoch step budget is unchanged; only the mix shifts.
+    """
+    names = list(variants)
+    constraints = {name: problem_schema(name)["constraints"] for name in names}
+    coverage: dict[str, int] = {}
+    for channels in constraints.values():
+        for channel in channels:
+            coverage[channel] = coverage.get(channel, 0) + 1
+    raw = {
+        name: 1.0 / min((coverage[c] for c in channels), default=len(names))
+        for name, channels in constraints.items()
+    }
+    total = sum(raw.values()) or 1.0
+    scale = len(names) / total
+    return {name: weight * scale for name, weight in raw.items()}
 
 
 _ORACLE_KEYWORDS = ("compass", "hgs", "ils", "lkh", "ortools", "pyvrp")

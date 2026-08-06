@@ -21,6 +21,10 @@ _VALIDATION_WANDB_AGGREGATES = {
     "worst_variant_feasibility_rate",
     "worst_variant_gap",
     "worst_variant_baseline_improvement_percent",
+    "saved_reference_instances",
+    "missing_reference_instances",
+    "gap_instances",
+    "gap_coverage",
     "seen_gap",
     "heldout_gap",
     "seen_baseline_improvement_percent",
@@ -141,6 +145,8 @@ class Logger:
         gap: float,
         epoch: int,
         metrics: dict[str, float],
+        *,
+        is_best: bool = False,
         timing: Optional[dict[str, float]] = None,
         step: Optional[int] = None,
     ) -> None:
@@ -149,6 +155,9 @@ class Logger:
             # and maximize-prize variants. Keep the mixed value diagnostic.
             "val/diagnostic_mixed_canonical_best": avg_best,
             "val/epoch": epoch,
+            # This is the exact lower-is-better value used to rank best.pt.
+            "val_summary/cost": avg_best,
+            "val_summary/is_best": float(is_best),
             "val_summary/macro_gap": gap,
             "val_summary/macro_improvement": float(
                 metrics["macro_baseline_improvement_percent"]
@@ -166,7 +175,7 @@ class Logger:
         self._wandb_log(values, step)
 
     def log_baseline(self, gap: float) -> None:
-        """Store the classical reference as run metadata, not epoch history."""
+        """Store the fields-off baseline gap as run metadata, not epoch history."""
         if self.use_wandb:
             try:
                 import wandb
@@ -183,15 +192,19 @@ class Logger:
         val_best: float,
         gap: Optional[float],
         feasibility_rate: Optional[float] = None,
+        *,
+        is_best: bool = False,
     ) -> None:
         message = f"Epoch {epoch}: MixedTrainCost={train_cost:.4f}"
         message += (
             " Validation=skipped"
             if gap is None
-            else f" MacroGap={gap:.2f}%"
+            else f" ValCost={val_best:.4f} MacroGap={gap:.2f}%"
         )
         if feasibility_rate is not None:
             message += f" Feasible={feasibility_rate:.2%}"
+        if is_best:
+            message += " BEST"
         self.info(message)
 
 

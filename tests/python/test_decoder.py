@@ -80,31 +80,17 @@ def test_cvrp_uses_same_perturbation_backend() -> None:
     assert refined["srr_moves"] > 0
 
 
-def test_dynaco_policy_bounds_generic_srr_work() -> None:
+def test_srr_uses_bounded_row_best_improvement_policy() -> None:
     problem = generated_problem("cvrp", 60, 77)
+    solver = make_decoder(problem, n_rollouts=4)
+    solver.seed(2026)
+    solver.solve(1)
+    refined = solver.solve(1)
 
-    def refine(search_config: dict) -> dict:
-        solver = make_decoder(
-            problem, search_config=search_config, n_rollouts=4
-        )
-        solver.seed(2026)
-        solver.solve(1)
-        return solver.solve(1)
-
-    bounded = refine({})
-    exhaustive = refine(
-        {
-            "srr_candidate_limit": 64,
-            "srr_first_improvement": False,
-            "srr_dont_look": False,
-            "srr_extended_operators": True,
-        }
-    )
-
-    assert bounded["feasible"]
-    assert bounded["srr_moves"] > 0
-    assert bounded["srr_evaluations"] < exhaustive["srr_evaluations"]
-    assert bounded["srr_full_rebuilds"] == 0
+    assert refined["feasible"]
+    assert refined["srr_moves"] > 0
+    assert refined["srr_evaluations"] > 0
+    assert refined["srr_full_rebuilds"] == 0
 
 
 def test_capacity_free_vrptw_uses_closed_multi_route_semantics() -> None:
@@ -141,12 +127,8 @@ def test_search_configuration_is_exposed() -> None:
         "max_perturb_attempts": 20,
         "or_opt_max_segment": 2,
         "feasibility_lookahead_depth": 2,
-        "srr_candidate_limit": 32,
         "use_srr": True,
         "classical_behavior": True,
-        "srr_first_improvement": True,
-        "srr_dont_look": True,
-        "srr_extended_operators": False,
         "verify_screening_resources": False,
         "verify_incremental_srr": False,
     }
@@ -565,8 +547,13 @@ def test_guidance_validation_and_inactive_channel_masking() -> None:
 
     with np.testing.assert_raises_regex(ValueError, "must have shape"):
         make_solver().solve(1, edge_field=ones[:, :-1])
-    with np.testing.assert_raises_regex(ValueError, "non-negative"):
-        make_solver().solve(1, edge_field=-ones)
+    # Signed learned fields are valid; only non-finite values are rejected.
+    signed = make_solver().solve(1, edge_field=-ones)
+    assert signed["feasible"]
+    invalid = ones.copy()
+    invalid[0, 0] = np.nan
+    with np.testing.assert_raises_regex(ValueError, "must be finite"):
+        make_solver().solve(1, edge_field=invalid)
     with np.testing.assert_raises_regex(ValueError, "non-negative"):
         make_solver().solve(
             1,
@@ -618,7 +605,7 @@ def test_typed_field_changes_greedy_construction() -> None:
     multipliers[prism_decoder.FIELD_CHANNEL_COUNT] = 1.0
     baseline = baseline_solver.solve(
         1,
-        edge_field=np.ones(shape, np.float32),
+        edge_field=np.zeros(shape, np.float32),
         multipliers=multipliers,
     )
     start, original_next = baseline["route"][:2]
@@ -695,6 +682,79 @@ def test_additive_field_guides_zero_pressure_edge() -> None:
 
     assert guided["route"][0] == start
     assert guided["route"][1] == guided_solver.edge_index[1, chosen_edge]
+
+
+def test_signed_objective_residual_guides_multi_constraint_objective() -> None:
+    coordinates, distance = euclidean_problem(20, 108)
+    rng = np.random.default_rng(109)
+    demand = np.r_[0.0, rng.uniform(0.01, 0.03, 19)].astype(np.float32)
+    tw_start = np.zeros(20, dtype=np.float32)
+    tw_end = np.full(20, 10.0, dtype=np.float32)
+    problem = {
+        "name": "cvrptw",
+        "coordinates": coordinates,
+        "distance": distance,
+        "demand": demand,
+        "capacity": 0.5,
+        "tw_start": tw_start,
+        "tw_end": tw_end,
+    }
+
+    def make_solver() -> prism_decoder.Decoder:
+        solver = make_decoder(
+            problem,
+            search_config={"classical_behavior": False},
+            n_rollouts=1,
+            beta=2.0,
+        )
+        solver.seed(10109)
+        return solver
+
+    baseline_solver = make_solver()
+    field = np.zeros(
+        (
+            baseline_solver.metadata["edge_count"],
+            prism_decoder.FIELD_CHANNEL_COUNT,
+        ),
+        dtype=np.float32,
+    )
+    multipliers = np.zeros(prism_decoder.MULTIPLIER_COUNT, dtype=np.float32)
+    multipliers[prism_decoder.FIELD_CHANNEL_COUNT] = 1.0
+    baseline = baseline_solver.sample_greedy(
+        edge_field=field,
+        multipliers=multipliers,
+    )
+    start, original_next = baseline["route"][:2]
+
+    guided_solver = make_solver()
+    alternatives = np.flatnonzero(
+        (guided_solver.edge_index[0] == start)
+        & (guided_solver.edge_index[1] != original_next)
+        & (guided_solver.edge_index[1] >= guided_solver.metadata["depot_count"])
+    )
+    assert alternatives.size > 0
+    chosen_edge = int(alternatives[0])
+    objective_residual = np.zeros(guided_solver.metadata["edge_count"], np.float32)
+    # Residuals are energy corrections: lower energy is preferred.
+    objective_residual[chosen_edge] = -100.0
+    guided = guided_solver.sample_greedy(
+        edge_field=field,
+        multipliers=multipliers,
+        objective_residual=objective_residual,
+    )
+
+    assert guided["feasible"]
+    assert guided["route"][0] == start
+    assert guided["route"][1] == guided_solver.edge_index[1, chosen_edge]
+    active = guided_solver.metadata["field_channel_mask"]
+    assert active[0] and active[1]
+
+    with pytest.raises(ValueError, match="objective_residual must have shape"):
+        guided_solver.sample_greedy(
+            edge_field=field,
+            multipliers=multipliers,
+            objective_residual=np.zeros((objective_residual.size, 1), np.float32),
+        )
 
 
 def test_srr_aggregate_comparison_uses_the_same_edge_energy() -> None:

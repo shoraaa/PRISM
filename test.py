@@ -33,6 +33,7 @@ from problem_data import (  # noqa: E402
     DEFAULT_DATASET_DIR,
     DatasetFinder,
     TRAIN_VARIANTS,
+    generate_evrp_data,
     load_saved_data,
 )
 from train import _canonical_cost, infer_instance, setup_seeds  # noqa: E402
@@ -64,7 +65,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--candidate-mode",
         choices=["schema", "geometric"],
-        default="schema",
+        default="geometric",
         help=(
             "Candidate-graph construction shared by PRISM and the fields-off "
             "baseline. 'schema' (default) admits resource candidates by the "
@@ -76,13 +77,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--learned-candidate-quotas",
         action="store_true",
-        help="Let the learned quota policy reweight the schema allocation.",
+        help="EXPERIMENTAL (off by default; may be removed or evolved in the "
+        "future). Let the learned quota policy reweight the schema allocation.",
     )
     parser.add_argument(
         "--val-size",
         type=int,
         default=8,
         help="number of saved instances to average per variant (default: 8)",
+    )
+    parser.add_argument(
+        "--evrp-size",
+        type=int,
+        default=100,
+        help="customer count for generated 'evrp' zero-shot instances (default: 100)",
     )
     parser.add_argument(
         "--static-field",
@@ -95,18 +103,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--threads", type=int, default=prism_decoder.get_available_threads()
     )
-    parser.add_argument("--seed", type=int, default=20260727)
+    parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument(
         "--device", default="cuda:0" if torch.cuda.is_available() else "cpu"
     )
     parser.add_argument(
         "--baseline",
-        choices=["fields-off", "classical"],
+        choices=["fields-off"],
         default="fields-off",
         help=(
-            "Reference the neural field is scored against. 'fields-off' (default)"
-            " is the same decoder with the field ablated to pure distance"
-            " (E = c(e)); 'classical' is the hand-tuned proximity ranking."
+            "Reference the neural field is scored against. Only 'fields-off' is"
+            " supported: the same decoder and search with the field ablated to a"
+            " flat, identical value (E = 1 on every edge), i.e. PRISM without any"
+            " field guidance."
         ),
     )
     parser.add_argument(
@@ -255,12 +264,18 @@ def run_urs_variant(
     return {**result, "cached": False}
 
 
+# Variants with no saved dataset: instances are generated on the fly. "evrp" is
+# the zero-shot unseen-resource probe (battery via the resource algebra) and is
+# never in the 110 benchmarks, so it must be requested explicitly.
+GENERATED_VARIANTS = ("evrp",)
+
+
 def selected_variants(value: str) -> list[str]:
     available = list(BENCHMARK_VARIANTS)
     if value == "all":
         return available
     requested = [name.strip() for name in value.split(",") if name.strip()]
-    unknown = sorted(set(requested) - set(available))
+    unknown = sorted(set(requested) - set(available) - set(GENERATED_VARIANTS))
     if unknown:
         raise ValueError("unknown URS variants: " + ", ".join(unknown))
     if not requested:
@@ -273,6 +288,8 @@ SEEN_VARIANTS = frozenset(BENCHMARK_VARIANTS) & frozenset(TRAIN_VARIANTS)
 
 def variant_split(name: str) -> str:
     """Match training's seen/held-out boundary over the 110 benchmarks."""
+    if name in GENERATED_VARIANTS:
+        return "heldout"
     if name not in BENCHMARK_VARIANTS:
         raise ValueError(f"unknown benchmark variant: {name}")
     return "seen" if name in SEEN_VARIANTS else "heldout"
@@ -377,7 +394,7 @@ def main() -> int:
     )
     if checkpoint.get("model_schema") != MODEL_SCHEMA:
         raise RuntimeError(
-            "checkpoint is not a typed-resource v2 checkpoint"
+            "checkpoint is not a typed-resource v4 signed-resource-energy checkpoint"
         )
     model = ConstraintFieldNet().to(args.device)
     load_constraint_field_state_dict(model, checkpoint["model_state_dict"])
@@ -395,22 +412,34 @@ def main() -> int:
     for index, name in enumerate(variants):
         test_started = time.perf_counter()
         try:
-            paths = finder.get(name, 100)
-            data, reference = load_saved_data(
-                paths["data_path"],
-                name,
-                args.val_size,
-                solution_path=paths["solution_path"],
-                allow_aggregate_reference=False,
-            )
-            has_reference = reference is not None
-            urs_result = (
-                run_urs_variant(
-                    name, paths["data_path"], args.val_size, args, urs_cache
+            if name in GENERATED_VARIANTS:
+                # Zero-shot unseen-resource probe: no saved dataset and no
+                # reference oracle yet, so score PRISM's learned field only
+                # against the fields-off baseline on the same generated
+                # instances (feasibility is guaranteed by the exact decoder).
+                data = generate_evrp_data(
+                    args.evrp_size, args.val_size, seed=args.seed
                 )
-                if args.urs_checkpoint is not None
-                else None
-            )
+                reference = None
+                has_reference = False
+                urs_result = None
+            else:
+                paths = finder.get(name, 100)
+                data, reference = load_saved_data(
+                    paths["data_path"],
+                    name,
+                    args.val_size,
+                    solution_path=paths["solution_path"],
+                    allow_aggregate_reference=False,
+                )
+                has_reference = reference is not None
+                urs_result = (
+                    run_urs_variant(
+                        name, paths["data_path"], args.val_size, args, urs_cache
+                    )
+                    if args.urs_checkpoint is not None
+                    else None
+                )
             baseline_objectives = []
             neural_objectives = []
             baseline_costs = []
@@ -433,10 +462,10 @@ def main() -> int:
                     seed=args.seed + index * args.val_size + instance_index,
                     search_iterations=args.iterations,
                     feasibility_lookahead_depth=2,
-                    feasibility_risk_penalty=10.0,
+                    feasibility_risk_penalty=1.0,
                     device=args.device,
                     static_field=args.static_field,
-                    baseline=args.baseline,
+                    candidate_mode=args.candidate_mode,
                 )
 
                 baseline_started = time.perf_counter()

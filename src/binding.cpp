@@ -466,17 +466,11 @@ SearchConfig parse_search_config(const py::dict &data) {
   config.feasibility_lookahead_depth = value_or<int32_t>(
       data, "feasibility_lookahead_depth",
       config.feasibility_lookahead_depth);
-  config.srr_candidate_limit = value_or<int32_t>(
-      data, "srr_candidate_limit", config.srr_candidate_limit);
   config.use_srr = value_or<bool>(data, "use_srr", config.use_srr);
   config.classical_behavior =
       value_or<bool>(data, "classical_behavior", config.classical_behavior);
-  config.srr_first_improvement = value_or<bool>(
-      data, "srr_first_improvement", config.srr_first_improvement);
-  config.srr_dont_look =
-      value_or<bool>(data, "srr_dont_look", config.srr_dont_look);
-  config.srr_extended_operators = value_or<bool>(
-      data, "srr_extended_operators", config.srr_extended_operators);
+  config.neutral_ranking =
+      value_or<bool>(data, "neutral_ranking", config.neutral_ranking);
   config.verify_screening_resources = value_or<bool>(
       data, "verify_screening_resources",
       config.verify_screening_resources);
@@ -515,7 +509,7 @@ py::dict solution_to_dict(const Solution &solution, Objective objective) {
 void parse_guidance(py::object edge_field, py::object edge_additive,
                     py::object multipliers,
                     py::object coupler_weights, py::object coupler_bias,
-                    py::object edge_risk,
+                    py::object objective_residual, py::object edge_risk,
                     int32_t edge_count, int32_t resource_count,
                     int32_t multiplier_count, int32_t live_state_count,
                     bool classical_behavior,
@@ -524,24 +518,27 @@ void parse_guidance(py::object edge_field, py::object edge_additive,
                     py::array_t<float> &multiplier_storage,
                     py::array_t<float> &coupler_weight_storage,
                     py::array_t<float> &coupler_bias_storage,
+                    py::array_t<float> &residual_storage,
                     py::array_t<float> &risk_storage,
                     const float *&field_values,
                     const float *&additive_values,
                     const float *&multiplier_values,
                     const float *&coupler_weight_values,
                     const float *&coupler_bias_values,
+                    const float *&residual_values,
                     const float *&risk_values) {
   field_values = nullptr;
   additive_values = nullptr;
   multiplier_values = nullptr;
   coupler_weight_values = nullptr;
   coupler_bias_values = nullptr;
+  residual_values = nullptr;
   risk_values = nullptr;
   if (classical_behavior) {
     if (!edge_field.is_none() || !edge_additive.is_none() ||
         !multipliers.is_none() ||
         !coupler_weights.is_none() || !coupler_bias.is_none() ||
-        !edge_risk.is_none()) {
+        !objective_residual.is_none() || !edge_risk.is_none()) {
       throw std::invalid_argument(
           "classical_behavior does not accept edge_field or multipliers");
     }
@@ -604,6 +601,16 @@ void parse_guidance(py::object edge_field, py::object edge_additive,
           "coupler_bias must have shape (multiplier_count,)");
     }
     coupler_bias_values = static_cast<const float *>(buffer.ptr);
+  }
+  if (!objective_residual.is_none()) {
+    residual_storage = objective_residual.cast<
+        py::array_t<float, py::array::c_style | py::array::forcecast>>();
+    const py::buffer_info buffer = residual_storage.request();
+    if (buffer.ndim != 1 || buffer.shape[0] != edge_count) {
+      throw std::invalid_argument(
+          "objective_residual must have shape (edge_count,)");
+    }
+    residual_values = static_cast<const float *>(buffer.ptr);
   }
   if (!edge_risk.is_none()) {
     risk_storage = edge_risk.cast<
@@ -680,36 +687,40 @@ public:
   py::list sample(py::object edge_field, py::object edge_additive,
                   py::object multipliers,
                   py::object coupler_weights, py::object coupler_bias,
-                  py::object edge_risk, float risk_penalty) {
+                  py::object objective_residual, py::object edge_risk,
+                  float risk_penalty) {
     py::array_t<float> field_storage;
     py::array_t<float> additive_storage;
     py::array_t<float> multiplier_storage;
     py::array_t<float> coupler_weight_storage;
     py::array_t<float> coupler_bias_storage;
+    py::array_t<float> residual_storage;
     py::array_t<float> risk_storage;
     const float *field_values;
     const float *additive_values;
     const float *multiplier_values;
     const float *coupler_weight_values;
     const float *coupler_bias_values;
+    const float *residual_values;
     const float *risk_values;
     parse_guidance(edge_field, edge_additive, multipliers, coupler_weights,
-                   coupler_bias, edge_risk, solver_.edge_count(),
+                   coupler_bias, objective_residual, edge_risk, solver_.edge_count(),
                    solver_.resource_count(), solver_.multiplier_count(),
                    solver_.live_state_feature_count(),
                    solver_.search_config().classical_behavior, field_storage,
                    additive_storage, multiplier_storage,
-                   coupler_weight_storage, coupler_bias_storage, risk_storage,
+                   coupler_weight_storage, coupler_bias_storage, residual_storage,
+                   risk_storage,
                    field_values,
                    additive_values, multiplier_values, coupler_weight_values,
-                   coupler_bias_values, risk_values);
+                   coupler_bias_values, residual_values, risk_values);
     std::vector<Solution> solutions;
     {
       py::gil_scoped_release release;
       solutions = solver_.sample(field_values, additive_values,
                                  multiplier_values,
                                  coupler_weight_values, coupler_bias_values,
-                                 risk_values, risk_penalty);
+                                 residual_values, risk_values, risk_penalty);
     }
     py::list result;
     for (const Solution &solution : solutions) {
@@ -721,30 +732,33 @@ public:
   py::dict sample_traced(py::object edge_field, py::object edge_additive,
                          py::object multipliers,
                          py::object coupler_weights,
-                         py::object coupler_bias, py::object edge_risk,
-                         float risk_penalty) {
+                         py::object coupler_bias, py::object objective_residual,
+                         py::object edge_risk, float risk_penalty) {
     py::array_t<float> field_storage;
     py::array_t<float> additive_storage;
     py::array_t<float> multiplier_storage;
     py::array_t<float> coupler_weight_storage;
     py::array_t<float> coupler_bias_storage;
+    py::array_t<float> residual_storage;
     py::array_t<float> risk_storage;
     const float *field_values;
     const float *additive_values;
     const float *multiplier_values;
     const float *coupler_weight_values;
     const float *coupler_bias_values;
+    const float *residual_values;
     const float *risk_values;
     parse_guidance(edge_field, edge_additive, multipliers, coupler_weights,
-                   coupler_bias, edge_risk, solver_.edge_count(),
+                   coupler_bias, objective_residual, edge_risk, solver_.edge_count(),
                    solver_.resource_count(), solver_.multiplier_count(),
                    solver_.live_state_feature_count(),
                    solver_.search_config().classical_behavior, field_storage,
                    additive_storage, multiplier_storage,
-                   coupler_weight_storage, coupler_bias_storage, risk_storage,
+                   coupler_weight_storage, coupler_bias_storage, residual_storage,
+                   risk_storage,
                    field_values,
                    additive_values, multiplier_values, coupler_weight_values,
-                   coupler_bias_values, risk_values);
+                   coupler_bias_values, residual_values, risk_values);
     std::vector<Solution> solutions;
     DecisionTrace trace;
     {
@@ -752,7 +766,7 @@ public:
       solutions = solver_.sample(field_values, additive_values,
                                  multiplier_values,
                                  coupler_weight_values, coupler_bias_values,
-                                 risk_values, risk_penalty,
+                                 residual_values, risk_values, risk_penalty,
                                  &trace);
     }
     py::list serialized;
@@ -768,36 +782,39 @@ public:
 
   py::dict sample_greedy(py::object edge_field, py::object edge_additive,
                          py::object multipliers, py::object coupler_weights,
-                         py::object coupler_bias, py::object edge_risk,
-                         float risk_penalty) {
+                         py::object coupler_bias, py::object objective_residual,
+                         py::object edge_risk, float risk_penalty) {
     py::array_t<float> field_storage;
     py::array_t<float> additive_storage;
     py::array_t<float> multiplier_storage;
     py::array_t<float> coupler_weight_storage;
     py::array_t<float> coupler_bias_storage;
+    py::array_t<float> residual_storage;
     py::array_t<float> risk_storage;
     const float *field_values;
     const float *additive_values;
     const float *multiplier_values;
     const float *coupler_weight_values;
     const float *coupler_bias_values;
+    const float *residual_values;
     const float *risk_values;
     parse_guidance(edge_field, edge_additive, multipliers, coupler_weights,
-                   coupler_bias, edge_risk, solver_.edge_count(),
+                   coupler_bias, objective_residual, edge_risk, solver_.edge_count(),
                    solver_.resource_count(), solver_.multiplier_count(),
                    solver_.live_state_feature_count(),
                    solver_.search_config().classical_behavior, field_storage,
                    additive_storage, multiplier_storage,
-                   coupler_weight_storage, coupler_bias_storage, risk_storage,
+                   coupler_weight_storage, coupler_bias_storage, residual_storage,
+                   risk_storage,
                    field_values,
                    additive_values, multiplier_values, coupler_weight_values,
-                   coupler_bias_values, risk_values);
+                   coupler_bias_values, residual_values, risk_values);
     Solution solution;
     {
       py::gil_scoped_release release;
       solution = solver_.sample_greedy(
           field_values, additive_values, multiplier_values,
-          coupler_weight_values, coupler_bias_values, risk_values,
+          coupler_weight_values, coupler_bias_values, residual_values, risk_values,
           risk_penalty);
     }
     return solution_to_dict(solution, solver_.problem().objective);
@@ -806,36 +823,39 @@ public:
   py::dict solve(int32_t iterations, py::object edge_field,
                  py::object edge_additive, py::object multipliers,
                  py::object coupler_weights,
-                 py::object coupler_bias, py::object edge_risk,
-                 float risk_penalty) {
+                 py::object coupler_bias, py::object objective_residual,
+                 py::object edge_risk, float risk_penalty) {
     py::array_t<float> field_storage;
     py::array_t<float> additive_storage;
     py::array_t<float> multiplier_storage;
     py::array_t<float> coupler_weight_storage;
     py::array_t<float> coupler_bias_storage;
+    py::array_t<float> residual_storage;
     py::array_t<float> risk_storage;
     const float *field_values;
     const float *additive_values;
     const float *multiplier_values;
     const float *coupler_weight_values;
     const float *coupler_bias_values;
+    const float *residual_values;
     const float *risk_values;
     parse_guidance(edge_field, edge_additive, multipliers, coupler_weights,
-                   coupler_bias, edge_risk, solver_.edge_count(),
+                   coupler_bias, objective_residual, edge_risk, solver_.edge_count(),
                    solver_.resource_count(), solver_.multiplier_count(),
                    solver_.live_state_feature_count(),
                    solver_.search_config().classical_behavior, field_storage,
                    additive_storage, multiplier_storage,
-                   coupler_weight_storage, coupler_bias_storage, risk_storage,
+                   coupler_weight_storage, coupler_bias_storage, residual_storage,
+                   risk_storage,
                    field_values,
                    additive_values, multiplier_values, coupler_weight_values,
-                   coupler_bias_values, risk_values);
+                   coupler_bias_values, residual_values, risk_values);
     Solution solution;
     {
       py::gil_scoped_release release;
       solution = solver_.solve(
           iterations, field_values, additive_values, multiplier_values,
-          coupler_weight_values, coupler_bias_values, risk_values,
+          coupler_weight_values, coupler_bias_values, residual_values, risk_values,
           risk_penalty);
     }
     return solution_to_dict(solution, solver_.problem().objective);
@@ -992,13 +1012,8 @@ public:
     search_values["or_opt_max_segment"] = search.or_opt_max_segment;
     search_values["feasibility_lookahead_depth"] =
         search.feasibility_lookahead_depth;
-    search_values["srr_candidate_limit"] = search.srr_candidate_limit;
     search_values["use_srr"] = search.use_srr;
     search_values["classical_behavior"] = search.classical_behavior;
-    search_values["srr_first_improvement"] = search.srr_first_improvement;
-    search_values["srr_dont_look"] = search.srr_dont_look;
-    search_values["srr_extended_operators"] =
-        search.srr_extended_operators;
     search_values["verify_screening_resources"] =
         search.verify_screening_resources;
     search_values["verify_incremental_srr"] =
@@ -1149,6 +1164,7 @@ PYBIND11_MODULE(prism_decoder, module) {
            py::arg("multipliers") = py::none(),
            py::arg("coupler_weights") = py::none(),
            py::arg("coupler_bias") = py::none(),
+           py::arg("objective_residual") = py::none(),
            py::arg("edge_risk") = py::none(),
            py::arg("risk_penalty") = 0.0f)
       .def("sample_traced", &PyDecoder::sample_traced,
@@ -1157,6 +1173,7 @@ PYBIND11_MODULE(prism_decoder, module) {
            py::arg("multipliers") = py::none(),
            py::arg("coupler_weights") = py::none(),
            py::arg("coupler_bias") = py::none(),
+           py::arg("objective_residual") = py::none(),
            py::arg("edge_risk") = py::none(),
            py::arg("risk_penalty") = 0.0f)
       .def("sample_greedy", &PyDecoder::sample_greedy,
@@ -1165,6 +1182,7 @@ PYBIND11_MODULE(prism_decoder, module) {
            py::arg("multipliers") = py::none(),
            py::arg("coupler_weights") = py::none(),
            py::arg("coupler_bias") = py::none(),
+           py::arg("objective_residual") = py::none(),
            py::arg("edge_risk") = py::none(),
            py::arg("risk_penalty") = 0.0f)
       .def("solve", &PyDecoder::solve, py::arg("iterations"),
@@ -1173,6 +1191,7 @@ PYBIND11_MODULE(prism_decoder, module) {
            py::arg("multipliers") = py::none(),
            py::arg("coupler_weights") = py::none(),
            py::arg("coupler_bias") = py::none(),
+           py::arg("objective_residual") = py::none(),
            py::arg("edge_risk") = py::none(),
            py::arg("risk_penalty") = 0.0f)
       .def("evaluate", &PyDecoder::evaluate, py::arg("route"))
