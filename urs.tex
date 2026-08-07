@@ -1,0 +1,1831 @@
+%%%%%%%% ICML 2026 EXAMPLE LATEX SUBMISSION FILE %%%%%%%%%%%%%%%%%
+
+\documentclass{article}
+
+% Recommended, but optional, packages for figures and better typesetting:
+\usepackage{microtype}
+\usepackage{graphicx}
+\usepackage{subcaption}
+\usepackage{booktabs} % for professional tables
+
+% hyperref makes hyperlinks in the resulting PDF.
+% If your build breaks (sometimes temporarily if a hyperlink spans a page)
+% please comment out the following usepackage line and replace
+% \usepackage{icml2026} with \usepackage[nohyperref]{icml2026} above.
+\usepackage{hyperref}
+
+
+% Attempt to make hyperref and algorithmic work together better:
+\newcommand{\theHalgorithm}{\arabic{algorithm}}
+
+% Use the following line for the initial blind version submitted for review:
+\usepackage[accepted]{icml2026}
+
+% For preprint, use
+% \usepackage[preprint]{icml2026}
+
+% If accepted, instead use the following line for the camera-ready submission:
+% \usepackage[accepted]{icml2026}
+
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{mathtools}
+\usepackage{amsthm}
+
+
+% if you use cleveref..
+\usepackage[capitalize,noabbrev]{cleveref}
+
+
+% additional packages
+\usepackage{url}
+\usepackage[flushleft]{threeparttable}
+\usepackage{multirow}
+\usepackage{wrapfig}
+\usepackage{float}
+\usepackage{algorithm}
+\usepackage{algorithmic}  % or algorithmicx and algpseudocode
+\usepackage{enumitem}
+\usepackage{bm} 
+\usepackage{microtype}      % microtypography
+\usepackage{longtable}
+\usepackage{booktabs}       % professional-quality tables
+\usepackage{amsfonts}       % To support special mathematical fonts (e.g., \mathbb)
+\usepackage[table]{xcolor} % Load xcolor and enable the table color support option
+\usepackage{listings}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% THEOREMS
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\theoremstyle{plain}
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{corollary}[theorem]{Corollary}
+\theoremstyle{definition}
+\newtheorem{definition}[theorem]{Definition}
+\newtheorem{assumption}[theorem]{Assumption}
+\theoremstyle{remark}
+\newtheorem{remark}[theorem]{Remark}
+
+% Todonotes is useful during development; simply uncomment the next line
+%    and comment out the line below the next line to turn off comments
+%\usepackage[disable,textsize=tiny]{todonotes}
+\usepackage[textsize=tiny]{todonotes}
+
+% The \icmltitle you define below is probably too long as a header.
+% Therefore, a short form for the running title is supplied here:
+\icmltitlerunning{URS: A Unified Neural Routing Solver for Cross-Problem Zero-Shot Generalization}
+
+\begin{document}
+
+\twocolumn[
+  \icmltitle{URS: A \underline{U}nified Neural \underline{R}outing \underline{S}olver for Cross-Problem \\ Zero-Shot Generalization}
+
+  % It is OKAY to include author information, even for blind submissions: the
+  % style file will automatically remove it for you unless you've provided
+  % the [accepted] option to the icml2026 package.
+
+  % List of affiliations: The first argument should be a (short) identifier you
+  % will use later to specify author affiliations Academic affiliations
+  % should list Department, University, City, Region, Country Industry
+  % affiliations should list Company, City, Region, Country
+
+  % You can specify symbols, otherwise they are numbered in order. Ideally, you
+  % should not use this facility. Affiliations will be numbered in order of
+  % appearance and this is the preferred way.
+  \icmlsetsymbol{equal}{*}
+
+  \begin{icmlauthorlist}
+  \icmlauthor{Changliang Zhou}{sustech,lab}
+  \icmlauthor{Canhong Yu}{szu}
+  \icmlauthor{Shunyu Yao}{cityu}
+  \icmlauthor{Xi Lin}{xju}
+  \icmlauthor{Zhenkun Wang}{sustech,lab}
+  \icmlauthor{Yu Zhou}{szu}
+  \icmlauthor{Qingfu Zhang}{cityu}
+  \end{icmlauthorlist}
+
+  \icmlaffiliation{sustech}{School of Automation and Intelligent Manufacturing, Southern University of Science and Technology, Shenzhen, China}
+  \icmlaffiliation{lab}{Guangdong Provincial Key Laboratory of Fully Actuated System Control Theory and Technology, Southern University of Science and Technology, Shenzhen, China}
+  \icmlaffiliation{szu}{College of Computer Science and Software Engineering, Shenzhen University, Shenzhen, China}
+  \icmlaffiliation{cityu}{Department of Computer Science, City University of Hong Kong, Hong Kong SAR, China}
+  \icmlaffiliation{xju}{School of Mathematics and Statistics, Xi'an Jiaotong University, Xi'an, China}
+  \icmlcorrespondingauthor{Zhenkun Wang}{wangzk3@sustech.edu.cn}
+  \icmlkeywords{Machine Learning, ICML}
+  \vskip 0.3in
+]
+
+% this must go after the closing bracket ] following \twocolumn[ ...
+
+% This command actually creates the footnote in the first column listing the
+% affiliations and the copyright notice. The command takes one argument, which
+% is text to display at the start of the footnote. The \icmlEqualContribution
+% command is standard text for equal contribution. Remove it (just {}) if you
+% do not need this facility.
+
+% Use ONE of the following lines. DO NOT remove the command.
+% If you have no special notice, KEEP empty braces:
+\printAffiliationsAndNotice{}  % no special notice (required even if empty)
+% Or, if applicable, use the standard equal contribution text:
+% \printAffiliationsAndNotice{\icmlEqualContribution}
+
+\begin{abstract}
+Multi-task neural routing solvers have emerged as a promising paradigm for their ability to solve multiple vehicle routing problems (VRPs) using a single model. However, existing neural solvers typically rely on predefined problem constraints or require per-problem fine-tuning, which substantially limits their zero-shot generalization ability to unseen VRP variants. To address this critical bottleneck, we propose URS, a unified neural routing solver that achieves zero-shot generalization across a wide range of unseen VRPs with a single model. We propose a unified data representation (UDR) that replaces problem enumeration with data unification, thereby broadening the problem coverage and reducing reliance on domain expertise. In addition, we introduce a Mixed Bias Module (MBM) during encoding to improve node embeddings, which efficiently captures multiple priors inherent to various problems. On top of the UDR, we develop a problem-conditioned parameter generator to further improve zero-shot generalization. Extensive experiments show that URS consistently produces high-quality solutions for 110 VRP variants (including 99 unseen variants) while demonstrating impressive scalability to large-scale instances with up to 7000 nodes. To the best of our knowledge, URS is the first neural solver to handle over 100 VRP variants with a single model. Our code is available at \url{https://github.com/CIAM-Group/URS}.
+\end{abstract}
+
+\section{Introduction}
+\label{sec:intro}
+
+The Vehicle Routing Problem (VRP) is an essential class of combinatorial optimization problems (COPs) with extensive applications in logistics and supply chain management~\citep{tiwari2023optimization, sar2023systematic}. Solving VRPs efficiently is challenging due to their NP-hard nature. While exact solvers can produce optimal solutions, they often become computationally prohibitive for real-world scenarios. In recent decades, classical heuristic solvers~\citep{LKH3,HGS} have achieved impressive performance within acceptable timeframes. Nevertheless, these methods require considerable domain expertise to design specialist rules for each routing problem. Given the growing diversity of VRP variants in real-world applications, manually crafting tailored rules for every case has become impractical. 
+
+In recent years, neural combinatorial optimization (NCO) methods have attracted substantial attention for their potential to reduce reliance on handcrafted rules while maintaining competitive solution quality~\citep{bengio2021machine,ba2026survey}. This has led to the development of many high-performing neural routing solvers that automatically learn implicit problem-specific rules from data under different training paradigms such as supervised learning (SL)~\citep{drakulic2023bq,luo2023lehd,luo2025insertion}, reinforcement learning (RL)~\citep{kool2019attention,zhou2024icam}, and self-improved learning (SIL)~\citep{luo2024Boosting,pirnay2024self}. Although these solvers have demonstrated impressive performance on specific problems~\citep{huang2025reld,zhou2025L2R}, they typically require architectural customization and per-problem retraining to accommodate the distinct constraints and features of different VRP variants, thereby increasing overall training costs and hindering practical deployment to new problems.
+
+
+\begin{table*}[t]
+\centering
+\caption{Comparison between our URS and existing neural solvers with multi-task learning. Note that "$\#$VRP Variants" and "Generalizable Scale" refer to the total number of tested problems and the maximum scale reported in the original papers, respectively.}
+\resizebox{\textwidth}{!}{
+\begin{tabular}{l|ccccccccc}
+\toprule[0.5mm]
+\multirow{2}[2]{*}{Multi-task Neural Routing Solver} & Training  & \multirow{2}[2]{*}{$\#$VRP Variants}  &Symmetric &Asymmetric  & Pickup
+and Delivery & Zero-shot & Training & Generalizable& \multirow{2}[2]{*}{Remarks} \\
+ &  Paradigm &  & VRPs & VRPs & Problems & Generalization &Scale &Scale & \\
+    \midrule
+    MTPOMO~\citep{liu2024mtpomo} & RL    & 16  &$\checkmark$ & $\times$   & $\times$ & $\checkmark$ & $100$ & $1000$& Constraint Combination \\
+    MVMoE~\citep{zhou2024mvmoe} & RL    & 16  &$\checkmark$ & $\times$   & $\times$   & $\checkmark$ & $100$& $1000$& Constraint Combination \\
+    RouteFinder~\citep{berto2024routefinder} & RL    & 48   &$\checkmark$ & $\times$ & $\times$  & $\checkmark$ & $100$ & $1000$& Constraint Combination \\
+    CaDA~\citep{li2025cada}  & RL    & 16   &$\checkmark$ & $\times$  & $\times$  & $\checkmark$& $100$ & $200$& Constraint Combination \\
+    MTL-KD~\citep{zheng2025mtl_kd} & RL+KD    & 16  &$\checkmark$ & $\times$    & $\times$ & $\checkmark$ & $100$& $1000$ & Constraint Combination \\
+    \midrule
+    TSP-FT~\citep{lin2024cross}   & RL    & 4   &$\checkmark$ & $\times$  & $\times$ & $\times$& $100$ & $1000$& Adapter-based Fine-tuning \\
+    MTL-MAB~\citep{wang2025mtl_mab}   & RL    & 3   &$\checkmark$ & $\times$  & $\times$ & $\times$ & $100$& $1000$& Adapter-based Fine-tuning \\
+    GOAL~\citep{drakulic2025goal}  & SL    & 10   &$\checkmark$ & $\checkmark$  & $\times$ & $\times$& $100$& $1000$ & Adapter-based Fine-tuning \\
+    \midrule
+    URS (Ours) & \cellcolor[HTML]{D0CECE}\textbf{RL}    & \cellcolor[HTML]{D0CECE}\textbf{110} &\cellcolor[HTML]{D0CECE}\textbf{$\checkmark$} & \cellcolor[HTML]{D0CECE}\textbf{$\checkmark$} & \cellcolor[HTML]{D0CECE}\textbf{$\checkmark$}   & \cellcolor[HTML]{D0CECE}\textbf{$\checkmark$}  &  \cellcolor[HTML]{D0CECE}\textbf{100}&  \cellcolor[HTML]{D0CECE}\textbf{7000}& \cellcolor[HTML]{D0CECE}\textbf{Unified Data Representation} \\
+    \bottomrule[0.5mm]
+    \end{tabular}
+}
+\vskip -0.1in
+\label{table:motivation}
+\end{table*}
+
+To address the challenge of cross-problem generalization, growing attention has been directed toward multi-task learning capable of handling diverse routing problems. As summarized in \cref{table:motivation}, existing efforts largely fall into two categories: 1) constraint combination-based multi-task learning and 2) adapter-based fine-tuning. In the first approach, VRP variants are treated as different combinations of constraint attributes, and a unified model is trained across these combinations to enable knowledge sharing for problems with seen constraints~\citep{liu2024mtpomo,zhou2024mvmoe,li2025cada,berto2024routefinder,zheng2025mtl_kd}. The second approach builds a shared model backbone for all problems and incorporates problem-specific input/output adapters, thereby reducing retraining costs~\citep{lin2024cross,drakulic2025goal,wang2025mtl_mab}.
+
+Despite the above advancements, existing methods still fall short in cross-problem zero-shot generalization. The problem coverage of constraint combination-based approaches is inherently bounded by their manually specified constraint sets, whereas adapter-based approaches require additional fine-tuning and thus cannot perform zero-shot generalization. Furthermore, both strategies fundamentally rely on the explicit problem enumeration through a predefined set of problem tags. This practice is challenging because the constraint space of VRP variants is open-ended and compositional. More critically, creating and maintaining such a problem taxonomy requires considerable domain expertise, which NCO always aims to avoid. A detailed review of related work on single-task and multi-task learning is provided in Appendix \ref{append:related_work}.
+
+In this paper, we propose a powerful \textbf{\underline{U}}nified Neural \textbf{\underline{R}}outing \textbf{\underline{S}}olver (URS) to improve the cross-problem zero-shot generalization ability for NCO methods. Our contributions can be summarized as follows: (1) We propose a unified data representation (UDR) that replaces existing problem enumeration with data unification, significantly broadening problem coverage while mitigating reliance on domain-specific expertise; (2) We introduce a Mixed Bias Module (MBM) during encoding to improve node embeddings, which efficiently captures multiple priors inherent to various problems while reducing architectural redundancy; (3) On top of the UDR, we develop a problem-conditioned parameter generator to further improve zero-shot generalization; (4) Extensive experiments on \textbf{110} VRP variants show that URS not only achieves competitive performance against specialist neural solvers on seen variants but also exhibits strong zero-shot generalization across \textbf{99} unseen variants. Notably, URS demonstrates impressive scalability to large-scale instances with up to 7000 nodes. To the best of our knowledge, URS is the first neural solver to efficiently solve over 100 VRP variants with a single model, without retraining or fine-tuning.
+
+\section{Preliminaries}
+In this section, we first introduce the definition of VRP, then provide an overview of recent constructive neural solvers for solution generation~\citep{kool2019attention,kwon2020pomo}.
+
+\paragraph{Vehicle Routing Problems}
+
+Consider a VRP instance with an optional depot indexed by $0$ and $n$ customers indexed by $\{1, 2, \ldots, n\}$, such as in the Capacitated VRP (CVRP). The instance can be represented as a graph $\mathcal{G}=(\mathcal{V}, \mathcal{E})$, where the node set $\mathcal{V}=\{v_i\}_{i=0}^n$ has a total size of $|\mathcal{V}|=1+n$ unless the variant has no depot (e.g., the Traveling Salesman Problem), and the edge set is $\mathcal{E}=\{e(v_i,v_j)\ |\ v_i,v_j\in \mathcal{V}, v_i \neq v_j\} $. The travel cost between nodes is given by a distance matrix $\bm{D}=\{d_{ij}| \ \forall \  i,j \in 0, \ldots, n\}$. In VRP, each node $v_i \in \mathcal{V}$ includes node coordinates $\{x_{i},y_{i}\}$ when available and problem-specific attributes (e.g., demands in CVRP). Formally, a feasible solution is denoted by a node permutation $\bm{\pi} = (\pi_1, \pi_2, \ldots, \pi_m)$~\citep{toth2002vehicle} (i.e., a finite sequence) that represents a set of valid routes. Each route is traversed by a single vehicle originating and terminating at its own depot or starting node, while strictly satisfying all constraints. Let $\Omega$ denote the feasible sequence set, given an objective function $f(\bm{\pi} | \mathcal{G})$, we aim to search for a sequence $\bm{\pi}^*$ with the maximum objective, i.e., $\bm{\pi}^* = \arg\max_{\bm{\pi}\in \Omega} f(\pi|\mathcal{G})$. In most VRPs, $f(\bm{\pi} | \mathcal{G})$ can be defined as the negative value of the total distance of $\bm{\pi}$. 
+
+In this paper, we consider 110 VRP variants which may simultaneously have one or more constraints from the following categories: (1) Capacity (C); (2) Open Route (O); (3) Backhaul (B); (4) Backhaul and Priority (BP); (5) Duration Limit (L); (6) Time Windows (TW); (7) Multi-Depot (MD); (8) Prize Collecting (PC); (9) Asymmetric (A); and (10) Pickup and Delivery (PD). Detailed definitions of these constraints are provided in Appendix \ref{append:setup_constraints}.
+
+
+\begin{figure*}[t]
+\begin{center}
+
+\centerline{\includegraphics[width=0.99\linewidth]{figs/URS_framework_final.pdf}}
+\caption{The pipeline of our URS for solving 110 VRP variants using a single model without any fine-tuning, illustrated on APDTSP.}
+\label{fig:URS_framework}
+\end{center}
+\vskip -0.3in
+
+\end{figure*}
+\paragraph{Constructive Neural Routing Solver}
+
+Most constructive NCO methods employ an encoder-decoder architecture for solution construction~\citep{luo2023lehd,kwon2020pomo}. Let learnable model parameters be denoted as $\bm{\theta}=\{\bm{\theta}_{enc},\bm{\theta}_{dec}\}$. Without loss of generality, we present the prevailing autoregressive construction pipeline using AM~\citep{kool2019attention}. Given an instance $\mathcal{G}$, raw node features are first mapped by a linear projection to initial embeddings $H^{(0)}=\{\mathbf{h}_i^{(0)}\}_{i=0}^n$. They are then processed by an encoder $\bm{\theta}_{enc}$ with $L$ attention layers to produce refined node embeddings $H^{(L)}=\{\mathbf{h}_i^{(L)}\}_{i=0}^n$. At each decoding step $t$, the decoder $\bm{\theta}_{dec}$ sequentially selects a node to append to the current partial solution $\pi_{1:t-1}=(\pi_{1},\pi_{2},\ldots,\pi_{t-1})$, where $\pi_{1}, \pi_{t-1}\in \mathcal{V}$ are the \textbf{first} and \textbf{last} visited node, respectively. This sequential process continues until a complete solution is formed. To guarantee the feasibility of generated solutions, a masking function $\mathcal{M}_t$ sets the selection probabilities of the following nodes to $-\infty$ during the construction process: nodes that (1) are visited or (2) violate problem-specific constraints (e.g., capacity). 
+
+\section{Methodology}
+\label{sec:urs}
+
+In this section, as illustrated in \cref{fig:URS_framework}, we propose a powerful \textbf{\underline{U}}nified Neural \textbf{\underline{R}}outing \textbf{\underline{S}}olver (URS), which significantly improves cross-problem zero-shot generalization for NCO methods. Its key components are elaborated below.
+
+
+\subsection{Unified Data Representation}
+\label{sec:udr}
+
+Existing multi-task neural solvers~\citep{zhou2024mvmoe,drakulic2025goal} fundamentally rely on explicit problem enumeration via a predefined set of problem tags, which is challenging because the constraint space of VRPs is open-ended and compositional. More critically, creating and maintaining such a problem taxonomy requires considerable domain expertise, which NCO always aims to avoid.
+
+From a data perspective, despite the substantial diversity in constraints, their instances share a common structural representation. For existing constraint combination-based methods~\citep{liu2024mtpomo,zhou2024mvmoe}, their evaluated problems can be formulated as CVRPTW instances. Leveraging this structural commonality, we propose a Unified Data Representation (UDR) $\bm{U}=\{\mathbf{u}_{i}\}_{i=0}^{n}$. By replacing explicit problem enumeration with data unification, our UDR broadens problem coverage and reduces reliance on domain expertise. Notably, the inputs to existing multi-task neural solvers based on either problem-specific adapters~\citep{drakulic2025goal} or constraint combinations~\citep{zhou2024mvmoe} can be viewed as special subsets of our proposed UDR.
+
+Instead of relying on a predefined problem taxonomy with a discrete set of problem tags, UDR decouples instance representation from constraint definitions and operates in a unified space characterized by both continuous and discrete features. It allows a single neural solver to address a much larger, open-ended space of VRP variants, as new problems can be seamlessly incorporated into this unified representation. Problem-specific constraints are delegated to the model-agnostic masking function $\mathcal{M}_t$. For example, for all CVRP variants, only the remaining load is explicitly provided as input, while diverse additional constraints (e.g., time windows) are enforced implicitly by masking infeasible candidate nodes during solution construction, rather than being fully enumerated in the decoder's input. Thus, UDR enables a single model to handle various VRP variants while significantly reducing reliance on domain expertise. Specifically, for an instance $\mathcal{G}$, each $\mathbf{u}_{i}=\{\bm{\rho}_{i},\ \bm{\omega}_{i},\ \bm{\xi}_{i}\}$, where $\bm{\rho}_{i},\ \bm{\omega}_{i},\ \bm{\xi}_{i}$ are a positional identifier, unified attribute set, and node-type indicator, respectively.
+
+\paragraph{Positional Identifier ($\bm{\rho}_{i}$)}
+We define a unified positional identifier for each node as $\bm{\rho}_{i}=\{\eta_{i},x_{i},y_{i}\} \in [0,1]^3$. The $\eta_i \sim \mathrm{Uniform}(0,1) \in \mathbb{R}^1$ is a sampled scalar, which is used to address asymmetric problems, following ~\citet{drakulic2023bq}. For symmetric cases, we simply set $\eta_i=0$.
+\paragraph{Unified Attribute Set ($\bm{\omega}_{i}$)}
+We define the unified attribute set as $\bm{\omega}_{i}=\{\delta_{i},\epsilon_{i}, \mu_{i},\ e_{i}, \ l_{i}, \ s_{i} \}$, where they correspond to demand, prize, penalty, earliest arrival time, latest arrival time, and service time, respectively. The unification empowers the model to learn the relative importance of individual attributes in a shared embedding space. It also supports effortless attribute extension or ablation via simple zero-filling, eliminating the need to change the architecture.
+\paragraph{Node-type Indicator ($\bm{\xi}_i$)}
+We provide a 5-dimensional binary vector $\bm{\xi}_i \in \{0,1\}^{5}$ for each node, encoding: depot, pickup node, delivery node, node in sub-routes, node in open route. The nodes in sub-routes and open routes mean the solution $\pi$ can have sub-routes or be an open route. We introduce explicit structural roles to enable the model to generalize over diverse variants. Further ablation analysis concerning $\bm{\xi}_i$ is provided in Appendix \ref{append:ablation_nodetype}.
+\paragraph{Multi-hot Problem Representation ($\bm{\lambda}_{i}$)}
+
+Through the UDR, each problem instance activates only a specific subset of the unified feature space. For any instance $\mathcal{G}_{i}$ drawn from different problems, a corresponding multi-hot problem representation $\bm{\lambda}_{i}$ is obtained by indicating active (non-zero) feature slots with a value of $1$. This representation captures only the presence of features, in contrast to their raw values, and it subsequently provides conditional guidance to the position bias weight (see \cref{eq:bias}) and the adaptive decoder parameters $\bm{\theta}_{dec}(\bm{\lambda})$ (see \cref{eq:decoder_aafm} and \cref{eq:compatibility}), thereby helping the model in distinguishing problem variants and refining its node selection process.
+
+A more detailed description of $\bm{U}$ and $\bm{\lambda}$ is provided in Appendix \ref{append:udr} and Appendix \ref{append:multi_hot}, respectively.
+
+\subsection{Model Architecture}
+\label{sec:model_architecture}
+
+As shown in \cref{fig:URS_framework}, we adopt AM~\citep{kool2019attention} as our basic model. While UDR provides cross-problem consistency, different problems have diverse geometric priors. To efficiently learn the multiple priors inherent in various problems and obtain better cross-problem zero-shot generalization, we propose two key enhancements: (1) a Mixed Bias Module (MBM) that captures multiple priors inherent to various problems, and (2) problem-conditioned parameter generators conditioned on the UDR. Their implementations are detailed below.
+
+\paragraph{Embedding Layer}
+Given an instance $\mathcal{G}$, for each $\mathbf{u}_{i}=\{\bm{\rho}_{i},\ \bm{\omega}_{i},\ \bm{\xi}_{i}\}$, we project it into $d$-dimensional embeddings through three separate linear transformations:
+\begin{equation}
+\mathbf{h}_{i}^{(0)}=\bm{\rho}_{i}W_{\bm{\rho}} + \bm{\omega}_{i}W_{\bm{\omega}} + \bm{\xi}_{i}W_{\bm{\xi}},
+\label{eq:input_linear}
+\end{equation}
+where $W_{\bm{\rho}}\in \mathbb{R}^{3\times d},\ W_{\bm{\omega}}\in \mathbb{R}^{6\times d},\ W_{\bm{\xi}}\in \mathbb{R}^{5\times d}$ are learnable matrices. Then we obtain a set of initial embeddings $H^{(0)}=\{\mathbf{h}_i^{(0)}\}_{i=0}^n$ for all nodes in instance $\mathcal{G}$. This embedding is the initial input of encoder $\bm{\theta}_{enc}$. After passing through $L$ stacked attention layers, $H^{(0)}$ is transformed into advanced node embeddings $H^{(L)}=\{\mathbf{h}_i^{(L)}\}_{i=0}^n$. The detailed encoding process is provided in Appendix \ref{append:encoder}. 
+
+\begin{figure}
+    \centering
+    \includegraphics[width=0.8\linewidth]{figs/MBM.pdf}
+    \caption{\textbf{The structure of the proposed Mixed Bias Module, explained on a $4$-node APDTSP instance.} We replace plain attention with MBM during encoding to improve node embeddings, which effectively captures multiple priors inherent to various problems while reducing architectural redundancy.}
+    \label{fig:mbm}
+    \vskip -0.1in
+\end{figure}
+\paragraph{Mixed Bias Module}
+Given the distinct priors across VRP variants, efficiently capturing the intrinsic geometric bias is pivotal for enhancing the cross-problem generalization of RL-based multi-task neural solvers. Current leading RL-based models generally adopt a heavy encoder and light decoder architecture, where the quality of the encoder-generated node embeddings plays a key role in overall performance. While prior studies like MatNet~\citep{kwon2021matnet} have attempted to handle asymmetry by integrating directional distance biases via parallel layers, such designs incur high model complexity and lack universality. Consequently, effectively encoding multiple inherent biases, such as symmetric and asymmetric distances, and relational dependencies, remains challenging, hindering the acquisition of high-quality solutions across a wide range of problems. 
+
+To address the limitation, we propose the mixed bias module (MBM) to replace the vanilla attention mechanism~\citep{vaswani2017attention}, which enhances cross-problem generalization while reducing architectural redundancy. As shown in \cref{fig:mbm}, MBM can efficiently capture three problem-specific prior matrices via three separate attention calculations: (1) an outgoing distance matrix $\bm{D}$; (2) an incoming distance matrix $\bm{D}^{\mathrm{T}}$; and (3) an optional relation matrix $\bm{R}=\{r_{ij}| \ \forall \  i,j \in 0, \ldots, n\}$, where $r_{ij} = 0$ if a predefined relation exists (e.g., pickup-delivery pairing) and 1 otherwise. This ensures that smaller values are preferred, aligning with the distance metric, where smaller values correspond to a larger selection bias. For the $\ell$-th layer, the MBM output $\hat{\mathbf{h}}_i^{(\ell)}$ can be expressed as:
+\begin{equation}
+\bar{\mathbf{h}}_{i}^{(0)} = \mathrm{Attention}(\mathbf{h}_i^{(\ell-1)}, H^{(\ell-1)}, f\left(\alpha,N,\bm{D}_{i}\right)),
+\end{equation}
+\begin{equation}
+\bar{\mathbf{h}}_{i}^{(1)} = \mathrm{Attention}(\mathbf{h}_i^{(\ell-1)}, H^{(\ell-1)}, f\left(\alpha,N,\bm{D}_{i}^{\mathrm{T}}\right)), \\
+\end{equation}
+\begin{equation}
+\bar{\mathbf{h}}_{i}^{(2)} = 
+    \begin{cases}
+    \mathrm{Attention}(\mathbf{h}_i^{(\ell-1)}, H^{(\ell-1)}, f\left(\alpha,\bm{R}_{i}\right))   & \text{if} \ \bm{R} \neq \emptyset \\
+    \bm{0}  &\text{otherwise}, 
+    \end{cases}
+\label{eq:mdm_attn}
+\end{equation}
+\begin{equation}
+\hat{\mathbf{h}}_i^{(\ell)} = \left[\bar{\mathbf{h}}_{i}^{(0)},\bar{\mathbf{h}}_{i}^{(1)},\bar{\mathbf{h}}_{i}^{(2)}\right]W^{O},
+    \label{eq:mixed_bias_module}
+\end{equation}
+where $[\cdot,\cdot]$ denotes the horizontal concatenation operator, $W^{O}\in \mathbb{R}^{(3\times d)\times d}$ is a learnable matrix. For $\mathrm{Attention}(\cdot)$,  we adopt the attention mechanism introduced by~\citet{zhou2024icam}, which boosts the perception of diverse geometric patterns through an adaptation function $f(\alpha, N,d_{ij})$ with bias weight $\alpha$ (see Appendix \ref{append:aafm} for implementation details). Note that since the relation $r_{ij}$ is scale-independent, we remove the scale $N$ in the adaptation function for $\bm{R}$. If $\bm{R}$ is absent, we substitute a zero vector for $\bar{\mathbf{h}}_{i}^{(2)}$. For a comparison between our MBM and existing attentions~\citep{vaswani2017attention,kwon2021matnet}, please see Appendix \ref{append:compare_msa}.
+
+\paragraph{Problem-Conditioned Parameter Generation}
+Using a single static set of parameters to solve 110 VRP variants is a significant challenge. To mitigate this, we introduce a problem-conditioned mechanism based on problem representation $\bm{\lambda}$, which consists of two components: (1) $\mathrm{BIAS}(\bm{\lambda})$ adjusts the degree to which different priors are integrated into the attention; and (2) $\mathrm{WEIGHT}(\bm{\lambda})$ generates decoder parameters for each problem. 
+
+As shown in \cref{fig:adaptive_params}, unlike existing adapter-based fine-tuning methods~\citep{lin2024cross,drakulic2025goal}, we provide a unified decoding entrance and enable URS to adaptively generate decoder parameters for each problem. This conditional weight generation removes problem-specific adapters, enabling zero-shot generalization to unseen problems while maintaining solution quality.
+
+For MBM in \cref{eq:mixed_bias_module}, we generate $\alpha$ via a lightweight bias network $\mathrm{BIAS}(\bm{\lambda})$:
+\begin{equation}
+    \mathrm{BIAS}(\bm{\lambda}) = \max\left(1,\  \left(\bm{\lambda} W_1+\mathbf{b}_{1}\right)W_2 +\mathbf{b}_{2}\right),
+    \label{eq:bias}
+\end{equation}
+where $W_1 \in \mathbb{R}^{|\bm{\lambda}|\times d},\  W_2 \in \mathbb{R}^{d\times 1},\  \mathbf{b}_1\in \mathbb{R}^{d},\  \mathbf{b}_2\in \mathbb{R}^{1}$ are learnable parameters. We set the minimum bias to $1$, resulting in faster model convergence. 
+
+For decoder $\bm{\theta}_{dec}(\bm{\lambda})$, all parameters are generated based on $\bm{\lambda}$. Following~\citet{kwon2020pomo}, given the first and last visited node embeddings $\mathbf{h}_{\pi_1}^{(L)}$ and $\mathbf{h}_{\pi_{t-1}}^{(L)}$, and an optional constraint state $C_t \in \mathbb{R}^{1}$ (e.g., remaining load), the context embedding $\mathbf{h}_{(C)}^{t}$ can be expressed as:
+\begin{equation}
+ \mathbf{h}_{(C)}^{t} = \left[\mathbf{h}_{\pi_1}^{(L)},\ \mathbf{h}_{\pi_{t-1}}^{(L)},\ C_{t}\right]W_{Q}(\bm{\lambda}),
+\label{eq:context_embedding}
+\end{equation}
+where $[\cdot,\cdot]$ is the horizontal concatenation operator, $W_{Q}(\bm{\lambda})\in \mathbb{R}^{(2d+1) \times d}$ is a linear projection matrix conditioned on $\bm{\lambda}$. Missing $C_t$ is zero-padded (see Appendix \ref{append:problem_state} for details). The new context embedding $\hat{\mathbf{h}}_{(C)}^{t}$ is obtained via $\mathrm{Attention}(\cdot)$~\citep{zhou2024icam} on $\mathbf{h}_{(C)}^{t}$ and $H^{(L)}$:
+\begin{equation}
+    K = H^{(L)}W_{K}(\bm{\lambda}), \qquad V = H^{(L)}W_{V}(\bm{\lambda}),
+\end{equation}
+\begin{equation}
+    \hat{\mathbf{h}}_{(C)}^{t} = \mathrm{Attention}(\mathbf{h}_{(C)}^{t}, K,V, \mathcal{M}_{t}, f(\alpha,N,d_{t,i})),
+    %\quad  \forall i \in 0,1,2,\ldots,n,
+\label{eq:decoder_aafm}
+\end{equation}
+where $W_{K}(\bm{\lambda}), W_{V}(\bm{\lambda})\in \mathbb{R}^{d \times d}$ are linear projection matrices conditioned on $\bm{\lambda}$. Finally, we compute probabilities for feasible nodes $p_{\bm{\theta}}(\pi_t = i \mid \mathcal{G}, \pi_{1:t-1})=\mathrm{softmax}(\mathbf{u})$ based on the improved compatibility~\citep{zhou2024icam}:
+\begin{equation}
+    u^{t}_{i} = 
+    \begin{cases}
+    \zeta  \cdot \text{tanh}(\frac{\hat{\mathbf{h}}_{(C)}^{t}(\mathbf{h}_{i}^{(L)})^\mathrm{T}}{\sqrt{d}} +f(\alpha,N,d_{t,i}))   & \text{if} \ i \not\in \{\pi_{1:t-1}\} \\
+    -\infty  &\text{otherwise,}
+\end{cases}
+    \label{eq:compatibility}
+\end{equation}
+
+\begin{figure}
+    \centering
+    \includegraphics[width=0.98\linewidth]{figs/adaptive_params.pdf}
+    \caption{Comparison between our URS and existing adapter-based fine-tuning frameworks.}
+    \label{fig:adaptive_params}
+    \vskip -0.1in
+\end{figure}
+where $\zeta$ is the clipping parameter. Inspired by~\citet{lin2022pareto}, we use a simple MLP hypernetwork $\mathrm{WEIGHT}(\bm{\lambda})$ to generate $\{W_{Q}(\bm{\lambda}),\ W_{K}(\bm{\lambda}),\ W_{V}(\bm{\lambda})\}$ (see Appendix \ref{append:decoder} for implementation details). For $\alpha$ in \cref{eq:decoder_aafm} and \cref{eq:compatibility}, we generate them via $\mathrm{BIAS}(\bm{\lambda})$ in \cref{eq:bias}.
+
+\begin{table*}[t]
+  \centering
+  \caption{Performance comparison on $8$ seen less-explored variants.}
+  \resizebox{0.99\textwidth}{!}{
+    \begin{tabular}{l|cc|cc|cc|cc|cc|cc|cc|cc}
+    \toprule[0.5mm]
+    \multirow{2}[2]{*}{Method} & \multicolumn{2}{c|}{OP100} & \multicolumn{2}{c|}{PCTSP100} & \multicolumn{2}{c|}{PDTSP100} & \multicolumn{2}{c|}{ACVRP100} & \multicolumn{2}{c|}{CVRPTW100} & \multicolumn{2}{c|}{CVRPB100} & \multicolumn{2}{c|}{OCVRP100} & \multicolumn{2}{c}{OCVRPTW100} \\
+          & Gap   & Time  & Gap   & Time  & Gap   & \multicolumn{1}{c|}{Time} & Gap   & Time  & Gap   & Time  & Gap   & Time  & Gap   & Time  & Gap   & Time \\
+    \midrule
+    Oracle & 0.00\% & 1.5m  & 0.00\% & 1.2h  & 0.00\% & \multicolumn{1}{c|}{9.8m} & 0.00\% & 6.6m  & 0.00\% & 19.6m & 0.00\% & 20.8m & 0.00\% & 5.3m  & 0.00\% & 20.8m \\
+    \midrule
+    Sym-NCO & 0.68\% & 15s   & 0.14\% & 16s   & \multicolumn{2}{c|}{$-$} & \multicolumn{2}{c|}{$-$} & \multicolumn{2}{c|}{$-$} & \multicolumn{2}{c|}{$-$} & \multicolumn{2}{c|}{$-$} & \multicolumn{2}{c}{$-$} \\
+    BQ    & 0.63\% & 7s    & \multicolumn{2}{c|}{$-$} & \multicolumn{2}{c|}{$-$} & \multicolumn{2}{c|}{$-$} & \multicolumn{2}{c|}{$-$} & \multicolumn{2}{c|}{$-$} & \multicolumn{2}{c|}{$-$} & \multicolumn{2}{c}{$-$} \\
+    Heter-AM & \multicolumn{2}{c|}{$-$} & \multicolumn{2}{c|}{$-$} & 6.61\% & \multicolumn{1}{c|}{5m} & \multicolumn{2}{c|}{$-$} & \multicolumn{2}{c|}{$-$} & \multicolumn{2}{c|}{$-$} & \multicolumn{2}{c|}{$-$} & \multicolumn{2}{c}{$-$} \\
+    \midrule
+    MVMoE & \multicolumn{2}{c|}{$-$} & \multicolumn{2}{c|}{$-$} & \multicolumn{2}{c|}{$-$} & \multicolumn{2}{c|}{$-$} & 4.90\% & 15s   & 1.28\% & 11s   & 3.14\% & 13s   & 3.85\% & 15s \\
+    MTPOMO & \multicolumn{2}{c|}{$-$} & \multicolumn{2}{c|}{$-$} & \multicolumn{2}{c|}{$-$} & \multicolumn{2}{c|}{$-$} & 5.31\% & 8s    & 1.67\% & 5s    & 3.46\% & 6s    & 4.41\% & 7s \\
+    ReLD-MTL & \multicolumn{2}{c|}{$-$} & \multicolumn{2}{c|}{$-$} & \multicolumn{2}{c|}{$-$} & \multicolumn{2}{c|}{$-$} & 4.56\% &  10s  & \cellcolor[HTML]{D0CECE}\textbf{0.90\%} & 6s    & 2.32\% & 7s    & \cellcolor[HTML]{D0CECE}\textbf{3.10\%} & 9s \\
+    GOAL-MTL & 1.20\% & 38s   & \multicolumn{2}{c|}{$-$} & \multicolumn{2}{c|}{$-$} & \multicolumn{2}{c|}{$-$} & 4.66\% & 42s   & \multicolumn{2}{c|}{$-$} & \multicolumn{2}{c|}{$-$} & \multicolumn{2}{c}{$-$} \\
+    \midrule
+    URS-STL & \cellcolor[HTML]{D0CECE}\textbf{0.11\%} & 4s    & \cellcolor[HTML]{D0CECE}\textbf{-0.09\%} & 5s    & \cellcolor[HTML]{D0CECE}\textbf{3.22\%} & \multicolumn{1}{c|}{4s} & \cellcolor[HTML]{D0CECE}\textbf{2.01\%} & 1.4m  & \cellcolor[HTML]{D0CECE}\textbf{4.50\%} & 8s    & 1.59\% & 6s    & \cellcolor[HTML]{D0CECE}\textbf{2.25\%} & 6s    & 3.22\% & 8s \\
+    URS   & 0.45\% & 4s    & 1.06\% & 5s    & 4.98\% & 4s    & 3.06\% & 1.4m  & 6.13\% & 8s    & 1.46\% & 6s    & 3.24\% & 6s    & 5.07\% & 8s \\
+    \bottomrule[0.5mm]
+    \end{tabular}%
+    }
+  \label{tab:indomain_8vrp}%
+\end{table*}%
+
+\begin{table}[htbp]
+  \centering
+  \caption{Experimental results on seen ATSP, TSP, and CVRP.}
+  \resizebox{0.48\textwidth}{!}{
+    \begin{tabular}{l|cc|cc|cc}
+    \toprule[0.5mm]
+    \multirow{2}[2]{*}{Method} & \multicolumn{2}{c|}{ATSP100} & \multicolumn{2}{c|}{TSP100} & \multicolumn{2}{c}{CVRP100} \\
+          & Gap   & Time  & Gap   & Time  & Gap   & Time \\
+    \midrule
+    Oracle & 0.00\% & 2m    & 0.00\% & 6m    & 0.00\% & 9.1m \\
+    \midrule
+    Sym-NCO & \multicolumn{2}{c|}{$-$} & 0.14\% & 5s    & 1.46\% & 6s \\
+    BQ    & 1.27\% & 1m    & 0.35\% & 7s    & 3.24\% & 8s \\
+    LEHD  & \multicolumn{2}{c|}{$-$} & 0.59\% & 2s    & 3.68\% & 2s \\
+    POMO  & \multicolumn{2}{c|}{$-$} & 0.13\% & 5s    & \cellcolor[HTML]{D0CECE}\textbf{1.25\%} & 6s \\
+    ICAM  & 3.05\% & 1m    & 0.15\% & 4s    & 2.04\% & 4s \\
+    MatNet & 0.95\% & 6.5m  & \multicolumn{2}{c|}{$-$} & \multicolumn{2}{c}{$-$} \\
+    \midrule
+    MVMoE & \multicolumn{2}{c|}{$-$} & \multicolumn{2}{c|}{$-$} & 1.65\% & 12s \\
+    MTPOMO & \multicolumn{2}{c|}{$-$} & \multicolumn{2}{c|}{$-$} & 1.85\% & 6s \\
+    ReLD-MTL & \multicolumn{2}{c|}{$-$} & \multicolumn{2}{c|}{$-$} & 1.42\% & 8s \\
+    GOAL-MTL & 1.77\% & 1m    & \multicolumn{2}{c|}{$-$} & 4.22\% & 48s \\
+    \midrule
+    URS-STL & \cellcolor[HTML]{D0CECE}\textbf{0.62\%} & 1.1m  & \cellcolor[HTML]{D0CECE}\textbf{0.08\%} & 6s    & 1.63\% & 6s \\
+    URS   & 2.26\% & 1.1m  & 0.57\% & 6s    & 1.81\% & 6s \\
+    \bottomrule[0.5mm]
+    \end{tabular}%
+    }
+    \vskip -0.1in
+  \label{tab:indomain_3vrp}%
+\end{table}%
+
+\section{Experiments}
+\label{sec:experiments}
+In this section, we present a comprehensive evaluation of URS against both classical and neural solvers. For URS, we focus on four key aspects: (1) performance on 11 seen problems; (2) zero-shot generalization on 99 unseen problems; (3) scalability to large-scale VRP variants; and (4) results on benchmark datasets. All experiments are conducted using a single NVIDIA GeForce RTX 4090 GPU (24GB of memory) for neural solvers and an Intel Xeon Gold 6240R CPU (2.40 GHz) for classical solvers.
+
+\begin{table*}[t]
+  \centering
+  \caption{Zero-shot generalization on 1K test instances of $32$ unseen VRPs ($N=100$). Due to page limit, complete experimental results (including all 99 unseen variants) are deferred to Appendix \ref{append:experiments}. }
+  \resizebox{1\textwidth}{!}{
+    \begin{tabular}{l|cc|cc|cc|cc|cc|cc|cc|cc}
+    \toprule[0.5mm]
+    \multirow{2}[2]{*}{Method} & \multicolumn{2}{c|}{CVRPBP} & \multicolumn{2}{c|}{CVRPBPL} & \multicolumn{2}{c|}{MDOCVRPBP} & \multicolumn{2}{c|}{MDOCVRPBPTW} & \multicolumn{2}{c|}{MDOCVRPBPL} & \multicolumn{2}{c|}{MDOCVRPBPLTW} & \multicolumn{2}{c|}{MDCVRP} & \multicolumn{2}{c}{MDOCVRP} \\
+          & Gap   & Time  & Gap   & Time  & Gap   & Time  & Gap   & Time  & Gap   & Time  & Gap   & Time  & Gap   & Time  & Gap   & Time \\
+    \midrule
+    Oracle  & 0.00\% & 6.6m  & 0.00\% & 6.6m  & 0.00\% & 6.6m  & 0.00\% & 6.6m  & 0.00\% & 6.6m  & 0.00\% & 6.6m  & 0.00\% & 6.6m  & 0.00\% & 6.6m \\
+    MVMoE & 13.95\% & 14s   & 13.38\% & 14s   & 56.60\% & 33s   & 63.77\% & 38s   & 56.26\% & 34s   & 62.47\% & 40s   & 33.06\% & 31s   & 29.08\% & 31s \\
+    MTPOMO & 13.71\% & 7s    & 13.44\% & 8s    & 42.94\% & 24s   & 47.09\% & 29s   & 41.98\% & 27s   & 46.26\% & 32s   & 23.38\% & 23s   & 27.46\% & 23s \\
+    ReLD-MTL & 13.57\% & 9s    & 12.96\% & 10s   & 37.74\% & 27s   & 45.16\% & 34s   & 37.45\% & 29s   & 44.74\% & 36s   & 18.39\% & 25s   & 22.32\% & 25s \\
+    URS   & \cellcolor[HTML]{D0CECE}\textbf{12.95\%} & 7s    & \cellcolor[HTML]{D0CECE}\textbf{12.65\%} & 8s    & \cellcolor[HTML]{D0CECE}\textbf{24.44\%} & 22s   & \cellcolor[HTML]{D0CECE}\textbf{26.31\%} & 26s   & \cellcolor[HTML]{D0CECE}\textbf{24.22\%} & 24s   & \cellcolor[HTML]{D0CECE}\textbf{26.20\%} & 28s   & \cellcolor[HTML]{D0CECE}\textbf{15.05\%} & 23s   & \cellcolor[HTML]{D0CECE}\textbf{22.01\%} & 23s \\
+    \midrule
+    \midrule
+    \multirow{2}[2]{*}{Method} & \multicolumn{2}{c|}{MDCVRPL} & \multicolumn{2}{c|}{MDOCVRPTW} & \multicolumn{2}{c|}{MDOCVRPB} & \multicolumn{2}{c|}{MDOCVRPBL} & \multicolumn{2}{c|}{MDOCVRPLTW} & \multicolumn{2}{c|}{SPCTSP} & \multicolumn{2}{c|}{PDCVRP} & \multicolumn{2}{c}{OPDCVRP} \\
+          & Gap   & Time  & Gap   & Time  & Gap   & Time  & Gap   & Time  & Gap   & Time  & Gap   & Time  & Gap   & Time  & Gap   & Time \\
+    \midrule
+    Oracle  & 0.00\% & 6.6m  & 0.00\% & 6.6m  & 0.00\% & 6.6m  & 0.00\% & 6.6m  & 0.00\% & 6.6m  & 0.00\% & 1.6h  & 0.00\% & 1.6h  & 0.00\% & 1.6h \\
+    MVMoE & 33.42\% & 34s   & 51.57\% & 40s   & 28.21\% & 26s   & 28.70\% & 28s   & 51.09\% & 43s   & \multicolumn{2}{c|}{$-$} & \multicolumn{2}{c|}{$-$} & \multicolumn{2}{c}{$-$} \\
+    MTPOMO & 24.32\% & 25s   & 35.71\% & 29s   & 25.06\% & 20s   & 25.01\% & 21s   & 35.39\% & 31s   & \multicolumn{2}{c|}{$-$} & \multicolumn{2}{c|}{$-$} & \multicolumn{2}{c}{$-$} \\
+    ReLD-MTL & 18.48\% & 28s   & 33.55\% & 33s   & 18.50\% & 21s   & 18.50\% & 22s   & 33.26\% & 35s   & \multicolumn{2}{c|}{$-$} & \multicolumn{2}{c|}{$-$} & \multicolumn{2}{c}{$-$} \\
+    URS   & \cellcolor[HTML]{D0CECE}\textbf{15.32\%} & 26s   & \cellcolor[HTML]{D0CECE}\textbf{26.05\%} & 25s   & \cellcolor[HTML]{D0CECE}\textbf{15.17\%} & 18s   & \cellcolor[HTML]{D0CECE}\textbf{14.90\%} & 20s   & \cellcolor[HTML]{D0CECE}\textbf{25.59\%} & 27s   & \cellcolor[HTML]{D0CECE}\textbf{-2.37\%} & 5s    & \cellcolor[HTML]{D0CECE}\textbf{-1.47\%} & 5s    & \cellcolor[HTML]{D0CECE}\textbf{4.93\%} & 5s \\
+    \midrule
+    \midrule
+    \multirow{2}[2]{*}{Method} & \multicolumn{2}{c|}{ACVRPL} & \multicolumn{2}{c|}{ACVRPBL} & \multicolumn{2}{c|}{ACVRPB} & \multicolumn{2}{c|}{ACVRPBTW} & \multicolumn{2}{c|}{APDTSP} & \multicolumn{2}{c|}{AMDCVRPL} & \multicolumn{2}{c|}{AMDCVRP} & \multicolumn{2}{c}{APDCVRP} \\
+          & Gap   & Time  & Gap   & Time  & Gap   & Time  & Gap   & Time  & Gap   & Time  & Gap   & Time  & Gap   & Time  & Gap   & Time \\
+    \midrule
+    Oracle  & 0.00\% & 6.6m  & 0.00\% & 6.6m  & 0.00\% & 6.6m  & 0.00\% & 6.6m  & 0.00\% & 6.6m  & 0.00\% & 6.6m  & 0.00\% & 6.6m  & 0.00\% & 6.6m \\
+    URS   & \cellcolor[HTML]{D0CECE}\textbf{-2.24\%} & 1.9m  & \cellcolor[HTML]{D0CECE}\textbf{6.18\%} & 2.4m  & \cellcolor[HTML]{D0CECE}\textbf{7.10\%} & 2.1m  & \cellcolor[HTML]{D0CECE}\textbf{9.95\%} & 2.2m  & \cellcolor[HTML]{D0CECE}\textbf{6.21\%} & 1m    & \cellcolor[HTML]{D0CECE}\textbf{7.15\%} & 6.1m  & \cellcolor[HTML]{D0CECE}\textbf{8.11\%} & 5.3m  & \cellcolor[HTML]{D0CECE}\textbf{7.03\%} & 1.2m \\
+    \midrule
+    \midrule
+    \multirow{2}[2]{*}{Method} & \multicolumn{2}{c|}{ACVRPLTW} & \multicolumn{2}{c|}{ACVRPBLTW} & \multicolumn{2}{c|}{ACVRPBPLTW} & \multicolumn{2}{c|}{AOCVRPBLTW} & \multicolumn{2}{c|}{ACVRPTW} & \multicolumn{2}{c|}{ ACVRPBPTW} & \multicolumn{2}{c|}{AOPDCVRP} & \multicolumn{2}{c}{AOP} \\
+          & Gap   & Time  & Gap   & Time  & Gap   & Time  & Gap   & Time  & Gap   & Time  & Gap   & Time  & Gap   & Time  & Gap   & Time \\
+    \midrule
+    Oracle  & 0.00\% & 6.6m  & 0.00\% & 6.6m  & 0.00\% & 6.6m  & 0.00\% & 6.6m  & 0.00\% & 6.6m  & 0.00\% & 6.6m  & 0.00\% & 6.6m  & 0.00\% & 6.6m \\
+    URS   & \cellcolor[HTML]{D0CECE}\textbf{12.22\%} & 2.7m  & \cellcolor[HTML]{D0CECE}\textbf{10.18\%} & 2.4m  & \cellcolor[HTML]{D0CECE}\textbf{13.82\%} & 2.8m  & \cellcolor[HTML]{D0CECE}\textbf{14.32\%} & 2.5m  & \cellcolor[HTML]{D0CECE}\textbf{11.28\%} & 2.5m  & \cellcolor[HTML]{D0CECE}\textbf{14.52\%} & 2.6m  & \cellcolor[HTML]{D0CECE}\textbf{11.13\%} & 1.2m  & \cellcolor[HTML]{D0CECE}\textbf{-5.47\%} & 1.2m \\
+    \bottomrule[0.5mm]
+    \end{tabular}%
+    }
+     
+  \label{tab:zero_shot_main_paper}%
+\end{table*}%
+
+\begin{table*}[h!]
+  \centering
+  \caption{Generalization on different large-scale VRP variants. All models are trained on instances of size $N = 100$ and employ instance augmentation $ \times$ 8. PyVRP and OR-Tools can process all instances of a given size concurrently to ensure a fair comparison.}
+    \resizebox{1\textwidth}{!}{
+    \begin{tabular}{c|c|cc|cc|cc|cc|cc}
+    \toprule[0.5mm]
+    \multirow{2}[2]{*}{Problem} & \multirow{2}[2]{*}{Method} & \multicolumn{2}{c|}{N = 1000} & \multicolumn{2}{c|}{N = 2000} & \multicolumn{2}{c|}{N = 3000} & \multicolumn{2}{c|}{N = 4000} & \multicolumn{2}{c}{N = 5000} \\
+          &       & Obj.(Gap) & Time  & Obj.(Gap) & Time  & Obj.(Gap) & Time  & Obj.(Gap) & Time  & Obj.(Gap) & Time \\
+    \midrule
+    \multirow{6}[2]{*}{\rotatebox{90}{CVRPTW} } & PyVRP & 159.35(0.00\%) & 20m   & 337.15(0.00\%) & 40m   & 516.97(0.00\%) & 1h    & 618.58(0.00\%) & 2.7h  & 787.25(0.00\%) & 3.3h \\
+      & OR-Tools & 178.13(11.79\%) & 20m   & 357.18(5.94\%) & 40m   & 533.97(3.29\%) & 1h    & 647.92(4.74\%) & 2.7h  & 807.128(2.52\%) & 3.3h \\
+\cmidrule{2-12}
+          & MTPOMO & 219.22(37.57\%) & 1.7m  & 488.40(44.86\%) & 14.6m & 773.00(49.53\%) & 49.5m & 975.61(57.72\%) & 1.9h  &\multicolumn{2}{c}{OOM} \\
+          & MVMoE & 233.53(46.55\%) & 1.7m  & 624.73(85.30\%) & 14.6m & 1094.25(111.67\%) & 51.9m & 1486.34(140.28\%) & 2h    &\multicolumn{2}{c}{OOM} \\
+          & ReLD-MTL & 183.31(15.04\%) & 1.6m  & 396.28(17.54\%) & 13.4m & 613.58(18.69\%) & 45.7m & 748.65(21.03\%) & 1.8h  &\multicolumn{2}{c}{OOM} \\
+          & URS & \cellcolor[HTML]{D0CECE}\textbf{172.58(8.30\%)} & \cellcolor[HTML]{D0CECE}\textbf{1.3m}  & \cellcolor[HTML]{D0CECE}\textbf{365.27(8.34\%)} & \cellcolor[HTML]{D0CECE}\textbf{11.1m} & \cellcolor[HTML]{D0CECE}\textbf{559.03(8.14\%)} & \cellcolor[HTML]{D0CECE}\textbf{30.1m} & \cellcolor[HTML]{D0CECE}\textbf{673.63(8.90\%)} & \cellcolor[HTML]{D0CECE}\textbf{1.2h}  & \cellcolor[HTML]{D0CECE}\textbf{853.79(8.45\%)} & \cellcolor[HTML]{D0CECE}\textbf{2.3h} \\
+    \midrule
+    \midrule
+    \multirow{6}[2]{*}{\rotatebox{90}{CVRPB}} & PyVRP & 36.52(0.00\%) & 20m   & 51.80(0.00\%) & 40m   & 75.12(0.00\%) & 1h    & 93.52(0.00\%) & 2.7h  & 112.21(0.00\%) & 3.3h \\
+              & OR-Tools & 44.23(21.11\%) & 20m   & 63.33(22.26\%) & 40m   & 88.6(17.94\%) & 1h    & 108.82(16.36\%) & 2.7h  & 128.11(14.17\%) & 3.3h \\
+\cmidrule{2-12}
+          & MTPOMO & 45.92(25.77\%) & 1.1m  & 83.50(61.20\%) & 8.8m  & 136.52(81.73\%) & 31.4m & 197.99(111.70\%) & 1.2h  &\multicolumn{2}{c}{OOM} \\
+          & MVMoE & 98.60(170.03\%) & 1m    & 250.47(383.57\%) & 8.1m  & 332.93(343.19\%) & 28.9m & 423.19(352.49\%) & 1.1h  &\multicolumn{2}{c}{OOM} \\
+          & ReLD-MTL & 38.52(5.48\%) & 1m    & 59.21(14.30\%) & 8m    & 88.36(17.62\%) & 28.3m & 114.88(22.83\%) & 1.1h  &\multicolumn{2}{c}{OOM} \\
+          & URS & \cellcolor[HTML]{D0CECE}\textbf{34.86(-4.54\%)} & \cellcolor[HTML]{D0CECE}\textbf{40s}   & \cellcolor[HTML]{D0CECE}\textbf{50.39(-2.72\%)} & \cellcolor[HTML]{D0CECE}\textbf{5.1m}  & \cellcolor[HTML]{D0CECE}\textbf{72.01(-4.15\%)} & \cellcolor[HTML]{D0CECE}\textbf{17.3m} & \cellcolor[HTML]{D0CECE}\textbf{91.74(-1.91\%)} & \cellcolor[HTML]{D0CECE}\textbf{41.2m} & \cellcolor[HTML]{D0CECE}\textbf{111.93(-0.24\%)} & \cellcolor[HTML]{D0CECE}\textbf{1.3h} \\
+    \midrule
+    \midrule
+    \multirow{6}[2]{*}{\rotatebox{90}{OCVRPTW}} & PyVRP & 90.91(0.00\%) & 20m   & 164.00(0.00\%) & 40m   & 224.16(0.00\%) & 1h    & 299.45(0.00\%) & 2.7h  & 367.86(0.00\%) & 3.3h \\
+              & OR-Tools & 105.98(16.58\%) & 20m   & 207.041(26.24\%) & 40m   & 280.88(25.30\%) & 1h    & 370.85(23.84\%) & 2.7h  & 447.02(21.52\%) & 3.3h \\
+\cmidrule{2-12}
+          & MTPOMO & 147.14(61.85\%) & 1.6m  & 297.53(81.43\%) & 12.8m & 437.73(95.28\%) & 44.3m & 601.63(100.91\%) & 1.7h  &\multicolumn{2}{c}{OOM} \\
+          & MVMoE & 147.35(62.09\%) & 1.6m  & 389.60(137.57\%) & 12.9m & 634.11(182.88\%) & 44.7m & 899.18(200.28\%) & 1.7h  &\multicolumn{2}{c}{OOM} \\
+          & ReLD-MTL & 110.00(21.01\%) & 1.5m  & 208.60(27.20\%) & 12.3m & 292.70(30.57\%) & 42m   & 394.42(31.72\%) & 1.6h  &\multicolumn{2}{c}{OOM} \\
+          & URS & \cellcolor[HTML]{D0CECE}\textbf{98.76(8.63\%)} & \cellcolor[HTML]{D0CECE}\textbf{1m}    & \cellcolor[HTML]{D0CECE}\textbf{178.07(8.58\%)} & \cellcolor[HTML]{D0CECE}\textbf{7.6m}  & \cellcolor[HTML]{D0CECE}\textbf{243.88(8.80\%)} & \cellcolor[HTML]{D0CECE}\textbf{25.4m} & \cellcolor[HTML]{D0CECE}\textbf{325.64(8.74\%)} & \cellcolor[HTML]{D0CECE}\textbf{1h}    & \cellcolor[HTML]{D0CECE}\textbf{398.72(8.39\%)} & \cellcolor[HTML]{D0CECE}\textbf{1.9h} \\
+    \bottomrule[0.5mm]
+    \end{tabular}%
+    }
+    % \vskip -0.1in
+  \label{tab:largescale_variants_mainpaper}%
+\end{table*}
+
+\subsection{Experimental Setup}
+
+\paragraph{Problem Setting} 
+We train URS on $11$ mixed variants to ensure that most features in UDR have been seen at least twice, which prevents URS from overfitting a specific feature to a single problem. Training problems and related data generations are as follows: (1) ATSP~\citep{kwon2021matnet};(2) TSP~\citep{kool2019attention}; (3) CVRP~\citep{kool2019attention}; (4) ACVRP~\citep{kwon2021matnet,kool2019attention}; (5) Orienteering Problem (OP)~\citep{kool2019attention}; (6) PCTSP~\citep{kool2019attention}; (7) PDTSP~\citep{li2021pdtsp}; (8) CVRPTW~\citep{zhou2024mvmoe}; (9) OCVRP~\citep{zhou2024mvmoe}; (10) CVRPB~\citep{zhou2024mvmoe}, and (11) OCVRPTW~\citep{zhou2024mvmoe}. We provide further discussion of problem selection in Appendix \ref{append:problem_selection}. Each of 110 variants comprises 1,000 instances. The related oracle solvers and problem representations are detailed in Appendix \ref{append:multi_hot}.
+
+\paragraph{Model \& Training Setting}
+\label{sec:exp_model_setting}
+We use an embedding dimension $d$ of $128$ and a feed-forward layer dimension of $512$. We set the number of attention layers in the encoder to $12$. The clipping parameter $\zeta$ is set to $50$ in \cref{eq:compatibility}. URS is trained by the REINFORCE~\citep{williams1992reinforce} algorithm, and the data is generated on the fly (see Appendix \ref{append:training} for more details). We train URS for $500$ epochs with $2\text{,}000$ batches per epoch, and each batch has a size of $128$. At each training step, we randomly select one problem from $11$ problems. We employ the AdamW optimizer~\citep{loshchilov2017adamw} with an initial learning rate of $10^{-4}$, which is decayed by a factor of 0.1 at the $451$st epoch. Weight decay is set to $10^{-6}$. More details are provided in Appendix \ref{append:model_setting}.
+
+\paragraph{Baseline}
+We compare URS with the following methods: (1)\textbf{Classical Solvers:} PyVRP~\citep{wouda2024pyvrp}, LKH3~\citep{LKH3}, and OR-Tools~\citep{ortools}. We run LKH3~\citep{LKH3} with $10000$ trials and 1 run~\citep{kool2019attention}. For PyVRP and OR-Tools, we run them on a single CPU core with time limits of 20s~\citep{li2025cada};  (2)\textbf{Neural Solvers:} (i) \textit{specialist solvers}: Sym-NCO~\citep{kim2022symnco}, BQ~\citep{drakulic2023bq}, LEHD~\citep{luo2023lehd}, ICAM~\citep{zhou2024icam}, POMO~\citep{kwon2020pomo}, ELG~\citep{gao2023elg}, MatNet~\citep{kwon2021matnet}, and Heter-AM~\citep{li2021pdtsp}; (ii) \textit{generalist neural solvers}: MTPOMO~\citep{liu2024mtpomo}, MVMoE~\citep{zhou2024mvmoe}, ReLD-MTL~\citep{huang2025reld}, and GOAL-MTL~\citep{drakulic2025goal}. Given the disparities in problem formulations and training settings, detailed comparisons against RouteFinder~\citep{berto2024routefinder} and CaDA~\citep{li2025cada} are deferred to Appendix \ref{append:compare_rf_cada}.
+
+\paragraph{Metrics and Inference}
+We report the optimality gap (Gap) and total inference time (Time) for each method. The optimality gap quantifies the discrepancy between the corresponding solvers and oracle solvers. For neural solvers, we execute the source code provided by the authors using default settings. We compare the performance of URS with relevant baselines for each problem, as well as its single-task version (i.e., URS-STL). The URS-STL variant uses exactly the same architecture and hyperparameters (see Appendix \ref{append:URS_STL} for more details). For URS, we report the best result with $\times8$~\citep{kwon2020pomo} and $\times128$~\citep{kwon2021matnet} instance augmentation for symmetric and asymmetric instances, respectively. The mark ($-$) indicates that the method does not support the corresponding setting. 
+
+\subsection{Performance Evaluation}
+\paragraph{Performance on Seen VRPs}
+As presented in \cref{tab:indomain_8vrp} and \cref{tab:indomain_3vrp}, among comparable neural solvers, URS-STL achieves the lowest gap on 8 of the 11 VRPs while offering fast inference, highlighting the strength of the URS architecture when fully specialized. Although URS-MTL exhibits a performance degradation relative to STL variants, it remains competitive across all 11 problems. Using ATSP as an example, we attribute this drop to geometric structural inequality, which likely biases the model's learning capacity toward symmetric VRPs. While the lack of explicit constraint states yields weaker performance compared to ReLD-MTL and MVMoE, URS shows clear advantages when generalizing to unseen VRP variants (\cref{tab:zero_shot_main_paper}) and scaling to large-size instances (\cref{tab:largescale_variants_mainpaper}). 
+
+
+\paragraph{Generalization to Unseen VRPs}
+% 44 well-studied and 55 less-explored VRP variants
+We evaluate our URS on zero-shot generalization across 99 unseen VRP variants. As presented in \cref{tab:zero_shot_main_paper} and Appendix \ref{append:experiments}, on 44 widely-studied VRPs with diverse constraint combinations (i.e., C, O, L, TW, MD, B, BP), URS continues to deliver high-quality solutions. Notably, URS merely selects the next node from a given set of feasible candidates without any additional domain knowledge, making its performance especially meaningful. Benefiting from our UDR, URS can directly address 55 less-explored VRP variants that compound asymmetry and PD relations. These results highlight URS's strong capacity for cross-problem zero-shot generalization without any fine-tuning.
+
+\paragraph{Scalability to Larger-scale VRP Variants}
+We conduct experiments on large-scale instances to validate URS's cross-problem scalability. Specifically, we generate five large-scale ($1,000-5,000$ nodes) synthetic datasets for each variant (CVRPTW, CVRPB, and OCVRPTW), and each dataset comprises 16 instances. We adhere to the capacity constraints specified in TAM~\citep{hou2022tam}. As shown in \cref{tab:largescale_variants_mainpaper}, URS consistently achieves the best solution quality, complemented by remarkably fast inference speeds, across various problem instances among all comparable multi-task neural solvers. Despite a significant increase in the problem scale (up to 50$\times$ the training size, $N=100$), the performance of URS remains stable, with no severe degradation. Remarkably, URS already outperforms the strong PyVRP with a carefully manual design on large-scale CVRPB instances. These extensive results show URS's strong scalability to large-scale complex VRP variants.
+
+\paragraph{Results on Benchmark Dataset}
+We further evaluate URS on benchmark instances from CVRPLib Set-X~\citep{uchoa2017cvrplib_setx} and CVRPLib Set-AGS (also known as Set-XXL)~\citep{arnold2019cvrplib_xxl}. We compare URS against several representative specialist and generalist solvers. As presented in \cref{tab:setxxl_mainpaper}, URS can significantly outperform existing generalist neural routing solvers in large-scale benchmark instances. Notably, as a generalist solver, URS also greatly surpasses many representative specialist models (e.g., LEHD, BQ, and ELG). In addition, the detailed results (Appendix \ref{append:benchmark}) on the Set-X dataset show that URS still maintains its position as the best overall performance. These results further underscore the practical applicability of URS in real-world large-scale scenarios.
+
+\begin{table}[t]
+  \centering
+  \caption{Comparison on Set-AGS with $N \in [3000,7000]$. All models are trained on instances of size $N = 100$.}
+  \resizebox{0.49\textwidth}{!}{
+    \begin{tabular}{c|ll|c|c|c|c|cc}
+    \toprule[0.5mm]
+   \multirow{2}[2]{*}{Type} & \multicolumn{2}{l|}{\multirow{2}[2]{*}{Method}} & Leuven1 & Leuven2 & Antwerp1 & Antwerp2 & \multicolumn{2}{c}{\multirow{2}[2]{*}{Avg.gap}} \\
+   &  \multicolumn{2}{l|}{}& (N=3000) & (N=4000) & (N=6000) & (N=7000) &\multicolumn{2}{c}{} \\ 
+    \midrule
+    \multirow{4}[2]{*}{\rotatebox{90}{Specialist}} & \multicolumn{2}{l|}{LEHD greedy}   &16.60\% &34.86\% & 14.66\% &22.77\% & \multicolumn{2}{c}{22.22\%}\\
+    &\multicolumn{2}{l|}{BQ greedy} &18.53\% & 30.70\% & 16.48\% &27.67\%  & \multicolumn{2}{c}{23.34\%}\\
+    &\multicolumn{2}{l|}{POMO aug$\times$8} &460.32\% & 202.17\%  & OOM &OOM & \multicolumn{2}{c}{$-$}\\ 
+    & \multicolumn{2}{l|}{ELG aug$\times$8}   &12.12\% & 21.52\%  & OOM &OOM & \multicolumn{2}{c}{$-$}\\ 
+    \midrule
+    \multirow{9}[2]{*}{\rotatebox{90}{Generalist}} & \multicolumn{2}{l|}{MTPOMO aug$\times$8}  & 67.72\% & 87.31\% & OOM   & OOM   & \multicolumn{2}{c}{$-$} \\
+    &\multicolumn{2}{l|}{MVMoE/4E aug$\times$8 }  & 299.10\% & 170.10\% & OOM   & OOM   & \multicolumn{2}{c}{$-$} \\
+    &\multicolumn{2}{l|}{MVMoE/4E-L aug$\times$8 }  & 182.28\% & 127.07\% & OOM   & OOM   & \multicolumn{2}{c}{$-$} \\
+    &\multicolumn{2}{l|}{RF-MVMoE aug$\times$8 }  & 57.30\% & 160.27\% & OOM   & OOM   & \multicolumn{2}{c}{$-$} \\
+    &\multicolumn{2}{l|}{RF-TE aug$\times$8 }  & 26.90\% & 45.56\% & OOM   & OOM   & \multicolumn{2}{c}{$-$} \\
+    &\multicolumn{2}{l|}{CaDA aug$\times$8 }  & 1035.51\% & OOM   & OOM   & OOM   & \multicolumn{2}{c}{$-$} \\
+    &\multicolumn{2}{l|}{ReLD-MTL aug$\times$8 }  & 17.00\% & 30.59\% & OOM   & OOM   & \multicolumn{2}{c}{$-$} \\
+    &\multicolumn{2}{l|}{GOAL greedy}  & OOM   & OOM   & OOM   & OOM   & \multicolumn{2}{c}{$-$} \\
+    \cmidrule{2-9}
+   & \multicolumn{2}{l|}{URS aug$\times$8 }  & \cellcolor[HTML]{D0CECE}\textbf{11.50\%} & \cellcolor[HTML]{D0CECE}\textbf{17.61\%} & \cellcolor[HTML]{D0CECE}\textbf{9.18\%} & \cellcolor[HTML]{D0CECE}\textbf{14.86\%} & \multicolumn{2}{c}{\cellcolor[HTML]{D0CECE}\textbf{13.29\%}} \\
+    \bottomrule[0.5mm]
+    \end{tabular}%
+    }
+  \label{tab:setxxl_mainpaper}%
+\end{table}%
+
+
+\section{Ablation Study}
+\label{sec:ablation_study}
+In this section, we conduct a comprehensive ablation study and analysis to demonstrate the effectiveness and robustness of URS. The detailed results and discussion are presented below. Note that, unless otherwise stated, the instance augmentation technique is used for the ablation studies.
+\paragraph{Effects of Key Components}
+We conduct an ablation study across 11 seen VRP variants to validate the effect of key components of URS, mainly including: (1) without node-type indicator $\bm{\xi}$ of UDR; (2) without problem state $C_t$; (3) effects of different priors in MBM ; (4) effects of alternative decoder architectures. As detailed in \cref{fig:diff_components}, URS maintains its competitive performance without $C_t$; its effectiveness is further improved by the inclusion of a node-type indicator $\bm{\xi}$. For MBM, the results reveal that three priors $\{\bm{D},\bm{D}^{\mathrm{T}}, \bm{R} \}$ are complementary, and their combined use allows MBM to effectively learn the geometric and relational biases inherent in various problems, resulting in superior overall performance. Furthermore, replacing the decoder with POMO or ReLD confirms the strong cross-problem robustness of URS, while integrating the decoder introduced in \citet{zhou2024icam} further improves cross-problem performance. More detailed results and analyses can be found in Appendix \ref{append:ablation}. 
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=0.98\linewidth]{figs/URS_components_comparison_large_font.pdf}
+    \caption{Effects of different components of URS.}
+    \label{fig:diff_components}
+\end{figure}
+
+\begin{table}[t]
+  \centering
+  \caption{Results comparing performance with and without MBM, $\mathrm{WEIGHT}(\bm{\lambda})$, and $\mathrm{BIAS}(\bm{\lambda})$ on seen and unseen variants.}
+  \resizebox{0.49\textwidth}{!}{
+    \begin{tabular}{ccc|cc|c}
+    \toprule[0.5mm]
+    \multirow{2}[2]{*}{MBM} & \multirow{2}[2]{*}{$\mathrm{WEIGHT}(\bm{\lambda})$} & \multirow{2}[2]{*}{$\mathrm{BIAS}(\bm{\lambda})$} & \multicolumn{2}{c|}{Avg.gap} & Best  \\
+          &       &       & Seen (11) &  Unseen (11) & Solution \\
+    \midrule
+    $\times$ & $\checkmark$     & $\checkmark$    & 6.33\% & 10.41\% & 3/22 \\
+    $\checkmark$     & $\times$     & $\times$ & 4.20\% & 8.12\% & 0/22 \\
+    $\checkmark$     & $\times$     & $\checkmark$     & 3.84\% & 8.02\% & 1/22 \\
+    $\checkmark$     & $\checkmark$ & $\times$ & 3.63\% & 7.81\% & 1/22 \\
+    $\checkmark$     & $\checkmark$     & $\checkmark$     & \cellcolor[HTML]{D0CECE}\textbf{2.74\%} & \cellcolor[HTML]{D0CECE}\textbf{7.05\%} & \cellcolor[HTML]{D0CECE}\textbf{17/22} \\
+    \bottomrule[0.5mm]
+    \end{tabular}%
+    }
+  \label{tab:mbm_hyper_bias_mainpaper}%
+\end{table}%
+\paragraph{MBM \& Parameter Generator}
+To further evaluate the effects of MBM, $\mathrm{WEIGHT}(\bm{\lambda})$, and $\mathrm{BIAS}(\bm{\lambda})$ for cross-problem zero-shot generalization, we conduct tests on 11 seen problems and 11 unseen CVRP variants widely studied in \citep{liu2024mtpomo}. As shown in \cref{tab:mbm_hyper_bias_mainpaper}, the full URS model achieves the lowest average gap on both seen and unseen problems, and provides the best solution on the majority of tasks (17/22). This shows that their synergy is essential for robust cross-problem zero-shot generalization. We provide detailed results in Appendix \ref{append:mbm_hyper_bias}.
+
+\begin{table}[t]
+  \centering 
+  \caption{Performance comparison of ablating each UDR component (i.e., $\bm{\rho}$, $\bm{\omega}$, and $\bm{\xi}$)  on seen and unseen variants. Since removing positional identifiers $\bm{\rho}$ prevents the use of instance augmentation, this augmentation technique is disabled across all results to maintain a consistent inference strategy.}
+  \resizebox{0.49\textwidth}{!}{
+    \begin{tabular}{ccc|cc|c}
+    \toprule[0.5mm]
+    \multirow{2}[2]{*}{$\bm{\rho}$} & \multirow{2}[2]{*}{$\bm{\omega}$} & \multirow{2}[2]{*}{$\bm{\xi}$} & \multicolumn{2}{c|}{Avg.gap} & Best  \\
+          &       &       & Seen (11) &  Unseen (11) & Solution \\
+    \midrule
+    $\times$ & $\checkmark$     & $\checkmark$    & 4.65\% & 18.12\% & 3/22 \\
+    $\checkmark$     & $\times$     & $\checkmark$     & 9.81\% & 18.60\% & 0/22 \\
+    $\checkmark$     & $\checkmark$ & $\times$ & 5.43\% & 18.60\% & 4/22 \\
+    $\checkmark$     & $\checkmark$     & $\checkmark$     & \cellcolor[HTML]{D0CECE}\textbf{4.17\%} & \cellcolor[HTML]{D0CECE}\textbf{8.51\%} & \cellcolor[HTML]{D0CECE}\textbf{15/22} \\
+    \bottomrule[0.5mm]
+    \end{tabular}%
+    }
+  \label{tab:udr_summary_main}%
+\end{table}%
+\paragraph{Effects of Each UDR Component}
+To clarify the independent contribution of each UDR component, we conduct ablations by removing each component in turn. As shown in \cref{tab:udr_summary_main}, the absence of any single component leads to notable performance degradation. A complete UDR achieves the lowest average gap, affirming the necessity of our UDR design for robust zero-shot generalization. The detailed results for each VRP variant can be found in Appendix \ref{append:effect_udr_component}.
+
+\paragraph{Hypernetwork vs. Adapter}
+We train URS-Adapter, a URS variant that adopts a distinct decoder for each of the 11 training problems, and compare it with the original URS with a hypernetwork on the same 11 seen problems and large-scale CVRP variants (see Appendix \ref{append:11_adapter} for detailed results). URS consistently outperforms URS-Adapter across the 11 problems seen, achieving higher parameter efficiency. This performance advantage holds consistently across large-scale CVRP variants, further solidifying our conclusion.
+
+\section{Conclusion, Limitation, and Future Work}
+\label{sec:conclusion_limitations}
+In this work, we propose a novel RL-based URS for cross-problem zero-shot generalization. The core of URS is the proposed UDR, which broadens problem coverage by substituting problem enumeration with data unification. Its generalization capability is further enhanced by an MBM and a problem-conditioned parameter generator. Extensive experiments show that URS can produce high-quality solutions for 110 VRP variants without any fine-tuning, including 99 unseen variants, significantly broadening the problem coverage and reducing reliance on domain expertise.
+
+\paragraph{Limitation and Future Work}
+While URS achieves impressive results across a wide range of VRP variants, its current training scheme does not fully account for the inherent disparities in problem complexity. In the future, we aim to explore more effective strategies, such as hierarchical training and difficulty-adaptive sampling, to improve training efficiency. Additionally, extending our method to accommodate more complex variants(e.g., dynamic VRP) is a promising direction for future research. 
+
+% \section*{Accessibility}
+
+% Authors are kindly asked to make their submissions as accessible as possible
+% for everyone including people with disabilities and sensory or neurological
+% differences. Tips of how to achieve this and what to pay attention to will be
+% provided on the conference website \url{http://icml.cc/}.
+
+% \section*{Software and Data}
+
+% If a paper is accepted, we strongly encourage the publication of software and
+% data with the camera-ready version of the paper whenever appropriate. This can
+% be done by including a URL in the camera-ready copy. However, \textbf{do not}
+% include URLs that reveal your institution or identity in your submission for
+% review. Instead, provide an anonymous URL or upload the material as
+% ``Supplementary Material'' into the OpenReview reviewing system. Note that
+% reviewers are not required to look at this material when writing their review.
+
+% % Acknowledgements should only appear in the accepted version.
+\section*{Acknowledgements}
+This work was supported by the National Natural Science Foundation of China (Grant No. 62476118), the Guangdong Provincial Key Laboratory of Fully Actuated System Control Theory and Technology (Grant No. 2024B1212010002), the Natural Science Foundation of Guangdong Province (Grant No. 2024A1515011759), and the Center for Computational Science and Engineering at Southern University of Science and Technology. We would like to thank the anonymous reviewers and (S)ACs of ICML 2026 for their constructive comments and dedicated service to the community. Additionally, we would like to thank Mr. Rongsheng Chen for his valuable advice and assistance during this research.
+% \textbf{Do not} include acknowledgements in the initial version of the paper
+% submitted for blind review.
+
+% If a paper is accepted, the final camera-ready version can (and usually should)
+% include acknowledgements.  Such acknowledgements should be placed at the end of
+% the section, in an unnumbered section that does not count towards the paper
+% page limit. Typically, this will include thanks to reviewers who gave useful
+% comments, to colleagues who contributed to the ideas, and to funding agencies
+% and corporate sponsors that provided financial support.
+\section*{Impact Statement}
+This paper presents work whose goal is to advance the field of Machine Learning. There are many potential societal consequences of our work, none of which we feel must be specifically highlighted here.
+
+% Authors are \textbf{required} to include a statement of the potential broader
+% impact of their work, including its ethical aspects and future societal
+% consequences. This statement should be in an unnumbered section at the end of
+% the paper (co-located with Acknowledgements -- the two may appear in either
+% order, but both must be before References), and does not count toward the paper
+% page limit. In many cases, where the ethical impacts and expected societal
+% implications are those that are well established when advancing the field of
+% Machine Learning, substantial discussion is not required, and a simple
+% statement such as the following will suffice:
+
+% ``This paper presents work whose goal is to advance the field of Machine
+% Learning. There are many potential societal consequences of our work, none
+% which we feel must be specifically highlighted here.''
+
+% The above statement can be used verbatim in such cases, but we encourage
+% authors to think about whether there is content which does warrant further
+% discussion, as this statement will be apparent if the paper is later flagged
+% for ethics review.
+
+
+% In the unusual situation where you want a paper to appear in the
+% references without citing it in the main text, use \nocite
+% \nocite{langley00}
+\bibliography{references}
+\bibliographystyle{icml2026}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% APPENDIX
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\newpage
+\appendix
+\onecolumn
+
+\section{Related Work}
+\label{append:related_work}
+\subsection{Neural Routing Solvers with Single-Task Learning}
+The NCO methods have emerged as a promising paradigm for tackling various routing problems, achieving impressive empirical performance. Early seminal work based on Pointer Networks ignited interest in learning end-to-end construction policies for TSP and CVRP \citep{vinyals2015pointer,bello2016neural,nazari2018reinforcement}. Subsequently, the Transformer-style heavy-encoder and light-decoder auto-regressive architecture has become the dominant paradigm~\citep{kool2019attention}, while POMO~\citep{kwon2020pomo} exploits permutation symmetry to enhance exploration diversity. Many advancements within this paradigm have pushed promising results on small instances (e.g., 100-node TSPs)~\citep{xin2020stepwise,kim2022symnco,xiao2024reinforcement,xiao2023distilling,sun2024regret}. However, models trained on a fixed instance scale often degrade sharply when evaluated out of scale. To mitigate the poor generalization performance, recent studies introduce auxiliary local policies \citep{gao2023elg}, adaptive perception across instance scales~\citep{zhou2024icam}, or different search space reduction methods~\citep{fang2024invit,zhou2025L2R,chen2025projection}. In parallel, "heavy decoder" designs that dynamically recompute embeddings at each construction step~\citep{drakulic2023bq,luo2023lehd} demonstrate strong generalization on large-scale instances. To improve the performance on large-scale routing instances, complementary directions are reducing solving difficulty via problem decomposition~\citep{zheng2024udc,ye2023glop,li2025drhg} or adopting non-autoregressive generation augmented with additional searches (e.g., Monte Carlo tree search (MCTS) and 2-opt)~\citep{fu2021attgcn_mcts,sun2023difusco,qiu2022dimes,li2024T2T,ye2023deepaco}. Moreover, heterogeneous vehicle routing~\citep{li2022hcvrp}, asymmetric distance settings~\citep{kwon2021matnet}, multiple VRPs~\citep{zheng2024dpn}, and pickup-delivery problems~\citep{li2021pdtsp,kong2024efficientpdp} have each motivated tailored neural designs, which have yielded competitive results. Despite these advancements, they still train a specialist model per problem type, limiting cross-problem transfer. We instead focus on a unified neural routing solver that aims to generalize across multiple routing problems without retraining from scratch for each specification. 
+
+\subsection{Neural Routing Solvers with Multi-Task Learning}
+To address the challenge of cross-problem generalization, growing attention has shifted to multi-task learning capable of adapting to diverse routing problems. Existing efforts can broadly fall into two categories: (1) constraint combination-based multi-task learning and (2) adapter-based fine-tuning frameworks. The former line (e.g., MTPOMO~\citep{liu2024mtpomo}) treats VRP variants as combinations of a predefined set of attributes and trains a shared backbone, achieving promising results on up to $16$ VRP variants. Follow-up work extends this paradigm by introducing mixture-of-experts (MoE) modules~\citep{zhou2024mvmoe}, heavy decoder designs plus knowledge distillation~\citep{zheng2025mtl_kd}, and constraint-aware dual-attention~\citep{li2025cada} or updated Transformer structure~\citep{berto2024routefinder} to improve model performance. While this enables knowledge sharing across problems, its coverage is inherently bounded by the hand-specified attribute set. The second family trains a shared backbone and performs adaptation to each variant via lightweight adapters. For instance, \citet{lin2024cross} pretrain a TSP backbone and adapt to new variants through adapter-based fine-tuning. \citet{drakulic2025goal} integrate edge features and adopt supervised multi-task pretraining for obtaining a powerful backbone before fine-tuning on novel tasks. \citet{wang2025mtl_mab} propose a multi-armed bandit strategy to realize more efficient multi-task training. Although these reduce retraining cost, they fail to achieve zero-shot generalization. In contrast, we focus on a constructive neural routing solver supported with zero-shot capability: once trained, it can directly generate high-quality solutions for previously unseen problems without any fine-tuning.
+
+\clearpage
+\section{Setups of VRP Variants}
+\label{append:setup_constraints}
+In this paper, we consider 110 VRP variants which may simultaneously have one or more constraints from the following categories: (1) Capacity (C); (2) Open Route (O); (3) Backhaul (B); (4) Backhaul and Priority (BP); (5) Duration Limit (L); (6) Time Windows (TW); (7) Multi-Depot (MD); (8) Prize Collecting (PC); (9) Asymmetric (A); (10) Pickup and Delivery (PD). The node coordinates are randomly sampled from the unit square when available (in symmetric geometric cases, i.e., $d_{ij}=d_{ji}$), following AM~\citep{kool2019attention}. Below, we provide a comprehensive description of the data generation process for each constraint.
+\paragraph{Capacity (C)}
+The selection of the vehicle capacity $\mathcal{C}$ is critical, as prior work~\citep{luo2025rethinking} demonstrates its significant impact on the solution structure. For PDVRP variants (e.g., PDCVRP, OPDCVRP, APDCVRP, and AOPDCVRP), an excessively large $\mathcal{C}$ causes the solution to approximate that of a PDTSP instance. Conversely, an overly restrictive $\mathcal{C}$ promotes a simplistic, repetitive Pickup-Delivery sequence. To ensure structurally sound solutions, we set $\mathcal{C}$=20 for PDCVRP variants. For all other VRP variants, we adopt the convention from AM~\citep{kool2019attention}, setting $\mathcal{C}$=50.
+
+\paragraph{Open Route (O)}
+The open route setting implies that vehicles are not required to return to the depot after completing their service tours. This does not alter the data generation, and it specifically affects the final cost evaluation by excluding the travel distance from the last customer back to the depot.
+\paragraph{Backhaul (B)}
+The standard CVRP involves vehicles delivering goods from a depot to a set of customers with positive demands. The introduction of backhauls extends this formulation to the CVRP with Backhauls (CVRPB), where vehicles must also load goods from backhaul customers and return them to the depot, in addition to serving the standard linehaul (delivery) customers. Following the experimental setup of MTPOMO~\citep{liu2024mtpomo}, we generate customer demands by sampling from a discrete uniform distribution over the integers $\{1, \ldots, 9\}$. Subsequently, 20\% of these nodes are randomly designated as backhaul customers, and their corresponding demand values are negative, while the remainder are classified as linehaul customers. Notably, no precedence constraints are imposed between the servicing of linehaul and backhaul customers. To ensure the feasibility of the solutions constructed by our neural solver, we adhere to the MVMoE~\citep{zhou2024mvmoe} framework's policy that the first customer visited must be a linehaul node.
+
+\paragraph{Backhaul and Priority (BP)}
+This constraint imposes a strict precedence requirement on the standard CVRPB, dictating that all linehaul customers must be serviced prior to any backhaul customers. Consequently, once a vehicle serves a backhaul customer, it is prohibited from visiting any subsequent linehaul nodes within the same route. If the first customer served is a backhaul node, the vehicle's load is initialized to zero. This ensures the neural solver can construct a feasible solution.
+\paragraph{Duration Limit (L)}
+Following MTPOMO~\citep{liu2024mtpomo}, we impose a duration limit (i.e., the maximum length of each vehicle route) of 3 in symmetric cases. Since the node coordinates are randomly sampled from the unit square, the maximum possible distance between any two nodes is $\sqrt{2}$. The setting is sufficient to ensure a vehicle can deliver goods to at least one customer and return to the depot, thus guaranteeing the feasibility of the solution. For the setting of asymmetric cases, we provide details in the description of the following asymmetric instances.
+\paragraph{Time Windows (TW)}
+Consistent with the MVMoE~\citep{zhou2024mvmoe}, we set time windows of the depot to $[e_0,l_0]$=[0,3] and its service time to 0. The service time $s_i$ for each customer node is set to 0.2. For the time windows for each customer node, we generate them following the methodology outlined in MVMoE~\citep{zhou2024mvmoe}.
+
+\paragraph{Multi-Depot (MD)}
+The generation of coordinates for the multiple depots aligns with that of other nodes, with the number of depots set to 3~\citep{berto2024routefinder}. A vehicle is required to return to the same depot it departed from. To guarantee that each starting node is considered in this multi-depot variant, we set the number of trajectories for an instance to be the product of the number of depots and the number of customer nodes, maximizing the exploration of high-quality solutions.
+
+\paragraph{Prize Collecting (PC)}
+Under the Prize Collecting condition, each node (excluding the depot) is assigned both a prize and a penalty. A prize is collected for each visited node, while a penalty is incurred for each unvisited node. The objective is to minimize the total travel distance plus the sum of penalties for all unvisited nodes. A key constraint is that a minimum amount of total prize must be collected before the vehicle is permitted to return to the depot and terminate its route. In this context, the minimum prize requirement for the four examined problems (PCTSP, SPCTSP, APCTSP, and ASPCTSP) is standardized to 1.0. Consistent with the AM~\citep{kool2019attention} framework, the prizes and penalties are generated as follows: $prize \sim \text{Uniform}\left(0, \frac{4}{n}\right)$, and $penalty \sim \text{Uniform}\left(0, 3 \cdot \frac{k_n}{n}\right)$, where $n=100$ and $k_n=4$ in our experiments. For the OP, the objective is to maximize collected prizes without exceeding a predefined distance limit (set to 4.0 for OP and 1.0 for AOP), where unvisited nodes carry no penalties. The prize for each node is assigned proportional to its Euclidean distance from the depot. By normalizing distances to the instance's maximum distance and discretizing them into $[0.01, 1.00]$, nodes further from the depot systematically yield higher rewards, with the depot's prize set to zero.
+
+
+\paragraph{Asymmetric (A)}
+We adopt the data generation method from MatNet~\citep{kwon2021matnet} to create an asymmetric distance matrix. Due to the small pairwise distances in the generated distance matrix, the parameters for duration limit and time windows set for symmetric cases are not applicable to the asymmetric problems. To ensure the constraints remain valid, we adjust the duration limit and depot end time to 0.6 and 1.0, respectively.
+
+\paragraph{Pickup and Delivery (PD)}
+For PDP variants, we adhere to the methodology in ~\citet{li2021pdtsp}. For a problem of size $N$, node $0$ is set to the depot, nodes $1$ to $N/2$ are designated as pickup nodes, while nodes from $N/2+1$ to $N$ are designated as delivery nodes.  For each pickup node $v_i$, its corresponding delivery node is $v_{i+N/2}$. A strict precedence constraint is imposed in PDP cases, requiring each vehicle to visit a pickup node before its corresponding delivery node. For PDCVRP variants, the demand for each delivery node is randomly sampled from a discrete uniform distribution over $\{1,2,\ldots,9\}$. The demand for each pickup node is then set to the negative of its corresponding delivery node's demand. To ensure the feasibility of the constraints, the vehicle capacity is set to $20$. 
+
+\clearpage
+\section{Unified Data Representation}
+\label{append:udr}
+
+In this section, we provide a detailed description of our UDR $\bm{U}=\{\mathbf{u}_{i}\}_{i=0}^{n}$ (see \cref{tab:udr_attributes}). Each node $\mathbf{u}_{i}$ consists of three components, i.e., $\mathbf{u}_{i}=\{\bm{\rho}_{i},\ \bm{\omega}_{i},\ \bm{\xi}_{i}\}$, where $\bm{\rho}_{i},\ \bm{\omega}_{i},\ \bm{\xi}_{i}$ are a positional identifier, unified attribute set, and node-type indicator, respectively. To distinguish linehaul/delivery from backhaul/pickup nodes, we assign negative demand values to backhaul/pickup nodes (positive for linehaul/delivery), making demand the only signed component, following ~\citep{liu2024mtpomo,zhou2024mvmoe}. 
+
+\begin{table}[h!]
+\centering
+\caption{Detailed description of each component in UDR.}
+\label{tab:udr_attributes}
+\resizebox{0.99\textwidth}{!}{
+\begin{tabular}{l|l|c|l|l}
+\toprule[0.5mm]
+Attribute Name & Symbol  & Range & Description & Examples \\
+\midrule
+Random Identifier & $\eta$  & $[0,1]$ & Random scalar for asymmetric problems. & ATSP \\
+Node Coordinates & $\{x, y\}$  & $[0,1]^2$ & 2D coordinates of the node. & TSP, CVRP \\
+\midrule
+Demand & $\delta$  & $[-1,1]$ & Node demand ($+$ for delivery, $-$ for pickup). & CVRP, PDCVRP \\
+Prize & $\epsilon$  & $[0,1]$ & Prize collected for each node. & OP, PCTSP \\
+Penalty & $\mu$  & $[0,1]$ & Penalty incurred for each node. & PCTSP \\
+Earliest Arrival Time & $e$ & $[0,1]$ & Earliest permissible arrival time. & CVRPTW \\
+Latest Arrival Time & $l$  & $[0,1]$ & Latest permissible arrival time (deadline). & CVRPTW \\
+Service Time & $s$  & $[0,1]$ & Time required for service at the node. & CVRPTW \\
+\midrule
+Depot & $-$  & $\{0, 1\}$ & Indicates if the node is a depot. & CVRP \\
+Pickup Node & $-$  & $\{0, 1\}$ & Indicates if the node is a pickup location. & PDTSP \\
+Delivery Node & $-$  & $\{0, 1\}$ & Indicates if the node is a delivery location. & CVRP, PDTSP \\
+Node in Sub-routes & $-$ & $\{0, 1\}$ & The solution $\pi$ can have sub-routes. & CVRP \\
+Node in Open Route & $-$  & $\{0, 1\}$ & Vehicles need not return to the depot. & OCVRP \\
+\bottomrule[0.5mm]
+\end{tabular}
+}
+\end{table}
+
+
+\clearpage
+\section{Multi-hot Problem Representation}
+\label{append:multi_hot}
+Leveraging the UDR, each problem instance activates only a subset of the unified feature space. Thus, for any instance $\mathcal{G}_{i}$ from different problems, we simply mark active (non-zero) feature slots with 1 to obtain a corresponding multi-hot problem representation $\bm{\lambda}_{i}$. Different from raw feature values, it encodes presence only and provides conditional signals to the following position bias weight (see \cref{eq:bias}) and adaptive decoder (see \cref{eq:decoder_aafm} and \cref{eq:compatibility}), helping the model distinguish variants and refine node selection. Here, we provide detailed representations for each problem in our experiments, and each problem is a 13-dimensional multi-hot vector. 
+
+As shown in \cref{tab:problem_attributes_seen}, we train URS on eleven classic and varied routing problems to ensure that each feature in the UDR has been seen at least once, i.e., $\mathcal{P}=\{P_i\}_{i=1}^{11}$. We adhere to the principle of minimal redundancy and strictly align with existing work on CVRP variant selection (e.g., MVMoE~\citep{zhou2024mvmoe} and ReLD~\citep{huang2025reld}): most features in UDR appear in at least two training problems, helping prevent URS from overfitting to a single problem. The only exception is the Penalty attribute, as there is structural similarity between the seen PCTSP and unseen SPCTSP. For more detailed analysis and experimental results, please see Appendix \ref{append:problem_selection}.
+
+Then, we evaluate generalization on unseen problems on different combinations of ten constraint attributes (see Appendix \ref{append:setup_constraints}), and the detailed representations of each unseen problem can be found in \cref{tab:problem_attributes_unseen_RF} (unseen well-studied VRP variants) and \cref{tab:problem_attributes_unseen_A_PD} (unseen less-explored VRP variants).
+\begin{table}[h!]
+  \centering
+  \caption{The representations for seen routing problems in our experiments. The total number of problems is 11. In training, each feature in the UDR has been seen at least once. Here, RI represents the random identifier, and EAT, LAT, and ST indicate the earliest arrival time, the latest arrival time, and the service time, respectively.}
+  \label{tab:problem_attributes_seen}
+  \resizebox{0.99\textwidth}{!}{
+  \begin{tabular}{l|l|cc|cccccc|ccccc}
+    \toprule[0.5mm]
+     Problem&Oracle &RI & Coord. & Demand & Prize & Penalty & EAT & LAT & ST & Depot & Pickup & Delivery & Sub-routes  & Open Route \\
+    \midrule
+    ATSP&LKH-3 & $\checkmark$ & & & & & & & & & & & & \\
+    TSP&LKH-3 & & $\checkmark$ & & & & & & & & & & & \\
+    OP&Compass & & $\checkmark$ & & $\checkmark$ & & & & & $\checkmark$ & & & & \\
+    PCTSP&ILS & & $\checkmark$ & & $\checkmark$ & $\checkmark$ & & & & $\checkmark$ & & & & \\
+    PDTSP&LKH-3 & & $\checkmark$ & & & & & & & $\checkmark$ & $\checkmark$ & $\checkmark$ & & \\
+    ACVRP&PyVRP & $\checkmark$ & & $\checkmark$ & & & & & & $\checkmark$ & & $\checkmark$ & $\checkmark$ & \\
+    CVRP&PyVRP & & $\checkmark$ & $\checkmark$ & & & & & & $\checkmark$ & & $\checkmark$ & $\checkmark$ & \\
+    CVRPTW&PyVRP & & $\checkmark$ & $\checkmark$ & & & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & & $\checkmark$ & $\checkmark$ & \\
+    CVRPB&OR-Tools & & $\checkmark$ & $\checkmark$ & & & & & & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & \\
+    OCVRP&LKH-3 & & $\checkmark$ & $\checkmark$ & & & & & & $\checkmark$ & & $\checkmark$ & $\checkmark$ & $\checkmark$ \\
+    OCVRPTW&OR-Tools & & $\checkmark$ & $\checkmark$ & & & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & & $\checkmark$ & $\checkmark$ & $\checkmark$ \\
+    \midrule
+    \multicolumn{2}{c|}{Frequency }& 2/11 &9/11 & 6/11& 2/11& 1/11& 2/11& 2/11& 2/11& 9/11& 2/11& 7/11& 6/11& 2/11\\ 
+    \bottomrule[0.5mm]
+  \end{tabular}
+  }
+\end{table}
+
+\begin{table}[h!]
+  \centering
+  \caption{The problem representations of unseen $44$ well-studied VRP variants. Here, RI represents the random identifier, and EAT, LAT, and ST indicate the earliest arrival time, the latest arrival time, and the service time, respectively.}
+  \label{tab:problem_attributes_unseen_RF}
+  \resizebox{0.99\textwidth}{!}{
+  \begin{tabular}{l|l|cc|cccccc|ccccc}
+    \toprule[0.5mm]
+    Problem&Oracle &RI & Coord. & Demand & Prize & Penalty & EAT & LAT & ST & Depot & Pickup & Delivery & Sub-routes  & Open Route \\
+    \midrule
+    CVRPL&LKH-3      & & $\checkmark$ & $\checkmark$ & & & & & & $\checkmark$ & & $\checkmark$ & $\checkmark$ & \\
+    OCVRPB&OR-Tools     & & $\checkmark$ & $\checkmark$ & & & & & & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ \\
+    CVRPBL&OR-Tools     & & $\checkmark$ & $\checkmark$ & & & & & & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & \\
+    CVRPLTW&OR-Tools    & & $\checkmark$ & $\checkmark$ & & & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & & $\checkmark$ & $\checkmark$ & \\
+    OCVRPBTW&OR-Tools   & & $\checkmark$ & $\checkmark$ & & & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ \\
+    CVRPBLTW&OR-Tools   & & $\checkmark$ & $\checkmark$ & & & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & \\
+    OCVRPL&OR-Tools     & & $\checkmark$ & $\checkmark$ & & & & & & $\checkmark$ & & $\checkmark$ & $\checkmark$ & $\checkmark$ \\
+    CVRPBTW&OR-Tools    & & $\checkmark$ & $\checkmark$ & & & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & \\
+    OCVRPBL&OR-Tools    & & $\checkmark$ & $\checkmark$ & & & & & & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ \\
+    OCVRPLTW&OR-Tools   & & $\checkmark$ & $\checkmark$ & & & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & & $\checkmark$ & $\checkmark$ & $\checkmark$ \\
+    OCVRPBLTW&OR-Tools  & & $\checkmark$ & $\checkmark$ & & & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ \\
+    CVRPBP&OR-Tools     & & $\checkmark$ & $\checkmark$ & & & & & & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & \\
+    OCVRPBP&OR-Tools    & & $\checkmark$ & $\checkmark$ & & & & & & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ \\
+    CVRPBPL&OR-Tools    & & $\checkmark$ & $\checkmark$ & & & & & & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & \\
+    OCVRPBPTW&OR-Tools  & & $\checkmark$ & $\checkmark$ & & & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ \\
+    CVRPBPLTW&OR-Tools   & & $\checkmark$ & $\checkmark$ & & & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & \\
+    CVRPBPTW&OR-Tools   & & $\checkmark$ & $\checkmark$ & & & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & \\
+    OCVRPBPL&OR-Tools   & & $\checkmark$ & $\checkmark$ & & & & & & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ \\
+    OCVRPBPLTW&OR-Tools  & & $\checkmark$ & $\checkmark$ & & & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ \\
+    \midrule
+    MDCVRP &PyVRP      & & $\checkmark$ & $\checkmark$ & & & & & & $\checkmark$ & & $\checkmark$ & $\checkmark$ & \\
+    MDCVRPTW &PyVRP    & & $\checkmark$ & $\checkmark$ & & & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & & $\checkmark$ & $\checkmark$ & \\
+    MDOCVRP &PyVRP     & & $\checkmark$ & $\checkmark$ & & & & & & $\checkmark$ & & $\checkmark$ & $\checkmark$ & $\checkmark$ \\
+    MDCVRPL &PyVRP     & & $\checkmark$ & $\checkmark$ & & & & & & $\checkmark$ & & $\checkmark$ & $\checkmark$ & \\
+    MDCVRPB &PyVRP     & & $\checkmark$ & $\checkmark$ & & & & & & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & \\
+    MDOCVRPTW &PyVRP   & & $\checkmark$ & $\checkmark$ & & & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & & $\checkmark$ & $\checkmark$ & $\checkmark$ \\
+    MDOCVRPB &PyVRP    & & $\checkmark$ & $\checkmark$ & & & & & & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ \\
+    MDCVRPBL &PyVRP    & & $\checkmark$ & $\checkmark$ & & & & & & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & \\
+    MDCVRPLTW &PyVRP   & & $\checkmark$ & $\checkmark$ & & & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & & $\checkmark$ & $\checkmark$ & \\
+    MDOCVRPBTW &PyVRP  & & $\checkmark$ & $\checkmark$ & & & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ \\
+    MDCVRPBLTW &PyVRP  & & $\checkmark$ & $\checkmark$ & & & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & \\
+    MDOCVRPL &PyVRP    & & $\checkmark$ & $\checkmark$ & & & & & & $\checkmark$ & & $\checkmark$ & $\checkmark$ & $\checkmark$ \\
+    MDCVRPBTW&PyVRP    & & $\checkmark$ & $\checkmark$ & & & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & \\
+    MDOCVRPBL &PyVRP   & & $\checkmark$ & $\checkmark$ & & & & & & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ \\
+    MDOCVRPLTW &PyVRP  & & $\checkmark$ & $\checkmark$ & & & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & & $\checkmark$ & $\checkmark$ & $\checkmark$ \\
+    MDOCVRPBLTW&PyVRP  & & $\checkmark$ & $\checkmark$ & & & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ \\
+    MDCVRPBP &PyVRP    & & $\checkmark$ & $\checkmark$ & & & & & & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & \\
+    MDOCVRPBP&PyVRP    & & $\checkmark$ & $\checkmark$ & & & & & & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ \\
+    MDCVRPBPL &PyVRP   & & $\checkmark$ & $\checkmark$ & & & & & & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & \\
+    MDOCVRPBPTW&PyVRP  & & $\checkmark$ & $\checkmark$ & & & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ \\
+    MDCVRPBPLTW &PyVRP  & & $\checkmark$ & $\checkmark$ & & & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & \\
+    MDCVRPBPTW &PyVRP   & & $\checkmark$ & $\checkmark$ & & & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & \\
+    MDOCVRPBPL&PyVRP   & & $\checkmark$ & $\checkmark$ & & & & & & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ \\
+    MDOCVRPBPLTW&PyVRP  & & $\checkmark$ & $\checkmark$ & & & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ \\
+    \midrule
+    SPCTSP& ILS     & & $\checkmark$ & & $\checkmark$ & $\checkmark$ & & & & $\checkmark$ & & & & \\
+    \bottomrule[0.5mm]
+  \end{tabular}
+  }
+\end{table}
+
+
+
+\begin{table}[h!]
+  \centering
+  \caption{The problem representations of unseen $55$ less-explored VRP variants. Here, RI represents the random identifier, and EAT, LAT, and ST indicate the earliest arrival time, the latest arrival time, and the service time, respectively.}
+  \label{tab:problem_attributes_unseen_A_PD}
+  \resizebox{0.99\textwidth}{!}{
+  \begin{tabular}{l|l|cc|cccccc|ccccc}
+    \toprule[0.5mm]
+    Problem&Oracle &RI & Coord. & Demand & Prize & Penalty & EAT & LAT & ST & Depot & Pickup & Delivery & Sub-routes  & Open Route \\
+    \midrule
+    ACVRPTW&OR-Tools     & $\checkmark$ & & $\checkmark$ & & & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & & $\checkmark$ & $\checkmark$ & \\
+    AOCVRP&OR-Tools      & $\checkmark$ & & $\checkmark$ & & & & & & $\checkmark$ & & $\checkmark$ & $\checkmark$ & $\checkmark$ \\
+    ACVRPL&OR-Tools      & $\checkmark$ & & $\checkmark$ & & & & & & $\checkmark$ & & $\checkmark$ & $\checkmark$ & \\
+    ACVRPB&OR-Tools      & $\checkmark$ & & $\checkmark$ & & & & & & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & \\
+    AOCVRPTW&OR-Tools    & $\checkmark$ & & $\checkmark$ & & & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & & $\checkmark$ & $\checkmark$ & $\checkmark$ \\
+    AOCVRPB&OR-Tools     & $\checkmark$ & & $\checkmark$ & & & & & & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ \\
+    ACVRPBL&OR-Tools     & $\checkmark$ & & $\checkmark$ & & & & & & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & \\
+    ACVRPLTW&OR-Tools    & $\checkmark$ & & $\checkmark$ & & & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & & $\checkmark$ & $\checkmark$ & \\
+    AOCVRPBTW&OR-Tools   & $\checkmark$ & & $\checkmark$ & & & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ \\
+    ACVRPBLTW&OR-Tools   & $\checkmark$ & & $\checkmark$ & & & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & \\
+    AOCVRPL&OR-Tools     & $\checkmark$ & & $\checkmark$ & & & & & & $\checkmark$ & & $\checkmark$ & $\checkmark$ & $\checkmark$ \\
+    ACVRPBTW&OR-Tools    & $\checkmark$ & & $\checkmark$ & & & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & \\
+    AOCVRPBL&OR-Tools    & $\checkmark$ & & $\checkmark$ & & & & & & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ \\
+    AOCVRPLTW&OR-Tools   & $\checkmark$ & & $\checkmark$ & & & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & & $\checkmark$ & $\checkmark$ & $\checkmark$ \\
+    AOCVRPBLTW&OR-Tools  & $\checkmark$ & & $\checkmark$ & & & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ \\
+    ACVRPBP&OR-Tools     & $\checkmark$ & & $\checkmark$ & & & & & & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & \\
+    AOCVRPBP&OR-Tools    & $\checkmark$ & & $\checkmark$ & & & & & & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ \\
+    ACVRPBPL&OR-Tools    & $\checkmark$ & & $\checkmark$ & & & & & & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & \\
+    AOCVRPBPTW&OR-Tools  & $\checkmark$ & & $\checkmark$ & & & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ \\
+    ACVRPBPLTW&OR-Tools   & $\checkmark$ & & $\checkmark$ & & & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & \\
+    ACVRPBPTW&OR-Tools    & $\checkmark$ & & $\checkmark$ & & & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & \\
+    AOCVRPBPL&OR-Tools   & $\checkmark$ & & $\checkmark$ & & & & & & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ \\
+    AOCVRPBPLTW&OR-Tools  & $\checkmark$ & & $\checkmark$ & & & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ \\
+    \midrule
+    AMDCVRP&OR-Tools       & $\checkmark$ & & $\checkmark$ & & & & & & $\checkmark$ & & $\checkmark$ & $\checkmark$ & \\
+    AMDCVRPTW&OR-Tools     & $\checkmark$ & & $\checkmark$ & & & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & & $\checkmark$ & $\checkmark$ & \\
+    AMDOCVRP&OR-Tools      & $\checkmark$ & & $\checkmark$ & & & & & & $\checkmark$ & & $\checkmark$ & $\checkmark$ & $\checkmark$ \\
+    AMDCVRPL&OR-Tools      & $\checkmark$ & & $\checkmark$ & & & & & & $\checkmark$ & & $\checkmark$ & $\checkmark$ & \\
+    AMDCVRPB&OR-Tools      & $\checkmark$ & & $\checkmark$ & & & & & & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & \\
+    AMDOCVRPTW&OR-Tools    & $\checkmark$ & & $\checkmark$ & & & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & & $\checkmark$ & $\checkmark$ & $\checkmark$ \\
+    AMDOCVRPB&OR-Tools     & $\checkmark$ & & $\checkmark$ & & & & & & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ \\
+    AMDCVRPBL&OR-Tools     & $\checkmark$ & & $\checkmark$ & & & & & & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & \\
+    AMDCVRPLTW &OR-Tools   & $\checkmark$ & & $\checkmark$ & & & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & & $\checkmark$ & $\checkmark$ & \\
+    AMDOCVRPBTW&OR-Tools   & $\checkmark$ & & $\checkmark$ & & & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ \\
+    AMDCVRPBLTW&OR-Tools   & $\checkmark$ & & $\checkmark$ & & & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & \\
+    AMDOCVRPL&OR-Tools     & $\checkmark$ & & $\checkmark$ & & & & & & $\checkmark$ & & $\checkmark$ & $\checkmark$ & $\checkmark$ \\
+    AMDCVRPBTW&OR-Tools    & $\checkmark$ & & $\checkmark$ & & & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & \\
+    AMDOCVRPBL&OR-Tools    & $\checkmark$ & & $\checkmark$ & & & & & & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ \\
+    AMDOCVRPLTW&OR-Tools   & $\checkmark$ & & $\checkmark$ & & & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & & $\checkmark$ & $\checkmark$ & $\checkmark$ \\
+    AMDOCVRPBLTW&OR-Tools  & $\checkmark$ & & $\checkmark$ & & & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ \\
+    AMDCVRPBP&OR-Tools     & $\checkmark$ & & $\checkmark$ & & & & & & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & \\
+    AMDOCVRPBP&OR-Tools    & $\checkmark$ & & $\checkmark$ & & & & & & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ \\
+    AMDCVRPBPL&OR-Tools    & $\checkmark$ & & $\checkmark$ & & & & & & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & \\
+    AMDOCVRPBPTW&OR-Tools  & $\checkmark$ & & $\checkmark$ & & & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ \\
+    AMDCVRPBPLTW&OR-Tools   & $\checkmark$ & & $\checkmark$ & & & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & \\
+    AMDCVRPBPTW&OR-Tools    & $\checkmark$ & & $\checkmark$ & & & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & \\
+    AMDOCVRPBPL&OR-Tools   & $\checkmark$ & & $\checkmark$ & & & & & & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ \\
+    AMDOCVRPBPLTW &OR-Tools & $\checkmark$ & & $\checkmark$ & & & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ \\
+   \midrule
+    APDTSP& OR-Tools    & $\checkmark$ & & & & & & & & $\checkmark$ & $\checkmark$ & $\checkmark$ & & \\
+    APDCVRP& OR-Tools    & $\checkmark$ & & $\checkmark$ & & & & & & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & \\
+    AOPDCVRP& OR-Tools   & $\checkmark$ & & $\checkmark$ & & & & & & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ \\
+     PDCVRP& OR-Tools     & & $\checkmark$ & $\checkmark$ & & & & & & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & \\
+    OPDCVRP& OR-Tools    & & $\checkmark$ & $\checkmark$ & & & & & & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ \\
+    \midrule
+    AOP&OR-Tools &$\checkmark$ &  & & $\checkmark$ & & & & & $\checkmark$ & & & & \\
+    APCTSP&OR-Tools &$\checkmark$  & & & $\checkmark$ & $\checkmark$ & & & & $\checkmark$ & & & & \\
+    ASPCTSP& N/A     &$\checkmark$ &  & & $\checkmark$ & $\checkmark$ & & & & $\checkmark$ & & & & \\
+    \bottomrule[0.5mm]
+  \end{tabular}
+  }
+\end{table}
+
+
+
+
+
+\clearpage
+\section{Model Architecture and Training}
+\label{append:model_architecture}
+
+\subsection{Encoder}
+\label{append:encoder}
+Similar to previous work~\citep{kool2019attention,kwon2020pomo}, we also use the encoder composed of $L$ stacked attention layers, where each attention layer consists of two sub-layers: an attention sub-layer and a Feed-Forward (FF) sub-layer, both of which use Instance Normalization~\citep{ulyanov2016instanceNorm} and skip-connection~\citep{he2016skip}.
+
+The encoder $\bm{\theta}_{enc}$ with $L$ stacked attention layers transforms $H^{(0)}$ into advanced node embeddings $H^{(L)}=\{\mathbf{h}_i^{(L)}\}_{i=0}^n$. Let ${H}^{(\ell-1)} = \{\mathbf{h}_{i}^{(\ell-1)}\}_{i=0}^{n}$ denote the input to the $\ell$-th attention layer for $\ell = 1, \ldots, L$. The outputs for the $i$-th node are computed as follows:
+\begin{equation}
+\widetilde{\mathbf{h}}_i^{(\ell)} = \mathrm{IN}^{(\ell)}\left(\mathbf{h}_i^{(\ell-1)} + \mathrm{MBM}^{(\ell)}\left(\mathbf{h}_i^{(\ell-1)},H^{(\ell-1)}, \bm{D},\bm{D}^{\mathrm{T}},\bm{R}\right)\right),
+\label{eq:attention_layer_mbm}
+\end{equation}
+\begin{equation}
+    \mathbf{h}_i^{(\ell)} = \mathrm{IN}^{(\ell)}\left(\mathbf{\widetilde{h}}_i^{(\ell)} + \mathrm{FF}^{(\ell)}\left(\mathbf{\widetilde{h}}_i^{(\ell)}\right)\right),
+\label{eq:FF_layer}
+\end{equation}
+where $\mathrm{IN}(\cdot)$ denotes instance normalization~\citep{ulyanov2016instanceNorm}, $\mathrm{MBM}$ represents the adopted mixed bias module (see \cref{eq:mixed_bias_module} for details), and $\mathrm{FF}(\cdot)$ in \cref{eq:FF_layer} corresponds to a fully connected neural network with ReLU activation. After $L$ attention layers, the final node embeddings $H^{(L)}=\{\mathbf{h}_i^{(L)}\}_{i=0}^n$ encapsulate the advanced feature representations of each node. Notably, to ensure dimensional consistency across bias channels, we normalize $\bm{D}$ and $\bm{D^{\mathrm{T}}}$ by dividing their maximum value before passing the MBM. 
+
+
+\subsection{Decoder}
+\label{append:decoder}
+In URS, all parameters $\bm{\theta}_{dec}(\bm{\lambda})$ are adaptively generated conditioned on the multi-hot problem representation $\bm{\lambda}$ (see Appendix \ref{append:multi_hot} for detailed problem representations). $\bm{\theta}_{dec}(\bm{\lambda})$ includes two MLP networks, which are $\mathrm{WEIGHT}(\bm{\lambda})$ and $\mathrm{BIAS}(\bm{\lambda})$. $\mathrm{WEIGHT}(\bm{\lambda})$ is used to generate linear projection matrices $[W_{Q}(\bm{\lambda}),\ W_{K}(\bm{\lambda}),\ W_{V}(\bm{\lambda})]$. $\mathrm{BIAS}(\bm{\lambda})$ in \cref{eq:bias} is used to generate bias weights for $\mathrm{Attention}(\cdot)$(see \cref{eq:decoder_aafm}) and compatibility (see \cref{eq:compatibility}).
+
+For $\mathrm{WEIGHT}(\bm{\lambda})$, we use a multi-layer MLP hypernetwork conditioned on a 13-dimensional problem representation $\bm{\lambda}$ to generate problem-specific adaptive parameters. Note that we factor $W_{Q}(\bm{\lambda}) \in \mathbb{R}^{(2d+1)\times d}$ into three vertically concatenated blocks $W_{\text{first}}(\bm{\lambda})\in \mathbb{R}^{d\times d}, W_{\text{last}}(\bm{\lambda}) \in \mathbb{R}^{d\times d}$ and $W_{C}(\bm{\lambda}) \in \mathbb{R}^{1\times d}$, applied respectively to the first visited node $\mathbf{h}_{\pi_1}^{(L)}$, the last visited node $\mathbf{h}_{\pi_{t-1}}^{(L)}$, and a scalar state feature $C_t \in \mathbb{R}^{1}$ (see Appendix \ref{append:problem_state} for more details). Thus $\mathrm{WEIGHT}(\bm{\lambda})$ outputs the linear projection matrices $\{W_{\text{first}}(\bm{\lambda}), W_{\text{last}}(\bm{\lambda}), W_{C}(\bm{\lambda}), W_{K}(\bm{\lambda}), W_{V}(\bm{\lambda})\}$. 
+
+Furthermore, we adopt the parameter compression technique of \citet{ha2016hypernetworks} to control model size. Specifically, we first generate an advanced embedding matrix $\bm{H}_{\text{dec}}(\bm{\lambda})=[\bm{h}_{\text{dec}}^i(\bm{\lambda})| i=1,2,\ldots,5] \in \mathbb{R}^{5 \times |\bm{\lambda}|}$ whose five row embeddings each parameterize one target projection matrix. It can be computed via three consecutive linear projections:
+\begin{equation}
+    \bm{H}_{\text{dec}}(\bm{\lambda}) =   ((\bm{\lambda} W_1+\mathbf{b}_{1})W_2 +\mathbf{b}_{2})W_3 +\mathbf{b}_3,
+    \label{eq:hyper_embeddings}
+\end{equation}
+where $W_1 \in \mathbb{R}^{|\bm{\lambda}|\times d_h},\  W_2 \in \mathbb{R}^{d_h\times d_h},\  W_3 \in \mathbb{R}^{d_h\times (5 \times |\bm{\lambda}|)},\  \mathbf{b}_1\in \mathbb{R}^{d_h},\  \mathbf{b}_2\in \mathbb{R}^{d_h}, \mathbf{b}_3\in \mathbb{R}^{(5 \times |\bm{\lambda}|)}$ are learnable parameters, $d_h$ is $256$ in this work, following~\citet{lin2022pareto}. Next, we use five different linear projections to map the new representation $\bm{h}_{\text{dec}}^i(\bm{\lambda})$ of each row to the corresponding decoder parameters. The computation can be expressed as:
+\begin{equation}
+    W_{\text{first}}(\bm{\lambda}) = \bm{h}_{\text{dec}}^1(\bm{\lambda})W^{1}_{\textbf{hyper}}, \ W_{\text{last}}(\bm{\lambda}) = \bm{h}_{\text{dec}}^2(\bm{\lambda})W^{2}_{\textbf{hyper}},\ 
+    W_{C}(\bm{\lambda}) = \bm{h}_{\text{dec}}^3(\bm{\lambda})W^{3}_{\textbf{hyper}},
+\end{equation}
+\begin{equation}
+    W_{K}(\bm{\lambda}) = \bm{h}_{\text{dec}}^4(\bm{\lambda})W^{4}_{\textbf{hyper}}, \ W_{V}(\bm{\lambda}) = \bm{h}_{\text{dec}}^5(\bm{\lambda})W^{5}_{\textbf{hyper}},
+\end{equation}
+where $W^{1}_{\textbf{hyper}}\in \mathbb{R}^{|\bm{\lambda}|\times (d\times d)}$, $W^{2}_{\textbf{hyper}}\in \mathbb{R}^{|\bm{\lambda}|\times (d\times d)}$, $W^{3}_{\textbf{hyper}}\in \mathbb{R}^{|\bm{\lambda}|\times (1\times d)}$, $W^{4}_{\textbf{hyper}}\in \mathbb{R}^{|\bm{\lambda}|\times (d\times d)}$, $W^{5}_{\textbf{hyper}}\in \mathbb{R}^{|\bm{\lambda}|\times (d\times d)}$ are learnable parameters. In this way, we use a simple MLP hypernetwork $\mathrm{WEIGHT}(\bm{\lambda})$ to generate used linear projection matrices $\{W_{Q}(\bm{\lambda}),\ W_{K}(\bm{\lambda}),\ W_{V}(\bm{\lambda})\}$ conditioned on the multi-hot problem representation $\bm{\lambda}$, enabling the adaptive construction of high-quality solutions for different problems.
+
+\subsection{Problem State $C_{t}$}
+\label{append:problem_state}
+In this section, we detail the problems that require additional state signals. If a problem is not mentioned in this section, it means we will not apply any extra state to it, i.e., $C_{t}=0$. 
+
+For all problems with the capacity constraint, we explicitly impose \textbf{only remaining load}, while diverse additional constraints (e.g., time windows, duration limit, and backhaul) are enforced implicitly as $\mathcal{M}_t$ masks infeasible candidate nodes to guarantee valid solutions, instead of being fully enumerated in the input of the decoder. For OP and AOP, we keep track of the remaining maximum length at time $t$, and $C_t$ represents the remaining routing length that can be moved, and we normalize it to $[0,1]$ by dividing by the maximum length (i.e., 4.0 in OP100 and 1.0 in AOP100). The setting is the same as AM~\citep{kool2019attention}. For (A)PCTSP and (A)SPCTSP, $C_t$ is the remaining prize to collect, and we do not provide any information about the penalties, as this is irrelevant for the remaining decisions, following~\citet{kool2019attention}. For the problem state, we provide an ablation study in Appendix \ref{append:ablation_constraints}.
+
+\subsection{Training}
+\label{append:training}
+
+Following~\citet{kwon2020pomo}, we use $n$ trajectories with distinct starting nodes in training. URS is trained by the REINFORCE~\citep{williams1992reinforce} algorithm with a shared baseline~\citep{kwon2020pomo}:
+\begin{equation}
+    \nabla_\theta \mathcal{L} (\bm{\theta}) = \mathbb{E}_{p(\bm{\pi}| \mathcal{G},{\bm{\theta}})}[ 
+    (f(\bm{\pi} | \mathcal{G})-\frac{1}{n} \sum_{i=1}^n f(\bm{\pi}^{i} | \mathcal{G}))
+    \nabla_{\bm{\theta}} \log p_{\bm{\theta}}\left(\bm{\pi} | \mathcal{G}\right) ],
+    \label{eq:mean_loss}
+\end{equation}
+\begin{equation}
+    p_{\bm{\theta}}(\bm{\pi}\mid \mathcal{G})=\prod_{t=2}^{n}
+    p_{\bm{\theta}}(\pi_t\mid \mathcal{G},\pi_{1:t-1}),
+    \label{eq:construct_solution}
+\end{equation}
+where the objective function $f(\bm{\pi} | \mathcal{G})$ represents the total reward (e.g., the negative value of tour length) of instance $\mathcal{G}$ given a specific solution $\bm{\pi}$.
+
+
+
+\section{Adaptation Attention Free Module}
+\label{append:aafm}
+Following \citet{zhou2024icam}, we implement $\mathrm{Attention}(\cdot)$ using an adaptation attention free module (AAFM) to enhance geometric pattern recognition for routing problems. Given the input $X$, the AAFM computation is then expressed as:
+\begin{equation}
+Q = XW^{Q}, \quad K = XW^{K}, \quad V = XW^{V},
+\label{eq:qkv}
+\end{equation}
+\begin{equation}
+\mathrm{Attention}(Q,K,V,A) = \sigma (Q) \odot \frac{\exp (A) (\exp (K) \odot V)}{\exp (A)\exp (K)},
+\label{eq:AAFM}
+\end{equation}
+where $W^{Q}$, $W^{K}$, and $W^{V}$ are learnable matrices. $\sigma$ denotes the sigmoid function, $\odot$ represents the element-wise product, and $A = \{a_{ij}\}$ denotes the pair-wise adaptation bias. For distance matrices, the corresponding adaptation bias $f\left(\alpha,N,d_{ij}\right)=-\alpha\cdot\log_2{N}\cdot d_{i,j}$. Here, $N$ denotes the total number of nodes (i.e., problem size), and $\alpha$ is generated via a lightweight network $\mathrm{BIAS}(\bm{\lambda})$ in our paper (see \cref{eq:bias}). Notably, for the relation matrix, we remove the scale $N$ in the calculation of adaptation bias because the relation is scale-independent. Compared to multi-head attention (MHA)~\citep{vaswani2017attention}, AAFM enables the model to explicitly capture instance-specific knowledge by updating pair-wise adaptation biases while exhibiting lower computational overhead. Further details are provided in the related work mentioned above. 
+
+\section{Comparison between Different Attention Mechanisms}
+\label{append:compare_msa}
+\begin{table*}[htbp]
+\vskip 0.15in
+\centering
+\caption{Comparison between different attention mechanisms. Here, $N,d,m$ denote the sequence length, feature dimension, and extra hidden layer dimension of mixed-score attention, respectively. Values in parentheses represent the percentage increase or decrease relative to URS and Avg. Peak VRAM represents the average peak VRAM per instance.}
+%\scalebox{0.9}
+\resizebox{\textwidth}{!}{
+\begin{tabular}{l |c c c cc}
+\toprule[0.5mm]
+Attention Mechanism & Time Complexity                   & Space Complexity            & \#Params & Avg.Peak VRAM & Inference Time   \\ 
+\midrule
+Multi-Head Attention    & $\mathcal{O}(N^{2} d)$    & $\mathcal{O}(N^{2} + Nd)$       &$3.32$M$(\times0.7)$ &$1.87$MB$(\times0.99)$ & $0.92$s$(\times0.9)$ \\
+Mixed-Score Attention (Parallel)        & $\mathcal{O}(N^2(d+m))$   & $\mathcal{O}(N^{2}m + Nd)$ &$16.17$M$(\times3.3)$ &$25.64$MB$(\times13.6)$& $3.64$s$(\times3.7)$ \\
+\midrule
+Mixed Bias Module (Ours)        & $\mathcal{O}(N^2 d)$   & $\mathcal{O}(N^{2} + Nd)$ & $4.96$M &$1.89$MB &$0.97s$\\
+
+\bottomrule[0.5mm]
+\end{tabular}
+}
+\label{table:compare_Complexity}
+\vskip -0.1in
+\end{table*} 
+
+To validate the efficiency of our proposed MBM, we have conducted a new comparative experiment between different attentions and tested them on TSP instances to ensure consistent decoding steps. Specifically, we replace our MBM with both a vanilla MHA~\citep{vaswani2017attention} and the parallel mixed-score attention (MSA) used in MatNet~\citep{kwon2021matnet}, and compare their complexities, memory overheads, and inference time. The results in Table \ref{table:compare_Complexity} show that the increased VRAM and time overhead of MBM compared to standard MHA are small, and both maintain the same time complexity and space complexity. Compared to MatNet's parallel MSA, our MBM drastically reduces both VRAM consumption and inference latency. These results show that MBM imposes only modest computational penalties while successfully capturing crucial problem-specific biases, which enhances cross-problem generalization while reducing architectural redundancy.
+
+% \clearpage
+\section{Training and Model Settings}
+\label{append:model_setting}
+
+\subsection{Multi-Task Version}
+\label{append:URS_MTL}
+\begin{wraptable}[21]{r}{0.5\textwidth}
+\vspace{-18pt}
+\begin{center}
+\caption{The hyperparameter settings of URS.}
+\label{table:hyperparameters}
+\resizebox{\linewidth}{!}{
+\begin{tabular}{l c }
+\toprule[0.5mm]
+Hyperparameter& Value \\
+\midrule
+ Optimizer              & AdamW       \\
+ Clipping parameter $\zeta$            & 50 \\
+ Initial learning rate             & $10^{-4}$ \\
+ Epochs of learning rate decay              & [451] \\
+ Factor of learning rate decay             & 0.1 \\
+
+ Weight decay                &$10^{-6}$      \\
+
+ The number of encoder layers $L$ &$12$           \\
+ Embedding dimension $d$       & $128$        \\
+ Feed forward dimension    & $512$        \\
+ Dimension $d_h$ in \cref{eq:hyper_embeddings} & $256$ \\
+
+ Training scale       &$100$     \\
+ Batches of each epoch      & $2,000$        \\
+ Batch size      & $128$           \\
+ Training Epochs         &$500$       \\
+
+\bottomrule[0.5mm]
+\end{tabular}
+}
+\end{center}
+\end{wraptable}
+The detailed information about the hyperparameter settings can be found in \cref{table:hyperparameters}. The URS training is conducted on a single NVIDIA GeForce RTX 4090 GPU (24GB of memory). The training procedure requires only about $95$ hours ($\approx 4$ days) in total (500 epochs at approximately $ 12$ minutes each) to obtain a unified parameter set capable of addressing a broad class of routing problems. 
+
+
+\subsection{Single-Task Version}
+\label{append:URS_STL}
+URS-STL is trained on data from only a single problem type (e.g., "URS-STL (CVRP)" is trained only on CVRP). The URS-STL variant uses exactly the same model architecture, hyperparameters (e.g., embedding dimension, number of layers, optimizer), and training setup (e.g., initial learning rate, batch size) as the multi-task URS described in Section \ref{sec:exp_model_setting} and Appendix \ref{append:URS_MTL}. The only modification we made is to the training duration. We observe that the single-task models converge significantly faster than the multi-task model. Therefore, we train URS-STL models for 300 epochs, with a learning rate decay applied at the 251st epoch. This contrasts with the multi-task URS, which is trained for 500 epochs with decay applied at the 451st epoch. This adjustment is made solely to reflect the faster convergence of the single-task training. All other hyperparameters and model architecture remain identical. 
+
+% \clearpage
+\section{Generalization to Unseen VRPs}
+\label{append:experiments}
+To comprehensively evaluate URS's zero-shot generalization, we test its performance on a diverse set of 99 unseen problems. This set is designed to cover both established and novel challenges, including 44 well-studied VRP variants and 55 less-explored VRP variants. The detailed results are presented in \cref{tab:all_exp_existing_problems} and \cref{tab:all_exp_unexplored_problems}. On widely-studied constraints (i.e., C, O, L, TW, MD, B, BP), URS continues to deliver high-quality solutions. Notably, URS merely selects the next node from a given set of feasible candidates without any additional domain knowledge, making its performance especially meaningful. Benefiting from our UDR, URS can directly address 55 less-explored VRP variants that compound asymmetry and PD relations. Without any fine-tuning, URS still produces high-quality solutions for them, thereby strengthening its broad problem generality and deployment efficiency.
+
+
+\begin{table}[htbp]
+  \centering
+  \caption{Zero-shot generalization performance across $44$ unseen well-studied VRP variants ($N=100$).}
+  \resizebox{0.85\textwidth}{!}{
+    \begin{tabular}{l|cc|cc|cc|cc|cc}
+    \toprule[0.5mm]
+    
+    \multirow{2}[2]{*}{Method} & \multicolumn{2}{c|}{CVRPBP} & \multicolumn{2}{c|}{OCVRPBP} & \multicolumn{2}{c|}{CVRPBPL} & \multicolumn{2}{c|}{OCVRPBPTW} & \multicolumn{2}{c}{CVRPBPLTW} \\
+          & Gap   & Time  & Gap   & Time  & Gap   & Time  & Gap   & \multicolumn{1}{c|}{Time} & Gap   & \multicolumn{1}{c}{Time} \\
+\midrule
+Oracle & 0.00\% & 6.6m  & 0.00\% & 6.6m  & 0.00\% & 6.6m  & 0.00\% & \multicolumn{1}{c|}{6.6m} & 0.00\% & \multicolumn{1}{c}{6.6m} \\
+MVMoE & 13.95\% & 14s   &  18.27\% & 14s   & 13.38\% & 14s   &  9.42\% & \multicolumn{1}{c|}{15s} &  16.66\% & \multicolumn{1}{c}{16s} \\
+MTPOMO & 13.71\% & 7s    &  17.90\% & 8s    & 13.44\% & 8s    &  9.94\% & \multicolumn{1}{c|}{9s} &  17.15\% & \multicolumn{1}{c}{10s} \\
+ReLD-MTL 
+& 13.57\% & 9s    
+&  \cellcolor[HTML]{D0CECE}\textbf{15.81\%} & 9s    
+& 12.96\% & 10s   
+&  \cellcolor[HTML]{D0CECE}\textbf{8.43\%} & \multicolumn{1}{c|}{11s} 
+&  \cellcolor[HTML]{D0CECE}\textbf{15.95\%} & \multicolumn{1}{c}{12s} \\
+URS   
+& \cellcolor[HTML]{D0CECE}\textbf{12.95\%} & 7s    
+&  16.96\% & 7s    
+& \cellcolor[HTML]{D0CECE}\textbf{12.65\%} & 8s    
+&  10.05\% & \multicolumn{1}{c|}{8s} 
+&  18.33\% & \multicolumn{1}{c}{10s} \\
+\midrule
+\midrule
+\multirow{2}[2]{*}{Method} 
+& \multicolumn{2}{c|}{CVRPBPTW} 
+& \multicolumn{2}{c|}{OCVRPBPL} 
+& \multicolumn{2}{c|}{OCVRPBPLTW} 
+& \multicolumn{2}{c|}{CVRPL} 
+& \multicolumn{2}{c}{CVRPBL} \\
+& Gap & Time & Gap & Time & Gap & Time & Gap & \multicolumn{1}{c|}{Time} & Gap & \multicolumn{1}{c}{Time} \\
+\midrule
+Oracle 
+& 0.00\% & 6.6m 
+& 0.00\% & 6.6m 
+& 0.00\% & 6.6m 
+& 0.00\% & \multicolumn{1}{c|}{16m} 
+& 0.00\% & \multicolumn{1}{c}{3.5h} \\
+
+MVMoE 
+&  16.86\% & 15s 
+&  17.75\% & 14s 
+&  8.87\%  & 16s 
+& 0.26\%  & \multicolumn{1}{c|}{12s} 
+& 1.35\%  & \multicolumn{1}{c}{12s} \\
+
+MTPOMO 
+&  17.22\% & 9s 
+&  17.31\% & 8s 
+&  9.47\%  & 10s 
+& 0.48\%  & \multicolumn{1}{c|}{6s} 
+& 1.79\%  & \multicolumn{1}{c}{6s} \\
+
+ReLD-MTL 
+&  \cellcolor[HTML]{D0CECE}\textbf{16.09\%} & 11s
+&  \cellcolor[HTML]{D0CECE}\textbf{15.21\%} & 10s
+&  \cellcolor[HTML]{D0CECE}\textbf{8.06\%}  & 11s
+& \cellcolor[HTML]{D0CECE}\textbf{0.02\%}  & \multicolumn{1}{c|}{8s}
+& \cellcolor[HTML]{D0CECE}\textbf{1.01\%}  & \multicolumn{1}{c}{7s} \\
+
+URS
+&  18.15\% & 9s
+&  16.37\% & 8s
+&  9.51\%  & 9s
+& 0.43\%  & \multicolumn{1}{c|}{7s}
+& 1.65\%  & \multicolumn{1}{c}{6s} \\
+
+
+
+    \midrule
+    \multirow{2}[2]{*}{Method} & \multicolumn{2}{c|}{CVRPBTW} & \multicolumn{2}{c|}{OCVRPBL} & \multicolumn{2}{c|}{OCVRPLTW} & \multicolumn{2}{c|}{OCVRPBLTW} & \multicolumn{2}{c}{MDCVRPBP} \\
+          & Gap   & Time  & Gap   & Time  & Gap   & Time  & Gap   & \multicolumn{1}{c|}{Time} & Gap   & \multicolumn{1}{c}{Time} \\
+    \midrule
+    Oracle & 0.00\% & 3.5h  & 0.00\% & 3.5h  & 0.00\% & 3.5h  & 0.00\% & \multicolumn{1}{c|}{3.5h} & 0.00\% & \multicolumn{1}{c}{6.6m} \\
+    MVMoE & 7.08\% & 15s   & 7.12\% & 12s   & 3.90\% & 15s   & 10.01\% & \multicolumn{1}{c|}{15s} &  65.98\% & \multicolumn{1}{c}{33s} \\
+    MTPOMO & 7.41\% & 7s    & 7.34\% & 7s    & 4.37\% & 8s    & 10.50\% & \multicolumn{1}{c|}{7s} &  45.77\% & \multicolumn{1}{c}{24s} \\
+    ReLD-MTL & \cellcolor[HTML]{D0CECE}\textbf{6.74\%} & 8s    & \cellcolor[HTML]{D0CECE}\textbf{5.41\%} & 7s    & \cellcolor[HTML]{D0CECE}\textbf{3.16\%} & 9s    & \cellcolor[HTML]{D0CECE}\textbf{9.22\%} & \multicolumn{1}{c|}{8s} &  40.70\% & \multicolumn{1}{c}{27s} \\
+    URS   & 8.94\% & 8s    & 9.47\% & 7s    & 5.12\% & 9s    & 13.72\% & \multicolumn{1}{c|}{8s} &  \cellcolor[HTML]{D0CECE}\textbf{35.44\%} & \multicolumn{1}{c}{24s} \\
+    \midrule
+    \midrule
+    \multirow{2}[2]{*}{Method} & \multicolumn{2}{c|}{MDOCVRPBP} & \multicolumn{2}{c|}{MDCVRPBPL} & \multicolumn{2}{c|}{MDOCVRPBPTW} & \multicolumn{2}{c|}{MDCVRPBPLTW} & \multicolumn{2}{c}{MDCVRPBPTW} \\
+          & Gap   & Time  & Gap   & Time  & Gap   & Time  & Gap   & \multicolumn{1}{c|}{Time} & Gap   & \multicolumn{1}{c}{Time} \\
+    \midrule
+    Oracle & 0.00\% & 6.6m  & 0.00\% & 6.6m  & 0.00\% & 6.6m  & 0.00\% & \multicolumn{1}{c|}{6.6m} & 0.00\% & \multicolumn{1}{c}{6.6m} \\
+    MVMoE &  56.60\% & 33s   &  65.81\% & 36s   &  63.77\% & 38s   &  68.49\% & \multicolumn{1}{c|}{42s} &  69.00\% & \multicolumn{1}{c}{39s} \\
+    MTPOMO &  42.94\% & 24s   &  45.98\% & 26s   &  47.09\% & 29s   &  50.45\% & \multicolumn{1}{c|}{32s} &  50.74\% & \multicolumn{1}{c}{30s} \\
+    ReLD-MTL &  37.74\% & 27s   &  39.57\% & 29s   &  45.16\% & 34s   &  45.23\% & \multicolumn{1}{c|}{37s} &  45.62\% & \multicolumn{1}{c}{35s} \\
+    URS   &  \cellcolor[HTML]{D0CECE}\textbf{24.44\%} & 22s   &  \cellcolor[HTML]{D0CECE}\textbf{35.07\%} & 26s   &  \cellcolor[HTML]{D0CECE}\textbf{26.31\%} & 26s   &  \cellcolor[HTML]{D0CECE}\textbf{36.49\%} & \multicolumn{1}{c|}{32s} &  \cellcolor[HTML]{D0CECE}\textbf{36.71\%} & \multicolumn{1}{c}{30s} \\
+    \midrule
+    \midrule
+    \multirow{2}[2]{*}{Method} & \multicolumn{2}{c|}{MDOCVRPBPL} & \multicolumn{2}{c|}{MDOCVRPBPLTW} & \multicolumn{2}{c|}{MDCVRP} & \multicolumn{2}{c|}{MDCVRPTW} & \multicolumn{2}{c}{MDOCVRP} \\
+          & Gap   & Time  & Gap   & Time  & Gap   & Time  & Gap   & \multicolumn{1}{c|}{Time} & Gap   & \multicolumn{1}{c}{Time} \\
+    \midrule
+    Oracle & 0.00\% & 6.6m  & 0.00\% & 6.6m  & 0.00\% & 6.6m  & 0.00\% & \multicolumn{1}{c|}{6.6m} & 0.00\% & \multicolumn{1}{c}{6.6m} \\
+    MVMoE &  56.26\% & 34s   &  62.47\% & 40s   &  33.06\% & 31s   & 53.64\% & \multicolumn{1}{c|}{41s} & 29.08\% & \multicolumn{1}{c}{31s} \\
+    MTPOMO &  41.98\% & 27s   &  46.26\% & 32s   &  23.38\% & 23s   & 36.10\% & \multicolumn{1}{c|}{31s} & 27.46\% & \multicolumn{1}{c}{23s} \\
+    ReLD-MTL &  37.45\% & 29s   &  44.74\% & 36s   &  18.39\% & 25s   & \cellcolor[HTML]{D0CECE}\textbf{30.90\%} & \multicolumn{1}{c|}{34s} & 22.32\% & \multicolumn{1}{c}{25s} \\
+    URS   &  \cellcolor[HTML]{D0CECE}\textbf{24.22\%} & 24s   &  \cellcolor[HTML]{D0CECE}\textbf{26.20\%} & 28s   &  \cellcolor[HTML]{D0CECE}\textbf{15.05\%} & 23s   & 37.26\% & \multicolumn{1}{c|}{32s} & \cellcolor[HTML]{D0CECE}\textbf{22.01\%} & \multicolumn{1}{c}{23s} \\
+    \midrule
+    \midrule
+    \multirow{2}[2]{*}{Method} & \multicolumn{2}{c|}{MDCVRPL} & \multicolumn{2}{c|}{MDCVRPB} & \multicolumn{2}{c|}{MDOCVRPTW} & \multicolumn{2}{c|}{MDOCVRPB} & \multicolumn{2}{c}{MDCVRPBL} \\
+          & Gap   & Time  & Gap   & Time  & Gap   & Time  & Gap   & \multicolumn{1}{c|}{Time} & Gap   & \multicolumn{1}{c}{Time} \\
+    \midrule
+    Oracle & 0.00\% & 6.6m  & 0.00\% & 6.6m  & 0.00\% & 6.6m  & 0.00\% & \multicolumn{1}{c|}{6.6m} & 0.00\% & \multicolumn{1}{c}{6.6m} \\
+    MVMoE & 33.42\% & 34s   & 21.70\% & 26s   & 51.57\% & 40s   & 28.21\% & \multicolumn{1}{c|}{26s} & 20.35\% & \multicolumn{1}{c}{29s} \\
+    MTPOMO & 24.32\% & 25s   & 12.89\% & 19s   & 35.71\% & 29s   & 25.06\% & \multicolumn{1}{c|}{20s} & 11.10\% & \multicolumn{1}{c}{20s} \\
+    ReLD-MTL & 18.48\% & 28s   & \cellcolor[HTML]{D0CECE}\textbf{9.38\%} & 21s   & 33.55\% & 33s   & 18.50\% & \multicolumn{1}{c|}{21s} & \cellcolor[HTML]{D0CECE}\textbf{8.26\%} & \multicolumn{1}{c}{23s} \\
+    URS   & \cellcolor[HTML]{D0CECE}\textbf{15.32\%} & 26s   & 13.14\% & 19s   & \cellcolor[HTML]{D0CECE}\textbf{26.05\%} & 25s   & \cellcolor[HTML]{D0CECE}\textbf{15.17\%} & \multicolumn{1}{c|}{18s} & 11.19\% & \multicolumn{1}{c}{21s} \\
+    \midrule
+    \midrule
+    \multirow{2}[2]{*}{Method} & \multicolumn{2}{c|}{MDCVRPLTW} & \multicolumn{2}{c|}{MDOCVRPBTW} & \multicolumn{2}{c|}{MDCVRPBLTW} & \multicolumn{2}{c|}{MDOCVRPL} & \multicolumn{2}{c}{MDCVRPBTW} \\
+          & Gap   & Time  & Gap   & Time  & Gap   & Time  & Gap   & \multicolumn{1}{c|}{Time} & Gap   & \multicolumn{1}{c}{Time} \\
+    \midrule
+    Oracle & 0.00\% & 6.6m  & 0.00\% & 6.6m  & 0.00\% & 6.6m  & 0.00\% & \multicolumn{1}{c|}{6.6m} & 0.00\% & \multicolumn{1}{c}{6.6m} \\
+    MVMoE & 55.55\% & 44s   & 62.47\% & 35s   & 63.18\% & 37s   & 29.33\% & \multicolumn{1}{c|}{33s} & 65.90\% & \multicolumn{1}{c}{35s} \\
+    MTPOMO & 37.34\% & 32s   & 45.55\% & 25s   & 45.07\% & 27s   & 27.21\% & \multicolumn{1}{c|}{25s} & 45.94\% & \multicolumn{1}{c}{25s} \\
+    ReLD-MTL & \cellcolor[HTML]{D0CECE}\textbf{31.56\%} & 36s   & 43.36\% & 28s   & 40.57\% & 30s   & \cellcolor[HTML]{D0CECE}\textbf{22.05\%} & \multicolumn{1}{c|}{27s} & 41.28\% & \multicolumn{1}{c}{28s} \\
+    URS   & 38.04\% & 35s   & \cellcolor[HTML]{D0CECE}\textbf{30.32\%} & 22s   & \cellcolor[HTML]{D0CECE}\textbf{37.70\%} & 27s   & 22.15\% & \multicolumn{1}{c|}{25s} & \cellcolor[HTML]{D0CECE}\textbf{37.78\%} & \multicolumn{1}{c}{25s} \\
+    \midrule
+    \midrule
+    \multirow{2}[2]{*}{Method} & \multicolumn{2}{c|}{MDOCVRPBL} & \multicolumn{2}{c|}{MDOCVRPLTW} & \multicolumn{2}{c|}{MDOCVRPBLTW} & \multicolumn{2}{c|}{SPCTSP} & \multicolumn{2}{c}{\multirow{2}[2]{*}{$-$}}  \\
+          & Gap   & Time  & Gap   & Time  & Gap   & Time  & Gap   & Time       &       &  \\
+    \midrule
+    Oracle & 0.00\% & 6.6m  & 0.00\% & 6.6m  & 0.00\% & 6.6m   & 0.00\% & 1.6h & \multicolumn{2}{c}{$-$} \\
+    MVMoE & 28.70\% & 28s   & 51.09\% & 43s   & 62.10\% & 37s   & \multicolumn{2}{c|}{$-$} & \multicolumn{2}{c}{$-$} \\
+    MTPOMO & 25.01\% & 21s   & 35.39\% & 31s   & 45.48\% & 27s   & \multicolumn{2}{c|}{$-$} & \multicolumn{2}{c}{$-$} \\
+    ReLD-MTL & 18.50\% & 22s   & 33.26\% & 35s   & 43.27\% & 30s   & \multicolumn{2}{c|}{$-$} & \multicolumn{2}{c}{$-$} \\
+    URS   & \cellcolor[HTML]{D0CECE}\textbf{14.90\%} & 20s   & \cellcolor[HTML]{D0CECE}\textbf{25.59\%} & 27s   & \cellcolor[HTML]{D0CECE}\textbf{30.41\%} & 24s   & \cellcolor[HTML]{D0CECE}\textbf{-2.37\%} &5s & \multicolumn{2}{c}{$-$} \\
+    \bottomrule[0.5mm]
+    \end{tabular}%
+    }
+  \label{tab:all_exp_existing_problems}%
+\end{table}%
+
+
+\begin{table}[htbp]
+  \centering
+  \caption{Zero-shot generalization performance across $55$ unseen  less-explored VRP variants ($N=100$).}
+  \resizebox{0.99\textwidth}{!}{
+    \begin{tabular}{l|cc|cc|cc|cc|cc}
+    \toprule[0.5mm]
+    \multirow{2}[2]{*}{Method} & \multicolumn{2}{c|}{ACVRPL} & \multicolumn{2}{c|}{ACVRPBL} & \multicolumn{2}{c|}{ACVRPLTW} & \multicolumn{2}{c|}{ACVRPBLTW} & \multicolumn{2}{c}{AOCVRPL} \\
+          & Gap   & Time  & Gap   & Time  & Gap   & Time  & Gap   & \multicolumn{1}{c|}{Time} & Gap   & \multicolumn{1}{c}{Time} \\
+    \midrule
+    Oracle & 0.00\% & 6.6m  & 0.00\% & 6.6m  & 0.00\% & 6.6m  & 0.00\% & \multicolumn{1}{c|}{6.6m} & 0.00\% & \multicolumn{1}{c}{6.6m} \\
+    URS   & \cellcolor[HTML]{D0CECE}\textbf{-2.24\%} & 1.9m  & \cellcolor[HTML]{D0CECE}\textbf{6.18\%} & 2.4m  & \cellcolor[HTML]{D0CECE}\textbf{12.22\%} & 2.7m  & \cellcolor[HTML]{D0CECE}\textbf{10.18\%} & \multicolumn{1}{c|}{2.4m} & \cellcolor[HTML]{D0CECE}\textbf{37.36\%} & \multicolumn{1}{c}{3.1m} \\
+    \midrule
+    \midrule
+    \multirow{2}[2]{*}{Method} & \multicolumn{2}{c|}{AOCVRPBL} & \multicolumn{2}{c|}{AOCVRPLTW} & \multicolumn{2}{c|}{AOCVRPBLTW} & \multicolumn{2}{c|}{ACVRPBPL} & \multicolumn{2}{c}{ACVRPBPLTW} \\
+          & Gap   & Time  & Gap   & Time  & Gap   & Time  & Gap   & \multicolumn{1}{c|}{Time} & Gap   & \multicolumn{1}{c}{Time} \\
+    \midrule
+    Oracle & 0.00\% & 6.6m  & 0.00\% & 6.6m  & 0.00\% & 6.6m  & 0.00\% & \multicolumn{1}{c|}{6.6m} & 0.00\% & \multicolumn{1}{c}{6.6m} \\
+    URS   & \cellcolor[HTML]{D0CECE}\textbf{17.23\%} & 2.7m  & \cellcolor[HTML]{D0CECE}\textbf{16.35\%} & 2.8m  & \cellcolor[HTML]{D0CECE}\textbf{14.32\%} & 2.5m  &  \cellcolor[HTML]{D0CECE}\textbf{24.03\%} & \multicolumn{1}{c|}{2.6m} &  \cellcolor[HTML]{D0CECE}\textbf{13.82\%} & \multicolumn{1}{c}{2.8m} \\
+    \midrule
+    \midrule
+    \multirow{2}[2]{*}{Method} & \multicolumn{2}{c|}{AOCVRPBPL} & \multicolumn{2}{c|}{AOCVRPBPLTW} & \multicolumn{2}{c|}{ACVRPB} & \multicolumn{2}{c|}{ACVRPTW} & \multicolumn{2}{c}{AOCVRP} \\
+          & Gap   & Time  & Gap   & Time  & Gap   & Time  & Gap   & \multicolumn{1}{c|}{Time} & Gap   & \multicolumn{1}{c}{Time} \\
+    \midrule
+    Oracle & 0.00\% & 6.6m  & 0.00\% & 6.6m  & 0.00\% & 6.6m  & 0.00\% & \multicolumn{1}{c|}{6.6m} & 0.00\% & \multicolumn{1}{c}{6.6m} \\
+    URS   &  \cellcolor[HTML]{D0CECE}\textbf{32.50\%} & 2.7m  &  \cellcolor[HTML]{D0CECE}\textbf{16.43\%} & 2.7m  & \cellcolor[HTML]{D0CECE}\textbf{7.10\%} & 2.1m  & \cellcolor[HTML]{D0CECE}\textbf{11.28\%} & \multicolumn{1}{c|}{2.5m} & \cellcolor[HTML]{D0CECE}\textbf{37.63\%} & \multicolumn{1}{c}{2.9m} \\
+    \midrule
+    \midrule
+    \multirow{2}[2]{*}{Method} & \multicolumn{2}{c|}{AOCVRPTW} & \multicolumn{2}{c|}{AOCVRPB} & \multicolumn{2}{c|}{AOCVRPBTW} & \multicolumn{2}{c|}{ACVRPBTW} & \multicolumn{2}{c}{ACVRPBP} \\
+          & Gap   & Time  & Gap   & Time  & Gap   & Time  & Gap   & \multicolumn{1}{c|}{Time} & Gap   & \multicolumn{1}{c}{Time} \\
+    \midrule
+    Oracle & 0.00\% & 6.6m  & 0.00\% & 6.6m  & 0.00\% & 6.6m  & 0.00\% & \multicolumn{1}{c|}{6.6m} & 0.00\% & \multicolumn{1}{c}{6.6m} \\
+    URS   & \cellcolor[HTML]{D0CECE}\textbf{17.47\%} & 2.6m  & \cellcolor[HTML]{D0CECE}\textbf{18.05\%} & 2.5m  & \cellcolor[HTML]{D0CECE}\textbf{14.45\%} & 2.3m  & \cellcolor[HTML]{D0CECE}\textbf{9.95\%} & \multicolumn{1}{c|}{2.2m} &  \cellcolor[HTML]{D0CECE}\textbf{24.20\%} & \multicolumn{1}{c}{2.4m} \\
+    \midrule
+    \midrule
+    \multirow{2}[2]{*}{Method} & \multicolumn{2}{c|}{AOCVRPBP} & \multicolumn{2}{c|}{AOCVRPBPTW} & \multicolumn{2}{c|}{ ACVRPBPTW} & \multicolumn{2}{c|}{APDTSP} & \multicolumn{2}{c}{AMDCVRPL} \\
+          & Gap   & Time  & Gap   & Time  & Gap   & Time  & Gap   & \multicolumn{1}{c|}{Time} & Gap   & \multicolumn{1}{c}{Time} \\
+    \midrule
+    Oracle & 0.00\% & 6.6m  & 0.00\% & 6.6m  & 0.00\% & 6.6m  & 0.00\% & \multicolumn{1}{c|}{6.6m} & 0.00\% & \multicolumn{1}{c}{6.6m} \\
+    URS   &  \cellcolor[HTML]{D0CECE}\textbf{32.58\%} & 2.5m  &  \cellcolor[HTML]{D0CECE}\textbf{17.45\%} & 2.5m  &  \cellcolor[HTML]{D0CECE}\textbf{14.52\%} & 2.6m  & \cellcolor[HTML]{D0CECE}\textbf{6.21\%} & \multicolumn{1}{c|}{1m} & \cellcolor[HTML]{D0CECE}\textbf{7.15\%} & \multicolumn{1}{c}{6.1m} \\
+    \midrule
+    \midrule
+    \multirow{2}[2]{*}{Method} & \multicolumn{2}{c|}{AMDCVRPBL} & \multicolumn{2}{c|}{AMDCVRPLTW} & \multicolumn{2}{c|}{AMDCVRPBLTW} & \multicolumn{2}{c|}{AMDOCVRPL} & \multicolumn{2}{c}{AMDOCVRPBL} \\
+          & Gap   & Time  & Gap   & Time  & Gap   & Time  & Gap   & \multicolumn{1}{c|}{Time} & Gap   & \multicolumn{1}{c}{Time} \\
+    \midrule
+    Oracle & 0.00\% & 6.6m  & 0.00\% & 6.6m  & 0.00\% & 6.6m  & 0.00\% & \multicolumn{1}{c|}{6.6m} & 0.00\% & \multicolumn{1}{c}{6.6m} \\
+    URS   & \cellcolor[HTML]{D0CECE}\textbf{17.51\%} & 6.5m  & \cellcolor[HTML]{D0CECE}\textbf{19.98\%} & 8.8m  & \cellcolor[HTML]{D0CECE}\textbf{16.73\%} & 7.5m  & \cellcolor[HTML]{D0CECE}\textbf{47.80\%} & \multicolumn{1}{c|}{8.6m} & \cellcolor[HTML]{D0CECE}\textbf{27.23\%} & \multicolumn{1}{c}{7.1m} \\
+    \midrule
+    \midrule
+    \multirow{2}[2]{*}{Method} & \multicolumn{2}{c|}{AMDOCVRPLTW} & \multicolumn{2}{c|}{AMDOCVRPBLTW} & \multicolumn{2}{c|}{AMDCVRPBPL} & \multicolumn{2}{c|}{AMDCVRPBPLTW} & \multicolumn{2}{c}{AMDOCVRPBPL} \\
+          & Gap   & Time  & Gap   & Time  & Gap   & Time  & Gap   & \multicolumn{1}{c|}{Time} & Gap   & \multicolumn{1}{c}{Time} \\
+    \midrule
+    Oracle & 0.00\% & 6.6m  & 0.00\% & 6.6m  & 0.00\% & 6.6m  & 0.00\% & \multicolumn{1}{c|}{6.6m} & 0.00\% & \multicolumn{1}{c}{6.6m} \\
+    URS   & \cellcolor[HTML]{D0CECE}\textbf{24.90\%} & 7.9m  & \cellcolor[HTML]{D0CECE}\textbf{22.84\%} & 6.7m  &  \cellcolor[HTML]{D0CECE}\textbf{35.00\%} & 7.2m  &  \cellcolor[HTML]{D0CECE}\textbf{20.50\%} & \multicolumn{1}{c|}{8.3m} &  \cellcolor[HTML]{D0CECE}\textbf{38.78\%} & \multicolumn{1}{c}{7.3m} \\
+    \midrule
+    \midrule
+    \multirow{2}[2]{*}{Method} & \multicolumn{2}{c|}{AMDOCVRPBPLTW} & \multicolumn{2}{c|}{AMDCVRP} & \multicolumn{2}{c|}{AMDCVRPTW} & \multicolumn{2}{c|}{AMDOCVRP} & \multicolumn{2}{c}{AMDCVRPB} \\
+          & Gap   & Time  & Gap   & Time  & Gap   & Time  & Gap   & \multicolumn{1}{c|}{Time} & Gap   & \multicolumn{1}{c}{Time} \\
+    \midrule
+    Oracle & 0.00\% & 6.6m  & 0.00\% & 6.6m  & 0.00\% & 6.6m  & 0.00\% & \multicolumn{1}{c|}{6.6m} & 0.00\% & \multicolumn{1}{c}{6.6m} \\
+    URS   &  \cellcolor[HTML]{D0CECE}\textbf{24.05\%} & 7.5m  &  \cellcolor[HTML]{D0CECE}\textbf{8.11\%} & 5.3m  & \cellcolor[HTML]{D0CECE}\textbf{20.96\%} & 8.1m  & \cellcolor[HTML]{D0CECE}\textbf{48.02\%} & \multicolumn{1}{c|}{7.8m} & \cellcolor[HTML]{D0CECE}\textbf{17.35\%} & \multicolumn{1}{c}{5.8m} \\
+    \midrule
+    \midrule
+    \multirow{2}[2]{*}{Method} & \multicolumn{2}{c|}{AMDOCVRPTW} & \multicolumn{2}{c|}{AMDOCVRPB} & \multicolumn{2}{c|}{AMDOCVRPBTW} & \multicolumn{2}{c|}{AMDCVRPBTW} & \multicolumn{2}{c}{AMDCVRPBP} \\
+          & Gap   & Time  & Gap   & Time  & Gap   & Time  & Gap   & \multicolumn{1}{c|}{Time} & Gap   & \multicolumn{1}{c}{Time} \\
+    \midrule
+    Oracle & 0.00\% & 6.6m  & 0.00\% & 6.6m  & 0.00\% & 6.6m  & 0.00\% & \multicolumn{1}{c|}{6.6m} & 0.00\% & \multicolumn{1}{c}{6.6m} \\
+    URS   & \cellcolor[HTML]{D0CECE}\textbf{26.02\%} & 7.3m  & \cellcolor[HTML]{D0CECE}\textbf{27.78\%} & 6.5m  & \cellcolor[HTML]{D0CECE}\textbf{23.67\%} & 6.2m  & \cellcolor[HTML]{D0CECE}\textbf{17.52\%} & \multicolumn{1}{c|}{6.8m} &  \cellcolor[HTML]{D0CECE}\textbf{36.18\%} & \multicolumn{1}{c}{6.5m} \\
+    \midrule
+    \midrule
+    \multirow{2}[2]{*}{Method} & \multicolumn{2}{c|}{AMDOCVRPBP} & \multicolumn{2}{c|}{AMDOCVRPBPTW} & \multicolumn{2}{c|}{AMDCVRPBPTW} & \multicolumn{2}{c|}{PDCVRP} & \multicolumn{2}{c}{OPDCVRP} \\
+          & Gap   & Time  & Gap   & Time  & Gap   & Time  & Gap   & \multicolumn{1}{c|}{Time} & Gap   & \multicolumn{1}{c}{Time} \\
+    \midrule
+    Oracle & 0.00\% & 6.6m  & 0.00\% & 6.6m  & 0.00\% & 6.6m  & 0.00\% & \multicolumn{1}{c|}{6.6m} & 0.00\% & \multicolumn{1}{c}{6.6m} \\
+    URS   &  \cellcolor[HTML]{D0CECE}\textbf{39.31\%} & 6.7m  &  \cellcolor[HTML]{D0CECE}\textbf{24.99\%} & 6.9m  &  \cellcolor[HTML]{D0CECE}\textbf{20.98\%} & 7.6m  & \cellcolor[HTML]{D0CECE}\textbf{-1.47\%} & \multicolumn{1}{c|}{4.3s} & \cellcolor[HTML]{D0CECE}\textbf{4.93\%} & \multicolumn{1}{c}{4.3s} \\
+    \midrule
+    \midrule
+    \multirow{2}[2]{*}{Method} 
+& \multicolumn{2}{c|}{APDCVRP} 
+& \multicolumn{2}{c|}{AOPDCVRP} 
+& \multicolumn{2}{c|}{AOP} 
+& \multicolumn{2}{c|}{APCTSP} 
+& \multicolumn{2}{c}{ASPCTSP} \\
+& Gap & Time & Gap & Time & Gap & Time & Gap & Time & Value & Time \\
+\midrule
+Oracle 
+& 0.00\% & 6.6m 
+& 0.00\% & 6.6m 
+& 0.00\% & 6.6m 
+& 0.00\% & 6.6m 
+& \multicolumn{2}{c}{$-$} \\
+URS   
+& \cellcolor[HTML]{D0CECE}\textbf{7.03\%} & 1.2m  
+& \cellcolor[HTML]{D0CECE}\textbf{11.13\%} & 1.2m  
+& \cellcolor[HTML]{D0CECE}\textbf{-5.47\%} & 1.2m 
+& \cellcolor[HTML]{D0CECE}\textbf{43.79\%} & 1.2m 
+& \cellcolor[HTML]{D0CECE}\textbf{2.22} & 1.2m  \\
+\bottomrule[0.5mm]
+    \end{tabular}%
+    }
+   
+  \label{tab:all_exp_unexplored_problems}%
+\end{table}%
+
+
+
+
+\clearpage
+
+\section{More Experiments}
+\subsection{Training Problem Selection}
+\label{append:problem_selection}
+To empirically validate our selection strategy of training problems, we train two additional variants and compare them with our original URS: URS-Diff (Different Selection) and URS-Expand (Broader Problems). The first variant, URS-Diff, uses a different problem set where OCVRPTW is replaced by attribute-independent CVRPL. This modification means that the Open Route and Time Window attributes each appear in only one training problem. The second variant, URS-Expand, is trained on a broader set of 22 problems, incorporating all variants evaluated in MTPOMO~\citep{liu2024mtpomo} and MVMoE~\citep{zhou2024mvmoe}.
+
+As shown in \cref{tab:ablation_diff_training_problems}, URS-Diff performs significantly worse on unseen problems involving Open Route and Time Window constraints. Meanwhile, URS-Expand achieves a slightly better performance than URS due to seeing more problem variants during training. However, the original URS remains highly competitive. Remarkably, despite being trained on only half the number of problem types (11 vs. 22), URS achieves the best solution on 12 out of the 22 evaluated problems.
+
+These results demonstrate that the choice of our selected 11 problems offers a balanced trade-off, providing sufficient attribute coverage for strong generalization while maintaining training efficiency. Expanding the training set yields only marginal gains, while a poorly selected set leads to poor cross-problem generalization. In future work, we plan to explore more effective training problem selection strategies to further enhance model performance and training efficiency.
+
+\begin{table}[htbp]
+  \centering
+  \caption{Comparison under different training problem settings. The symbol * indicates the original problem selection, and $\Delta$ represents a different problem selection of equal number. All test problems are encompassed within URS-Expand.}
+  \resizebox{0.9\textwidth}{!}{
+    \begin{tabular}{c|c|c|c|c|c|c}
+    \toprule[0.5mm]
+    Method & ATSP (* $\Delta$) & TSP(* $\Delta$) & OP(* $\Delta$) & PCTSP(* $\Delta$) & PDTSP(* $\Delta$) & ACVRP(*$\Delta$) \\
+    \midrule
+    URS-Diff & 4.52\% & 1.05\% & 0.82\% & 1.31\% & 6.09\% & 5.10\% \\
+    URS-Expand & 4.77\% & 0.93\% & 0.99\% & 1.41\% & 5.85\% & 5.48\% \\
+    URS   & \cellcolor[HTML]{D0CECE}\textbf{2.26\%} & \cellcolor[HTML]{D0CECE}\textbf{0.57\%} & \cellcolor[HTML]{D0CECE}\textbf{0.45\%} & \cellcolor[HTML]{D0CECE}\textbf{1.06\%} & \cellcolor[HTML]{D0CECE}\textbf{4.98\%} & \cellcolor[HTML]{D0CECE}\textbf{3.06\%} \\
+    \midrule
+    \midrule
+          & CVRP(* $\Delta$) & CVRPTW(* $\Delta$) & CVRPB(* $\Delta$) & OCVRP(* $\Delta$) & OCVRPTW(*) & CVRPL($\Delta$) \\
+    \midrule
+    URS-Diff & 1.97\% & 6.26\% & 1.80\% & 3.75\% & 15.45\% & 0.58\% \\
+    URS-Expand & 2.04\% & \cellcolor[HTML]{D0CECE}\textbf{5.62\%} & 1.77\% & 3.45\% & \cellcolor[HTML]{D0CECE}\textbf{4.34\%} & 0.65\% \\
+    URS   & \cellcolor[HTML]{D0CECE}\textbf{1.81\%} & 6.13\% & \cellcolor[HTML]{D0CECE}\textbf{1.46\%} & \cellcolor[HTML]{D0CECE}\textbf{3.24\%} & 5.07\% & \cellcolor[HTML]{D0CECE}\textbf{0.43\%} \\
+    \midrule
+    \midrule
+          & OCVRPB & CVRPBL & CVRPLTW & OCVRPBTW & CVRPBLTW & OCVRPL \\
+    \midrule
+    URS-Diff & 7.55\% & 2.02\% & 2.76\% & 27.48\% & 10.25\% & 3.73\% \\
+    URS-Expand & \cellcolor[HTML]{D0CECE}\textbf{5.39\%} & 1.88\% & \cellcolor[HTML]{D0CECE}\textbf{2.03\%} & \cellcolor[HTML]{D0CECE}\textbf{9.13\%} & \cellcolor[HTML]{D0CECE}\textbf{6.29\%} & 3.41\% \\
+    URS   & 9.35\% & \cellcolor[HTML]{D0CECE}\textbf{1.65\%} & 2.67\% & 13.77\% & 9.18\% & \cellcolor[HTML]{D0CECE}\textbf{3.22\%} \\
+    \midrule
+    \midrule
+          & CVRPBTW & OCVRPBL & OCVRPLTW & OCVRPBLTW & Avg.gap & Best Sol. \\
+    \midrule
+    URS-Diff & 10.00\% & 7.56\% & 15.61\% & 27.80\% & 7.43\% & 0/22 \\
+    URS-Expand & \cellcolor[HTML]{D0CECE}\textbf{6.07\%} & \cellcolor[HTML]{D0CECE}\textbf{5.47\%} & \cellcolor[HTML]{D0CECE}\textbf{4.38\%} & \cellcolor[HTML]{D0CECE}\textbf{9.23\%} & \cellcolor[HTML]{D0CECE}\textbf{4.12\%} & 10/22 \\
+    URS   & 8.94\% & 9.47\% & 5.12\% & 13.72\% & 4.89\% & \cellcolor[HTML]{D0CECE}\textbf{12/22} \\
+    \bottomrule[0.5mm]
+    \end{tabular}%
+    }
+  \label{tab:ablation_diff_training_problems}%
+\end{table}%
+
+
+\clearpage
+
+\subsection{Comparison with RouteFinder and CaDA}
+\label{append:compare_rf_cada}
+We strictly adhered to the problem settings established by MVMoE~\citep{zhou2024mvmoe} and ReLD~\citep{huang2025reld} to ensure a fair and consistent evaluation. Notably, as shown in Table \ref{tab:setxxl_mainpaper}, URS already outperforms RF~\citep{berto2024routefinder} and CaDA~\citep{li2025cada} on the large-scale CVRPLib benchmark dataset. In our cross-problem test, RF and CaDA are excluded due to discrepancies in the problems, including the number of trained CVRP variants (16 in their work vs. 5 in ours) and constraint settings (i.e., Backhauls and Time Windows). To ensure a fair comparison with RF and CaDA, we conduct two additional experiments: 
+\begin{itemize}
+    \item We evaluate URS against CaDA and the best-performing RouteFinder variant (RF-TE) on a shared subset of both seen and unseen problems, strictly restricting the evaluation to variants with perfectly aligned constraint definitions across all methods. As shown in Table \ref{tab:RF_CaDA_official}, when evaluated under strictly matched conditions, URS still performs best overall among comparable methods. Note that URS can provide the strongest zero-shot generalization across all shared unseen problems.
+    \item We retrain both RouteFinder-TE (denoted as RF-Retrain) and CaDA (denoted as CaDA-Retrain) from scratch using the exact same training settings as our URS and evaluate the three models on 48 CVRP variants. Since RF fails to train beyond 150 epochs due to the occurrence of NaN probabilities in our training setting, we evaluate all three methods at exactly 150 epochs to ensure a fair comparison. The experimental results in Table \ref{tab:urs_rf_cada_150epochs} show that under consistent training settings, URS still achieves the best overall performance among the three methods and provides the best solutions for the majority of problems (32/48), highlighting our strong zero-shot generalization.
+\end{itemize}
+
+\begin{table}[h!]
+  \centering
+  \caption{Comparison of shared seen and unseen VRP variants between URS, RF-TE, and CaDA.}
+    \begin{tabular}{c|c|c|c|c|c|c|c|c}
+    \toprule[0.5mm]
+    \multirow{2}[2]{*}{Method} & \multicolumn{2}{c|}{Seen} & \multicolumn{4}{c|}{Unseen}   & \multirow{2}[2]{*}{Avg.gap} & \multirow{2}[2]{*}{Best Sol.} \\
+          & CVRP  & OCVRP & MDCVRP & MDOCVRP & MDCVRPL & MDOCVRPL &       &  \\
+    \midrule
+    RF-TE & 2.06\% & 2.86\% & 63.60\% & 33.52\% & 66.75\% & 34.40\% & 33.86\% & 0/6 \\
+    CaDA  & 2.17\% & \cellcolor[HTML]{D0CECE}\textbf{2.80\%} & 40.96\% & 53.21\% & 42.40\% & 53.34\% & 32.48\% & 1/6 \\
+    URS   & \cellcolor[HTML]{D0CECE}\textbf{1.81\%} & 3.24\% & \cellcolor[HTML]{D0CECE}\textbf{15.04\%} & \cellcolor[HTML]{D0CECE}\textbf{22.01\%} & \cellcolor[HTML]{D0CECE}\textbf{15.32\%} & \cellcolor[HTML]{D0CECE}\textbf{22.15\%} & \cellcolor[HTML]{D0CECE}\textbf{13.26\%} & \cellcolor[HTML]{D0CECE}\textbf{5/6} \\
+    \bottomrule[0.5mm]
+    \end{tabular}%
+  \label{tab:RF_CaDA_official}%
+\end{table}%
+
+\begin{table}[htbp]
+  \centering
+  \caption{Comparison between URS and the retrained RouteFinder and CaDA on all 48 CVRP variants. Note that all models are trained for 150 epochs to ensure a fair comparison.}
+  \resizebox{0.9\textwidth}{!}{
+    \begin{tabular}{l|cc|cc|cc|cc|cc}
+    \toprule[0.5mm]
+    \multirow{2}[2]{*}{Method} & \multicolumn{2}{c|}{CVRPTW } & \multicolumn{2}{c|}{OCVRP} & \multicolumn{2}{c|}{CVRP} & \multicolumn{2}{c|}{CVRPB} & \multicolumn{2}{c}{OCVRPTW} \\
+          & Gap   & Time  & Gap   & Time  & Gap   & Time  & Gap   & Time  & Gap   & Time \\
+    \midrule
+    RF-Retrain & 8.38\% & 8s    & 6.03\% & 6s    & 3.58\% & 6s    & 4.47\% & 5s    & 8.18\% & 7s \\
+    CaDA-Retrain & \cellcolor[HTML]{D0CECE}\textbf{5.28\%} & 9s    & \cellcolor[HTML]{D0CECE}\textbf{3.22\%} & 7s    & \cellcolor[HTML]{D0CECE}\textbf{1.92\%} & 7s    & \cellcolor[HTML]{D0CECE}\textbf{1.61\%} & 6s    & \cellcolor[HTML]{D0CECE}\textbf{4.42\%} & 8s \\
+    URS & 6.09\% & 8s    & 3.71\% & 6s    & 2.07\% & 6s    & 1.90\% & 5s    & 4.89\% & 8s \\
+    \midrule
+    \midrule
+    \multirow{2}[2]{*}{Method} & \multicolumn{2}{c|}{OCVRPB} & \multicolumn{2}{c|}{CVRPBL} & \multicolumn{2}{c|}{CVRPLTW} & \multicolumn{2}{c|}{OCVRPBTW} & \multicolumn{2}{c}{CVRPBLTW} \\
+          & Gap   & Time  & Gap   & Time  & Gap   & Time  & Gap   & Time  & Gap   & Time \\
+    \midrule
+    RF-Retrain & 11.61\% & 5s    & 4.73\% & 6s    & 4.77\% & 9s    & 14.17\% & 7s    & 10.11\% & 8s \\
+    CaDA-Retrain & 8.46\% & 6s    & 4.42\% & 7s    & 4.63\% & 11s   & \cellcolor[HTML]{D0CECE}\textbf{10.39\%} & 8s    & 10.87\% & 10s \\
+    URS & \cellcolor[HTML]{D0CECE}\textbf{8.01\%} & 6s    & \cellcolor[HTML]{D0CECE}\textbf{2.12\%} & 6s    & \cellcolor[HTML]{D0CECE}\textbf{2.53\%} & 9s    & 12.37\% & 7s    & \cellcolor[HTML]{D0CECE}\textbf{8.74\%} & 8s \\
+    \midrule
+    \midrule
+    \multirow{2}[2]{*}{Method} & \multicolumn{2}{c|}{OCVRPL} & \multicolumn{2}{c|}{CVRPBTW} & \multicolumn{2}{c|}{OCVRPBL} & \multicolumn{2}{c|}{OCVRPLTW} & \multicolumn{2}{c}{OCVRPBLTW} \\
+          & Gap   & Time  & Gap   & Time  & Gap   & Time  & Gap   & Time  & Gap   & Time \\
+    \midrule
+    RF-Retrain & 5.98\% & 7s    & 9.74\% & 7s    & 11.58\% & 6s    & 8.34\% & 8s    & 14.46\% & 7s \\
+    CaDA-Retrain & 5.81\% & 8s    & \cellcolor[HTML]{D0CECE}\textbf{7.17\%} & 8s    & 12.48\% & 7s    & 8.55\% & 11s   & 15.94\% & 10s \\
+    URS & \cellcolor[HTML]{D0CECE}\textbf{3.72\%} & 7s    & 8.42\% & 7s    & \cellcolor[HTML]{D0CECE}\textbf{8.05\%} & 6s    & \cellcolor[HTML]{D0CECE}\textbf{5.06\%} & 8s    & \cellcolor[HTML]{D0CECE}\textbf{12.37\%} & 8s \\
+    \midrule
+    \midrule
+    \multirow{2}[2]{*}{Method} & \multicolumn{2}{c|}{CVRPBP} & \multicolumn{2}{c|}{OCVRPBP} & \multicolumn{2}{c|}{CVRPBPL} & \multicolumn{2}{c|}{OCVRPBPTW} & \multicolumn{2}{c}{CVRPBPLTW} \\
+          & Gap   & Time  & Gap   & Time  & Gap   & Time  & Gap   & Time  & Gap   & Time \\
+    \midrule
+    RF-Retrain & 14.40\% & 7s    & 18.31\% & 7s    & 14.01\% & 7s    & 11.43\% & 9s    & 18.70\% & 10s \\
+    CaDA-Retrain & \cellcolor[HTML]{D0CECE}\textbf{13.37\%} & 8s    & 18.25\% & 8s    & 16.71\% & 9s    & \cellcolor[HTML]{D0CECE}\textbf{9.64\%} & 10s   & 20.17\% & 12s \\
+    URS & 13.37\% & 7s    & \cellcolor[HTML]{D0CECE}\textbf{16.08\%} & 7s    & \cellcolor[HTML]{D0CECE}\textbf{12.94\%} & 8s    & 10.07\% & 9s    & \cellcolor[HTML]{D0CECE}\textbf{18.47\%} & 10s \\
+    \midrule
+    \midrule
+    \multirow{2}[2]{*}{Method} & \multicolumn{2}{c|}{CVRPBPTW} & \multicolumn{2}{c|}{OCVRPBPL} & \multicolumn{2}{c|}{OCVRPBPLTW} & \multicolumn{2}{c|}{CVRPL} & \multicolumn{2}{c}{MDCVRP} \\
+          & Gap   & Time  & Gap   & Time  & Gap   & Time  & Gap   & Time  & Gap   & Time \\
+    \midrule
+    RF-Retrain & 18.84\% & 9s    & 17.76\% & 8s    & 10.88\% & 9s    & 2.21\% & 7s    & 27.10\% & 18s \\
+    CaDA-Retrain & \cellcolor[HTML]{D0CECE}\textbf{17.11\%} & 10s   & 21.44\% & 9s    & 13.54\% & 12s   & 2.29\% & 8s    & \cellcolor[HTML]{D0CECE}\textbf{27.09\%} & 23s \\
+    URS & 18.63\% & 9s    & \cellcolor[HTML]{D0CECE}\textbf{15.42\%} & 8s    & \cellcolor[HTML]{D0CECE}\textbf{9.57\%} & 10s   & \cellcolor[HTML]{D0CECE}\textbf{0.66\%} & 7s    & 38.17\% & 23s \\
+    \midrule
+    \midrule
+    \multirow{2}[2]{*}{Method} & \multicolumn{2}{c|}{MDCVRPTW} & \multicolumn{2}{c|}{MDOCVRP} & \multicolumn{2}{c|}{MDCVRPL} & \multicolumn{2}{c|}{MDCVRPB} & \multicolumn{2}{c}{MDOCVRPTW} \\
+          & Gap   & Time  & Gap   & Time  & Gap   & Time  & Gap   & Time  & Gap   & Time \\
+    \midrule
+    RF-Retrain & 76.46\% & 25s   & \cellcolor[HTML]{D0CECE}\textbf{19.09\%} & 18s   & \cellcolor[HTML]{D0CECE}\textbf{27.41\%} & 34s   & 21.40\% & 15s   & 35.23\% & 22s \\
+    CaDA-Retrain & 51.08\% & 30s   & 30.01\% & 19s   & 27.59\% & 21s   & \cellcolor[HTML]{D0CECE}\textbf{16.47\%} & 19s   & 54.46\% & 29s \\
+    URS & \cellcolor[HTML]{D0CECE}\textbf{38.25\%} & 31s   & 21.34\% & 21s   & 39.22\% & 26s   & 20.83\% & 18s   & \cellcolor[HTML]{D0CECE}\textbf{28.40\%} & 22s \\
+    \midrule
+    \midrule
+    \multirow{2}[2]{*}{Method} & \multicolumn{2}{c|}{MDOCVRPB} & \multicolumn{2}{c|}{MDCVRPBL} & \multicolumn{2}{c|}{MDCVRPLTW} & \multicolumn{2}{c|}{MDOCVRPBTW} & \multicolumn{2}{c}{MDCVRPBLTW} \\
+          & Gap   & Time  & Gap   & Time  & Gap   & Time  & Gap   & Time  & Gap   & Time \\
+    \midrule
+    RF-Retrain & 17.84\% & 15s   & 20.02\% & 29s   & 79.33\% & 40s   & 44.11\% & 19s   & 82.19\% & 23s \\
+    CaDA-Retrain & 26.72\% & 16s   & \cellcolor[HTML]{D0CECE}\textbf{15.02\%} & 18s   & 43.43\% & 29s   & 64.29\% & 25s   & 50.11\% & 24s \\
+    URS & \cellcolor[HTML]{D0CECE}\textbf{15.20\%} & 17s   & 17.36\% & 21s   & \cellcolor[HTML]{D0CECE}\textbf{39.98\%} & 33s   & \cellcolor[HTML]{D0CECE}\textbf{25.68\%} & 19s   & \cellcolor[HTML]{D0CECE}\textbf{33.24\%} & 27s \\
+    \midrule
+    \midrule
+    \multirow{2}[2]{*}{Method} & \multicolumn{2}{c|}{MDOCVRPL} & \multicolumn{2}{c|}{MDCVRPBTW} & \multicolumn{2}{c|}{MDOCVRPBL} & \multicolumn{2}{c|}{MDOCVRPLTW} & \multicolumn{2}{c}{MDOCVRPBLTW} \\
+          & Gap   & Time  & Gap   & Time  & Gap   & Time  & Gap   & Time  & Gap   & Time \\
+    \midrule
+    RF-Retrain & \cellcolor[HTML]{D0CECE}\textbf{19.02\%} & 19s   & 84.94\% & 21s   & 17.72\% & 16s   & 35.06\% & 24s   & 44.12\% & 21s \\
+    CaDA-Retrain & 30.61\% & 20s   & 61.39\% & 25s   & 26.94\% & 17s   & 39.49\% & 29s   & 49.12\% & 25s \\
+    URS & 21.56\% & 24s   & \cellcolor[HTML]{D0CECE}\textbf{33.58\%} & 25s   & \cellcolor[HTML]{D0CECE}\textbf{14.84\%} & 19s   & \cellcolor[HTML]{D0CECE}\textbf{28.60\%} & 24s   & \cellcolor[HTML]{D0CECE}\textbf{25.84\%} & 21s \\
+    \midrule
+    \midrule
+    \multirow{2}[2]{*}{Method} & \multicolumn{2}{c|}{MDCVRPBP} & \multicolumn{2}{c|}{MDOCVRPBP} & \multicolumn{2}{c|}{MDCVRPBPL} & \multicolumn{2}{c|}{MDOCVRPBPTW} & \multicolumn{2}{c}{MDCVRPBPLTW} \\
+          & Gap   & Time  & Gap   & Time  & Gap   & Time  & Gap   & Time  & Gap   & Time \\
+    \midrule
+    RF-Retrain & 54.74\% & 21s   & 36.08\% & 21s   & 54.19\% & 23s   & 47.24\% & 26s   & 84.51\% & 30s \\
+    CaDA-Retrain & 54.45\% & 25s   & 52.38\% & 22s   & 50.69\% & 24s   & 69.07\% & 32s   & 55.63\% & 32s \\
+    URS & \cellcolor[HTML]{D0CECE}\textbf{41.49\%} & 24s   & \cellcolor[HTML]{D0CECE}\textbf{24.18\%} & 23s   & \cellcolor[HTML]{D0CECE}\textbf{41.08\%} & 27s   & \cellcolor[HTML]{D0CECE}\textbf{24.19\%} & 25s   & \cellcolor[HTML]{D0CECE}\textbf{33.99\%} & 35s \\
+    \midrule
+    \midrule
+    \multirow{2}[2]{*}{Method} & \multicolumn{2}{c|}{MDCVRPBPTW} & \multicolumn{2}{c|}{MDOCVRPBPL} & \multicolumn{2}{c|}{MDOCVRPBPLTW} & \multicolumn{2}{c|}{\multirow{2}[2]{*}{Avg.gap}} & \multicolumn{2}{c}{\multirow{2}[2]{*}{Best Solutions}} \\
+          & Gap   & Time  & Gap   & Time  & Gap   & Time  & \multicolumn{2}{c|}{} & \multicolumn{2}{c}{} \\
+    \midrule
+    RF-Retrain & 85.12\% & 28s   & 36.06\% & 23s   & 47.63\% & 28s   & \multicolumn{2}{c|}{29.24\%} & \multicolumn{2}{c}{3/48} \\
+    CaDA-Retrain & 66.78\% & 33s   & 53.48\% & 23s   & 53.06\% & 31s   & \multicolumn{2}{c|}{28.45\%} & \multicolumn{2}{c}{13/48} \\
+    URS & \cellcolor[HTML]{D0CECE}\textbf{34.55\%} & 32s   & \cellcolor[HTML]{D0CECE}\textbf{24.10\%} & 25s   & \cellcolor[HTML]{D0CECE}\textbf{24.32\%} & 27s   & \multicolumn{2}{c|}{\cellcolor[HTML]{D0CECE}\textbf{19.01\%}} & \multicolumn{2}{c}{\cellcolor[HTML]{D0CECE}\textbf{32/48}} \\
+    \bottomrule[0.5mm]
+    \end{tabular}%
+    }
+  \label{tab:urs_rf_cada_150epochs}%
+\end{table}%
+
+\subsection{Detailed Results on CVRPLib Set-X Dataset}
+\label{append:benchmark}
+We further evaluate the generalization ability of URS on benchmark instances from CVRPLib Set-X~\citep{uchoa2017cvrplib_setx} with scale $\in [500,1000]$. Our test results on CVRPLib Set-X datasets are presented in \cref{tb:exp_benchmark_large_scale}. All models are trained on instances of size $N = 100$. In the Set-X dataset, some results for comparative models are sourced from MVMoE~\citep{zhou2024mvmoe} and RouteFinder~\citep{berto2024routefinder}. As shown in \cref{tb:exp_benchmark_large_scale}, URS maintains its position as the best overall performance across instances of varying scales. Notably, RL-based URS surpasses the SL-based representative specialist model LEHD (8.678\% vs. 12.836\%) and many representative multi-task neural solvers (e.g., MVMoE and RouteFinder), underscoring its practical applicability in real-world scenarios. 
+
+\begin{table*}[htbp]
+\caption{Results on large-scale CVRPLib instances (Set-X) \citep{uchoa2017cvrplib_setx} ($500 \leq N \leq 1000$). All models are trained on instances of size $N=100$.}
+  \label{tb:exp_benchmark_large_scale}
+  \begin{center}
+  \begin{small}
+  \renewcommand\arraystretch{1.5}
+  \resizebox{\textwidth}{!}{ 
+  \begin{tabular}{cc|cccccccccccccccc}
+    \toprule[0.5mm]
+\multicolumn{2}{c|}{Set-X}    & \multicolumn{2}{c}{POMO}     & \multicolumn{2}{c}{LEHD}           & \multicolumn{2}{c}{MTPOMO} & \multicolumn{2}{c}{MVMoE/4E} & \multicolumn{2}{c}{MVMoE/4E-L} & \multicolumn{2}{c}{RF-MVMoE}        & \multicolumn{2}{c}{RF-TE}           & \multicolumn{2}{c}{URS}              \\
+Instance         & Opt.       & Obj.         & Gap           & Obj.            & Gap              & Obj.         & Gap           & Obj.         & Gap           & Obj.          & Gap            & Obj.            & Gap               & Obj.            & Gap               & Obj.             & Gap               \\ 
+\midrule
+X-n502-k39       & 69226      & 75617        & 9.232\%       & 71438           & 3.195\%          & 77284        & 11.640\%      & 73533        & 6.222\%       & 74429         & 7.516\%        & 76338           & 10.274\%          & 71791           & 3.705\%           & \cellcolor[HTML]{D0CECE}\textbf{71281}   & \cellcolor[HTML]{D0CECE}\textbf{2.969\%}  \\
+X-n513-k21       & 24201      & 30518        & 26.102\%      & \cellcolor[HTML]{D0CECE}\textbf{25624}  & \cellcolor[HTML]{D0CECE}\textbf{5.880\%} & 28510        & 17.805\%      & 32102        & 32.647\%      & 31231         & 29.048\%       & 32639           & 34.866\%          & 28465           & 17.619\%          & 26166            & 8.119\%           \\
+X-n524-k153      & 154593     & 201877       & 30.586\%      & 280556          & 81.480\%         & 192249       & 24.358\%      & 186540       & 20.665\%      & 182392        & 17.982\%       & \cellcolor[HTML]{D0CECE}\textbf{170999} & \cellcolor[HTML]{D0CECE}\textbf{10.612\%} & 174381          & 12.800\%          & 175250           & 13.362\%          \\
+X-n536-k96       & 94846      & 106073       & 11.837\%      & 103785          & 9.425\%          & 106514       & 12.302\%      & 109581       & 15.536\%      & 108543        & 14.441\%       & 105847          & 11.599\%          & 103272          & 8.884\%           & \cellcolor[HTML]{D0CECE}\textbf{102969}  & \cellcolor[HTML]{D0CECE}\textbf{8.564\%}  \\
+X-n548-k50       & 86700      & 103093       & 18.908\%      & 90644           & 4.549\%          & 94562        & 9.068\%       & 95894        & 10.604\%      & 95917         & 10.631\%       & 104289          & 20.287\%          & 100956          & 16.443\%          & \cellcolor[HTML]{D0CECE}\textbf{89768}   & \cellcolor[HTML]{D0CECE}\textbf{3.539\%}  \\
+X-n561-k42       & 42717      & 49370        & 15.575\%      & \cellcolor[HTML]{D0CECE}\textbf{44728}  & \cellcolor[HTML]{D0CECE}\textbf{4.708\%} & 47846        & 12.007\%      & 56008        & 31.114\%      & 51810         & 21.287\%       & 53383           & 24.969\%          & 49454           & 15.771\%          & 45964            & 7.601\%           \\
+X-n573-k30       & 50673      & 83545        & 64.871\%      & \cellcolor[HTML]{D0CECE}\textbf{53482}  & \cellcolor[HTML]{D0CECE}\textbf{5.543\%} & 60913        & 20.208\%      & 59473        & 17.366\%      & 57042         & 12.569\%       & 61524           & 21.414\%          & 55952           & 10.418\%          & 54361            & 7.278\%           \\
+X-n586-k159      & 190316     & 229887       & 20.792\%      & 232867          & 22.358\%         & 208893       & 9.761\%       & 215668       & 13.321\%      & 214577        & 12.748\%       & 212151          & 11.473\%          & 205575          & 8.018\%           & \cellcolor[HTML]{D0CECE}\textbf{202645}  & \cellcolor[HTML]{D0CECE}\textbf{6.478\%}  \\
+X-n599-k92       & 108451     & 150572       & 38.839\%      & 115377          & 6.386\%          & 120333       & 10.956\%      & 128949       & 18.901\%      & 125279        & 15.517\%       & 126578          & 16.714\%          & 116560          & 7.477\%           & \cellcolor[HTML]{D0CECE}\textbf{114423}  & \cellcolor[HTML]{D0CECE}\textbf{5.507\%}  \\
+X-n613-k62       & 59535      & 68451        & 14.976\%      & \cellcolor[HTML]{D0CECE}\textbf{62484}  & \cellcolor[HTML]{D0CECE}\textbf{4.953\%} & 67984        & 14.192\%      & 82586        & 38.718\%      & 74945         & 25.884\%       & 73456           & 23.383\%          & 67267           & 12.987\%          & 65901            & 10.693\%          \\
+X-n627-k43       & 62164      & 84434        & 35.825\%      & 67568           & 8.693\%          & 73060        & 17.528\%      & 70987        & 14.193\%      & 70905         & 14.061\%       & 70414           & 13.271\%          & 67572           & 8.700\%           & \cellcolor[HTML]{D0CECE}\textbf{66499}   & \cellcolor[HTML]{D0CECE}\textbf{6.973\%}  \\
+X-n641-k35       & 63682      & 75573        & 18.672\%      & 68249           & 7.172\%          & 72643        & 14.071\%      & 75329        & 18.289\%      & 72655         & 14.090\%       & 71975           & 13.023\%          & 70831           & 11.226\%          & \cellcolor[HTML]{D0CECE}\textbf{67005}   & \cellcolor[HTML]{D0CECE}\textbf{5.218\%}  \\
+X-n655-k131      & 106780     & 127211       & 19.134\%      & 117532          & 10.069\%         & 116988       & 9.560\%       & 117678       & 10.206\%      & 118475        & 10.952\%       & 119057          & 11.497\%          & 112202          & 5.078\%           & \cellcolor[HTML]{D0CECE}\textbf{110237}  & \cellcolor[HTML]{D0CECE}\textbf{3.237\%}  \\
+X-n670-k130      & 146332     & 208079       & 42.197\%      & 220927          & 50.977\%         & 190118       & 29.922\%      & 197695       & 35.100\%      & 183447        & 25.364\%       & \cellcolor[HTML]{D0CECE}\textbf{168226} & \cellcolor[HTML]{D0CECE}\textbf{14.962\%} & 168999          & 15.490\%          & 184010           & 25.748\%          \\
+X-n685-k75       & 68205      & 79482        & 16.534\%      & \cellcolor[HTML]{D0CECE}\textbf{72946}           & \cellcolor[HTML]{D0CECE}\textbf{6.951\%} & 80892        & 18.601\%      & 97388        & 42.787\%      & 89441         & 31.136\%       & 82269           & 20.620\%          & 77847           & 14.137\%          & 75942            & 11.344\%          \\
+X-n701-k44       & 81923      & 97843        & 19.433\%      & 86327           & 5.376\%          & 92075        & 12.392\%      & 98469        & 20.197\%      & 94924         & 15.870\%       & 90189           & 10.090\%          & 89932           & 9.776\%           & \cellcolor[HTML]{D0CECE}\textbf{86038}   & \cellcolor[HTML]{D0CECE}\textbf{5.023\%}  \\
+X-n716-k35       & 43373      & 51381        & 18.463\%      & 46502           & 7.214\%          & 52709        & 21.525\%      & 56773        & 30.895\%      & 52305         & 20.593\%       & 52250           & 20.467\%          & 49669           & 14.516\%          & \cellcolor[HTML]{D0CECE}\textbf{46496}   & \cellcolor[HTML]{D0CECE}\textbf{7.200\%}  \\
+X-n733-k159      & 136187     & 159098       & 16.823\%      & 149115          & 9.493\%          & 161961       & 18.925\%      & 178322       & 30.939\%      & 167477        & 22.976\%       & 156387          & 14.833\%          & 148463          & 9.014\%           & \cellcolor[HTML]{D0CECE}\textbf{147743}  & \cellcolor[HTML]{D0CECE}\textbf{8.485\%}  \\
+X-n749-k98       & 77269      & 87786        & 13.611\%      & \cellcolor[HTML]{D0CECE}\textbf{83439}  & \cellcolor[HTML]{D0CECE}\textbf{7.985\%} & 90582        & 17.229\%      & 100438       & 29.985\%      & 94497         & 22.296\%       & 92147           & 19.255\%          & 85171           & 10.227\%          & 83759            & 8.399\%           \\
+X-n766-k71       & 114417     & 135464       & 18.395\%      & 131487          & 14.919\%         & 144041       & 25.891\%      & 152352       & 33.155\%      & 136255        & 19.086\%       & 130505          & 14.061\%          & \cellcolor[HTML]{D0CECE}\textbf{129935} & \cellcolor[HTML]{D0CECE}\textbf{13.563\%} & 139371           & 21.810\%          \\
+X-n783-k48       & 72386      & 90289        & 24.733\%      & \cellcolor[HTML]{D0CECE}\textbf{76766}  & \cellcolor[HTML]{D0CECE}\textbf{6.051\%} & 83169        & 14.897\%      & 100383       & 38.677\%      & 92960         & 28.423\%       & 96336           & 33.087\%          & 83185           & 14.919\%          & 77437            & 6.978\%           \\
+X-n801-k40       & 73305      & 124278       & 69.536\%      & 77546           & 5.785\%          & 85077        & 16.059\%      & 91560        & 24.903\%      & 87662         & 19.585\%       & 87118           & 18.843\%          & 86164           & 17.542\%          & \cellcolor[HTML]{D0CECE}\textbf{77369}   & \cellcolor[HTML]{D0CECE}\textbf{5.544\%}  \\
+X-n819-k171      & 158121     & 193451       & 22.344\%      & 178558          & 12.925\%         & 177157       & 12.039\%      & 183599       & 16.113\%      & 185832        & 17.525\%       & 179596          & 13.581\%          & 174441          & 10.321\%          & \cellcolor[HTML]{D0CECE}\textbf{171024}  & \cellcolor[HTML]{D0CECE}\textbf{8.160\%}  \\
+X-n837-k142      & 193737     & 237884       & 22.787\%      & 207709          & 7.212\%          & 214207       & 10.566\%      & 229526       & 18.473\%      & 221286        & 14.220\%       & 230362          & 18.904\%          & 208528          & 7.635\%           & \cellcolor[HTML]{D0CECE}\textbf{203457}  & \cellcolor[HTML]{D0CECE}\textbf{5.017\%}  \\
+X-n856-k95       & 88965      & 152528       & 71.447\%      & \cellcolor[HTML]{D0CECE}\textbf{92936}  & \cellcolor[HTML]{D0CECE}\textbf{4.464\%} & 101774       & 14.398\%      & 99129        & 11.425\%      & 106816        & 20.065\%       & 105801          & 18.924\%          & 98291           & 10.483\%          & 94547            & 6.274\%           \\
+X-n876-k59       & 99299      & 119764       & 20.609\%      & \cellcolor[HTML]{D0CECE}\textbf{104183} & \cellcolor[HTML]{D0CECE}\textbf{4.918\%} & 116617       & 17.440\%      & 119619       & 20.463\%      & 114333        & 15.140\%       & 114016          & 14.821\%          & 107416          & 8.174\%           & 105417           & 6.161\%           \\
+X-n895-k37       & 53860      & 70245        & 30.421\%      & \cellcolor[HTML]{D0CECE}\textbf{58028}  & \cellcolor[HTML]{D0CECE}\textbf{7.739\%} & 65587        & 21.773\%      & 79018        & 46.710\%      & 64310         & 19.402\%       & 69099           & 28.294\%          & 64871           & 20.444\%          & 58137            & 7.941\%           \\
+X-n916-k207      & 329179     & 399372       & 21.324\%      & 385208          & 17.021\%         & 361719       & 9.885\%       & 383681       & 16.557\%      & 374016        & 13.621\%       & 373600          & 13.494\%          & 352998          & 7.236\%           & \cellcolor[HTML]{D0CECE}\textbf{346556}  & \cellcolor[HTML]{D0CECE}\textbf{5.279\%}  \\
+X-n936-k151      & 132715     & 237625       & 79.049\%      & 196547          & 48.097\%         & 186262       & 40.347\%      & 220926       & 66.466\%      & 190407        & 43.471\%       & \cellcolor[HTML]{D0CECE}\textbf{161343} & \cellcolor[HTML]{D0CECE}\textbf{21.571\%} & 163162          & 22.942\%          & 172675           & 30.110\%          \\
+X-n957-k87       & 85465      & 130850       & 53.104\%      & \cellcolor[HTML]{D0CECE}\textbf{90295}  & \cellcolor[HTML]{D0CECE}\textbf{5.651\%} & 98198        & 14.898\%      & 113882       & 33.250\%      & 105629        & 23.593\%       & 123633          & 44.659\%          & 102689          & 20.153\%          & 90485            & 5.874\%           \\
+X-n979-k58       & 118976     & 147687       & 24.132\%      & 127972          & 7.561\%          & 138092       & 16.067\%      & 146347       & 23.005\%      & 139682        & 17.404\%       & 131754          & 10.740\%          & 129952          & 9.225\%           & \cellcolor[HTML]{D0CECE}\textbf{125353}  & \cellcolor[HTML]{D0CECE}\textbf{5.360\%}  \\
+X-n1001-k43      & 72355      & 100399       & 38.759\%      & \cellcolor[HTML]{D0CECE}\textbf{76689}  & \cellcolor[HTML]{D0CECE}\textbf{5.990\%} & 87660        & 21.153\%      & 114448       & 58.176\%      & 94734         & 30.929\%       & 88969           & 22.962\%          & 85929           & 18.760\%          & 77739            & 7.441\%           \\ \hline
+\multicolumn{2}{c|}{Avg. Gap} & \multicolumn{2}{c}{29.658\%} & \multicolumn{2}{c}{12.836\%}       & \multicolumn{2}{c}{16.796\%} & \multicolumn{2}{c}{26.408\%} & \multicolumn{2}{c}{19.607\%}   & \multicolumn{2}{c}{18.795\%}        & \multicolumn{2}{c}{12.303\%}        & \multicolumn{2}{c}{\cellcolor[HTML]{D0CECE}\textbf{8.678\%}} \\ 
+\bottomrule[0.5mm]
+\end{tabular}
+    
+    }
+  \end{small}
+  \end{center}
+\end{table*}
+
+\clearpage
+\section{Ablation Study}
+\label{append:ablation}
+In this section, we conduct a detailed ablation study and analysis to demonstrate the effectiveness and robustness of URS. Please note that, unless stated otherwise, the results presented in the ablation study reflect the best result from multiple trajectories, and we employ instance augmentation to improve performance in the ablation study. We adopt the widely used 100-node setting as our primary evaluation scenario for URS.
+
+\subsection{Effects of Node-type Indicator}
+\label{append:ablation_nodetype}
+
+\begin{table}[htbp]
+  \centering
+  \caption{The ablation study of the node-type indicator on trained VRPs}
+  \resizebox{\textwidth}{!}{
+    \begin{tabular}{l|c|c|c|c|c|c|c|c|c|c|c|c}
+    \toprule[0.5mm]
+    Method & ATSP  & TSP  & OP  & PCTSP  & PDTSP  & ACVRP  & CVRP  & CVRPTW  & CVRPB  & OCVRP  & OCVRPTW  & Avg.gap \\
+    \midrule
+    w/o $\bm{\xi}_i$ & \cellcolor[HTML]{D0CECE}\textbf{2.14\%} & \cellcolor[HTML]{D0CECE}\textbf{0.48\%} & 0.45\% & 1.06\% & 9.28\% & \cellcolor[HTML]{D0CECE}\textbf{2.84\%} & 3.66\% & 6.61\% & 1.57\% & 7.87\% & 5.66\% & 3.78\% \\
+    w/ $\bm{\xi}_i$   & 2.26\% & 0.57\% & \cellcolor[HTML]{D0CECE}\textbf{0.45\%} & \cellcolor[HTML]{D0CECE}\textbf{1.06\%} & \cellcolor[HTML]{D0CECE}\textbf{4.98\%} & 3.06\% & \cellcolor[HTML]{D0CECE}\textbf{1.81\%} & \cellcolor[HTML]{D0CECE}\textbf{6.13\%} & \cellcolor[HTML]{D0CECE}\textbf{1.46\%} & \cellcolor[HTML]{D0CECE}\textbf{3.24\%} & \cellcolor[HTML]{D0CECE}\textbf{5.07\%} & \cellcolor[HTML]{D0CECE}\textbf{2.74\%} \\
+    \bottomrule[0.5mm]
+    \end{tabular}%
+    }
+  \label{tab:ablation_nodetype}%
+\end{table}%
+To evaluate the effectiveness of node-type indicator $\bm{\xi}$, we conduct an ablation study about including and excluding $\bm{\xi}$. Table \ref{tab:ablation_nodetype} shows that adding the node-type indicator reduces the average optimality gap from 3.78\% to 2.74\%, with large gains on the routing problem with relatively rich instance node roles, such as PDTSP, where the coexistence of a depot and paired pickup-delivery nodes (with inherent precedence coupling) allows the explicit node-role encoding to further boost performance. Meanwhile, URS maintains a competitive performance in addressing the problem of single-node roles.
+
+\subsection{Effects of Problem State}
+\label{append:ablation_constraints}
+
+\begin{table}[htbp]
+  \centering
+  \caption{Performance impact of removing the problem state feature $C_t$}
+  \resizebox{\textwidth}{!}{
+    \begin{tabular}{c|c|c|c|c|c|c|c|c|c|c|c|c}
+    \toprule[0.5mm]
+    Method  & ATSP & TSP & OP & PCTSP & PDTSP & ACVRP & CVRP & CVRPTW & CVRPB & OCVRP & OCVRPTW & Avg.gap \\
+    \midrule
+    w/o $C_t$ &  \cellcolor[HTML]{D0CECE}\textbf{2.09\%} &  \cellcolor[HTML]{D0CECE}\textbf{0.45\%} & 0.60\% & 1.20\% &  \cellcolor[HTML]{D0CECE}\textbf{4.59\%} & 4.03\% & 2.70\% &  \cellcolor[HTML]{D0CECE}\textbf{5.71\%} & 2.64\% & 4.02\% &  \cellcolor[HTML]{D0CECE}\textbf{4.62\%} & 2.97\% \\
+    w/ $C_t$ & 2.26\% & 0.57\% &  \cellcolor[HTML]{D0CECE}\textbf{0.45\%} &  \cellcolor[HTML]{D0CECE}\textbf{1.06\%} & 4.98\% &  \cellcolor[HTML]{D0CECE}\textbf{3.06\%} &  \cellcolor[HTML]{D0CECE}\textbf{1.81\%} & 6.13\% &  \cellcolor[HTML]{D0CECE}\textbf{1.46\%} &  \cellcolor[HTML]{D0CECE}\textbf{3.24\%} & 5.07\% &  \cellcolor[HTML]{D0CECE}\textbf{2.74\%} \\
+    \bottomrule[0.5mm]
+    \end{tabular}%
+    }
+  \label{tab:ablation_constraint}%
+\end{table}%
+
+As described in Appendix \ref{append:problem_state}, the majority of VRP variants are already solved without supplying an additional problem state $C_t$. To test whether the remaining use of $C_t$ matters, we conduct an ablation in which we eliminate it entirely, enforcing $C_t\equiv0$ for all problems. The results in \cref{tab:ablation_constraint} show that URS maintains its competitive performance even in the absence of $C_t$. This indicates that explicit constraint-state features are not essential to URS effectiveness. Interestingly, on (O)CVRPTW instances, the model without any explicit constraint features outperforms the version that supplies only capacity information. We guess that capacity and time windows information are equally important, so enforcing only capacity creates a bias toward load considerations.
+
+\subsection{Effects of Mixed Bias Module}
+\label{append:ablation_mbm}
+
+\begin{table}[htbp]
+  \centering
+  \caption{Ablation of prior components in the MBM.}
+  \resizebox{\textwidth}{!}{
+    \begin{tabular}{ccccccccccccccc}
+    \toprule[0.5mm]
+    $\bm{D}$     & $\bm{D^{\mathrm{T}}}$    & \multicolumn{1}{c|}{$\bm{R}$} & \multicolumn{1}{c|}{ATSP} & \multicolumn{1}{c|}{TSP} & \multicolumn{1}{c|}{OP } & \multicolumn{1}{c|}{PCTSP } & \multicolumn{1}{c|}{PDTSP } & \multicolumn{1}{c|}{ACVRP } & \multicolumn{1}{c|}{CVRP } & \multicolumn{1}{c|}{CVRPTW } & \multicolumn{1}{c|}{CVRPB } & \multicolumn{1}{c|}{OCVRP } & \multicolumn{1}{c|}{OCVRPTW } & Avg.gap \\
+    \midrule
+    $\checkmark$     & $\times$     & \multicolumn{1}{c|}{$\times$} & \multicolumn{1}{c|}{16.64\%} & \multicolumn{1}{c|}{ \cellcolor[HTML]{D0CECE}\textbf{0.44\%}} & \multicolumn{1}{c|}{ \cellcolor[HTML]{D0CECE}\textbf{0.25\%}} & \multicolumn{1}{c|}{ \cellcolor[HTML]{D0CECE}\textbf{0.67\%}} & \multicolumn{1}{c|}{7.33\%} & \multicolumn{1}{c|}{16.62\%} & \multicolumn{1}{c|}{2.42\%} & \multicolumn{1}{c|}{6.44\%} & \multicolumn{1}{c|}{3.96\%} & \multicolumn{1}{c|}{9.44\%} & \multicolumn{1}{c|}{5.47\%} & 6.33\% \\
+    $\checkmark$     & $\checkmark$     & \multicolumn{1}{c|}{$\times$} & \multicolumn{1}{c|}{ \cellcolor[HTML]{D0CECE}\textbf{2.09\%}} & \multicolumn{1}{c|}{0.45\%} & \multicolumn{1}{c|}{0.48\%} & \multicolumn{1}{c|}{0.82\%} & \multicolumn{1}{c|}{7.66\%} & \multicolumn{1}{c|}{9.11\%} & \multicolumn{1}{c|}{2.52\%} & \multicolumn{1}{c|}{6.89\%} & \multicolumn{1}{c|}{2.68\%} & \multicolumn{1}{c|}{5.70\%} & \multicolumn{1}{c|}{6.36\%} & 4.07\% \\
+    $\checkmark$     & $\times$     & \multicolumn{1}{c|}{$\checkmark$} & \multicolumn{1}{c|}{16.60\%} & \multicolumn{1}{c|}{0.46\%} & \multicolumn{1}{c|}{0.49\%} & \multicolumn{1}{c|}{0.94\%} & \multicolumn{1}{c|}{ \cellcolor[HTML]{D0CECE}\textbf{4.49\%}} & \multicolumn{1}{c|}{26.22\%} & \multicolumn{1}{c|}{4.16\%} & \multicolumn{1}{c|}{6.57\%} & \multicolumn{1}{c|}{3.07\%} & \multicolumn{1}{c|}{12.23\%} & \multicolumn{1}{c|}{5.53\%} & 7.34\% \\
+    $\checkmark$     & $\checkmark$     & \multicolumn{1}{c|}{$\checkmark$} & \multicolumn{1}{c|}{2.26\%} & \multicolumn{1}{c|}{0.57\%} & \multicolumn{1}{c|}{0.45\%} & \multicolumn{1}{c|}{1.06\%} & \multicolumn{1}{c|}{4.98\%} & \multicolumn{1}{c|}{ \cellcolor[HTML]{D0CECE}\textbf{3.06\%}} & \multicolumn{1}{c|}{ \cellcolor[HTML]{D0CECE}\textbf{1.81\%}} & \multicolumn{1}{c|}{ \cellcolor[HTML]{D0CECE}\textbf{6.13\%}} & \multicolumn{1}{c|}{ \cellcolor[HTML]{D0CECE}\textbf{1.46\%}} & \multicolumn{1}{c|}{ \cellcolor[HTML]{D0CECE}\textbf{3.24\%}} & \multicolumn{1}{c|}{ \cellcolor[HTML]{D0CECE}\textbf{5.07\%}} &  \cellcolor[HTML]{D0CECE}\textbf{2.74\%} \\
+    \bottomrule[0.5mm]
+    \end{tabular}%
+    }
+  \label{tab:ablation_mbm}%
+\end{table}%
+
+To further assess the effectiveness of MBM, we conduct an ablation study that examines different combinations of problem-specific priors within MBM. Owing to its flexibility, the MBM allows multiple priors to be imposed on the same shared attention layer. The results in Table \ref{tab:ablation_mbm} underscore the complementary roles of the three prior components: (1) The transposed distance matrix $\bm{D^{\mathrm{T}}}$ captures directional asymmetry absent from the raw distance matrix, and its inclusion markedly stabilizes optimization on asymmetric variants; (2) Removing the pickup-delivery relation matrix $\bm{R}$ degrades performance on PDTSPs, confirming that explicit relational coupling is indispensable for these instances; (3) When all priors are fused, MBM can simultaneously learn the geometric and relational biases inherent in various problems, yielding the best overall performance.
+
+\subsection{Effects of Different Decoder Architectures}
+\label{append:ablation_decoder}
+
+\begin{table}[htbp]
+  \centering
+  \caption{Effect of different decoder architectures on URS cross-problem performance.}
+  \resizebox{\textwidth}{!}{
+    \begin{tabular}{c|c|c|c|c|c|c|c|c|c|c|c|c}
+    \toprule[0.5mm]
+    Decoder & ATSP  & TSP   & OP    & PCTSP & PDTSP & ACVRP & CVRP  & CVRPTW & CVRPB & OCVRP & OCVRPTW & Avg.gap \\
+    \midrule
+    URS-POMO & 4.83\% & 0.74\% & 0.72\% & 1.29\% & 5.45\% & 5.09\% & 1.99\% & 6.42\% & 1.83\% & 3.62\% & 5.31\% & 3.39\% \\
+    URS-ReLD & 6.48\% & 0.90\% & 0.86\% & 1.51\% & 5.81\% & 6.51\% & 2.33\% & 6.56\% & 2.33\% & 3.62\% & 5.64\% & 3.87\% \\
+    URS  & \cellcolor[HTML]{D0CECE}\textbf{2.26\%} & \cellcolor[HTML]{D0CECE}\textbf{0.57\%} & \cellcolor[HTML]{D0CECE}\textbf{0.45\%} & \cellcolor[HTML]{D0CECE}\textbf{1.06\%} & \cellcolor[HTML]{D0CECE}\textbf{4.98\%} & \cellcolor[HTML]{D0CECE}\textbf{3.06\%} & \cellcolor[HTML]{D0CECE}\textbf{1.81\%} & \cellcolor[HTML]{D0CECE}\textbf{6.13\%} & \cellcolor[HTML]{D0CECE}\textbf{1.46\%} & \cellcolor[HTML]{D0CECE}\textbf{3.24\%} & \cellcolor[HTML]{D0CECE}\textbf{5.07\%} & \cellcolor[HTML]{D0CECE}\textbf{2.74\%} \\
+    \bottomrule[0.5mm]
+    \end{tabular}%
+    }
+  \label{tab:ablation_different_decoder}%
+\end{table}%
+We adopt an AM~\citep{kool2019attention} as our basic encoder-decoder model. Multiple decoder refinements have been proposed around AM~\citep{kwon2020pomo,huang2025reld,zhou2024icam}. To assess how decoder structure impacts multi-task performance, we additionally train two URS variants whose decoders follow POMO and ReLD, denoted URS-POMO and URS-ReLD. For stronger and fairer baselines, we apply Distance-aware Attention Reshaping (DAR)~\citep{wang2025distance} to both, and all decoder parameters are generated by a hypernetwork conditioned on the problem representation $\bm{\lambda}$ (see Appendix \ref{append:decoder}). As shown in \cref{tab:ablation_different_decoder}, URS-POMO and URS-ReLD still exhibit strong cross-problem robustness, while replacing the decoder with ICAM~\citep{zhou2024icam} yields a further overall improvement.
+
+Furthermore, the results in \cref{tab:ablation_different_decoder} reveal a notable optimization challenge. By incorporating an additional Feed-Forward Network layer compared to POMO, the ReLD decoder forces the hypernetwork to map to a larger parameter space, thereby increasing its learning difficulty and degrading performance. This optimization difficulty prevents URS-ReLD from matching the performance of the original ReLD-MTL, where weights are learned directly rather than being dynamically generated. Given the outstanding performance of ReLD and other heavy-decoder paradigms in single-task optimization~\citep{luo2023lehd,drakulic2023bq}, exploring how to adapt problem-conditioned generation mechanisms for heavier decoders is a highly promising direction.
+
+
+\subsection{Effects of MBM \& Parameter Generator on Zero-shot Generalization}
+\label{append:mbm_hyper_bias}
+\begin{table}[htbp]
+  \centering
+  \caption{Ablation of MBM, $\mathrm{WEIGHT}(\bm{\lambda})$, and $\mathrm{BIAS}(\bm{\lambda})$ on cross-problem zero-shot generalization. The symbol (*) indicates the seen problems in training.}
+  \resizebox{0.99\textwidth}{!}{
+    \begin{tabular}{ccc|c|c|c|c|c|c}
+  
+    \toprule[0.5mm]
+    MBM   & $\mathrm{WEIGHT}(\bm{\lambda})$ & $\mathrm{BIAS}(\bm{\lambda})$ & ATSP (*) & TSP (*) & OP (*) & PCTSP (*) & PDTSP (*) & ACVRP (*) \\
+    \midrule
+    $\times$ & $\checkmark$     & $\checkmark$    & 16.64\% & \cellcolor[HTML]{D0CECE}\textbf{0.44\%} & \cellcolor[HTML]{D0CECE}\textbf{0.25\%} & \cellcolor[HTML]{D0CECE}\textbf{0.67\%} & 7.33\% & 16.62\% \\
+    $\checkmark$     & $\times$     & $\times$ & 4.24\% & 1.10\% & 1.04\% & 1.42\% & 6.38\% & 4.07\% \\
+    $\checkmark$     & $\times$     & $\checkmark$  & 3.83\% & 1.16\% & 1.09\% & 1.52\% & 6.65\% & 4.27\% \\
+     $\checkmark$     & $\checkmark$ & $\times$ & 2.79\% & 1.58\% & 1.39\% & 1.92\% & 7.05\% & 3.39\% \\
+    $\checkmark$     & $\checkmark$     & $\checkmark$   & \cellcolor[HTML]{D0CECE}\textbf{2.26\%} & 0.57\% & 0.45\% & 1.06\% & \cellcolor[HTML]{D0CECE}\textbf{4.98\%} & \cellcolor[HTML]{D0CECE}\textbf{3.06\%} \\
+    \midrule
+    \midrule
+    MBM   & $\mathrm{WEIGHT}(\bm{\lambda})$ & $\mathrm{BIAS}(\bm{\lambda})$ & CVRP (*) & CVRPTW (*) & CVRPB (*) & OCVRP (*) & OCVRPTW (*) & CVRPL \\
+    \midrule
+    $\times$ & $\checkmark$     & $\checkmark$     & 2.42\% & 6.44\% & 3.96\% & 9.44\% & 5.47\% & 0.98\% \\
+    $\checkmark$     & $\times$     & $\times$ & 6.23\% & 7.22\% & 5.00\% & 3.99\% & 5.41\% & 2.92\% \\
+  $\checkmark$     & $\times$     & $\checkmark$ & 4.94\% & \cellcolor[HTML]{D0CECE}\textbf{6.08\%} & 3.00\% & 4.61\% & 5.21\% & 4.79\% \\
+    $\checkmark$     & $\checkmark$ & $\times$& 2.90\% & 6.60\% & 3.12\% & 4.47\% & \cellcolor[HTML]{D0CECE}\textbf{4.76\%} & 1.46\% \\
+    $\checkmark$     & $\checkmark$     & $\checkmark$   & \cellcolor[HTML]{D0CECE}\textbf{1.81\%} & 6.13\% & \cellcolor[HTML]{D0CECE}\textbf{1.46\%} & \cellcolor[HTML]{D0CECE}\textbf{3.24\%} & 5.07\% & \cellcolor[HTML]{D0CECE}\textbf{0.43\%} \\
+    \midrule
+    \midrule
+    MBM   & $\mathrm{WEIGHT}(\bm{\lambda})$ & $\mathrm{BIAS}(\bm{\lambda})$ & OCVRPB & CVRPBL & CVRPLTW & OCVRPBTW & CVRPBLTW & OCVRPL \\
+    \midrule
+    $\times$ & $\checkmark$     & $\checkmark$   & 15.95\% & 4.18\% & 2.89\% & 18.78\% & 10.93\% & 9.51\% \\
+    $\checkmark$     & $\times$     & $\times$ & 9.54\% & 5.30\% & 2.73\% & 14.37\% & 9.80\% & 4.64\% \\
+   $\checkmark$     & $\times$     & $\checkmark$  & 9.58\% & 3.25\% & 3.07\% & 14.16\% & 9.91\% & 3.88\% \\
+    $\checkmark$     & $\checkmark$ & $\times$& 9.92\% & 3.34\% & 3.08\% & 14.02\% & 9.92\% & 4.52\% \\
+   $\checkmark$     & $\checkmark$     & $\checkmark$    & \cellcolor[HTML]{D0CECE}\textbf{9.35\%} & \cellcolor[HTML]{D0CECE}\textbf{1.65\%} & \cellcolor[HTML]{D0CECE}\textbf{2.67\%} & \cellcolor[HTML]{D0CECE}\textbf{13.77\%} & \cellcolor[HTML]{D0CECE}\textbf{9.18\%} & \cellcolor[HTML]{D0CECE}\textbf{3.22\%} \\
+    \midrule
+    \midrule
+    MBM   & $\mathrm{WEIGHT}(\bm{\lambda})$ & $\mathrm{BIAS}(\bm{\lambda})$ & CVRPBTW & OCVRPBL & OCVRPLTW & OCVRPBLTW & Avg.gap & Best Sol. \\
+    \midrule
+    $\times$ & $\checkmark$     & $\checkmark$    & 10.74\% & 16.14\% & 5.57\% & 18.80\% & 8.37\% & 3/22 \\
+    $\checkmark$     & $\times$     & $\times$ & 9.67\% & 10.67\% & 5.23\% & 14.49\% & 6.16\% & 0/22 \\
+   $\checkmark$     & $\times$     & $\checkmark$ & 9.63\% & 10.42\% & 5.51\% & 13.99\% & 5.93\% & 1/22 \\
+    $\checkmark$     & $\checkmark$ & $\times$& 9.79\% & 10.02\% & 5.81\% & 13.98\% & 5.72\% & 1/22 \\
+   $\checkmark$     & $\checkmark$     & $\checkmark$    & \cellcolor[HTML]{D0CECE}\textbf{8.94\%} & \cellcolor[HTML]{D0CECE}\textbf{9.47\%} & \cellcolor[HTML]{D0CECE}\textbf{5.12\%} & \cellcolor[HTML]{D0CECE}\textbf{13.72\%} & \cellcolor[HTML]{D0CECE}\textbf{4.89\%} & \cellcolor[HTML]{D0CECE}\textbf{17/22} \\
+    \bottomrule[0.5mm]
+    \end{tabular}%
+    }
+  \label{tab:ablation_hyper_bias}%
+\end{table}%
+
+To empirically evaluate the necessity of these components, we have conducted tests on the 11 seen problems as well as 11 additional unseen CVRP variants widely investigated in current multi-task research (e.g., MVMoE~\citep{zhou2024mvmoe}). The results are presented in \cref{tab:ablation_hyper_bias}. We can observe that removing MBM leads to a significant performance drop on problems with complex geometric properties, such as ATSP, ACVRP, and PDTSP, which confirms MBM is critical for perceiving specific geometric biases. In addition, removing $\mathrm{WEIGHT}(\bm{\lambda})$ or $\mathrm{BIAS}(\bm{\lambda})$ also results in performance degradation across most tasks. In terms of overall performance, URS significantly outperforms any model where a single module is removed. The full URS model achieves the lowest average gap and provides the best solution on the majority of tasks (17/22). This demonstrates that the synergy of these components is essential for robust cross-problem generalization.
+
+\subsection{Effects of Each UDR Component}
+\label{append:effect_udr_component}
+To clarify the independent contribution of each UDR component, we conduct ablations by removing each component in turn. As shown in Table \ref{tab:effects_each_component_udr}, the absence of any single component leads to notable performance degradation. A complete UDR achieves the lowest average gap and provides the best solution on the majority of tasks (15/22), affirming the necessity of our UDR design for robust zero-shot generalization.
+
+\begin{table}[htbp]
+  \centering
+  \caption{The ablation study of each UDR component. The symbol (*) indicates the seen problems in training. $\bm{\rho}$, $\bm{\omega}$, and $\bm{\xi}$ represent positional identifier, unified attribute set, and node-type indicator, respectively. Since removing positional identifiers prevents the use of instance augmentation, we have excluded it from all results to ensure consistency in the inference strategy. }
+  \resizebox{\textwidth}{!}{
+    \begin{tabular}{ccc|c|c|c|c|c|c}
+    \toprule[0.5mm]
+    $\bm{\rho}$ & $\bm{\omega}$ & $\bm{\xi}$    & ATSP (*) & TSP (*) & OP (*) & PCTSP (*) & PDTSP (*) & ACVRP (*) \\
+    \midrule
+    $\times$ & $\checkmark$     & $\checkmark$     & 7.64\% & 1.76\% & 1.17\% & 1.96\% & 8.54\% & 7.16\% \\
+    $\checkmark$     & $\times$ & $\checkmark$     & 10.07\% & 1.98\% & 2.70\% & 7.05\% & 13.50\% & 13.36\% \\
+    $\checkmark$     & $\checkmark$     & $\times$ & \cellcolor[HTML]{D0CECE}\textbf{5.43\%} & \cellcolor[HTML]{D0CECE}\textbf{1.02\%} & 1.08\% & 1.86\% & 12.72\% & \cellcolor[HTML]{D0CECE}\textbf{5.81\%} \\
+    $\checkmark$     & $\checkmark$     & $\checkmark$     & 5.51\% & 1.17\% & \cellcolor[HTML]{D0CECE}\textbf{0.96\%} & \cellcolor[HTML]{D0CECE}\textbf{1.79\%} & \cellcolor[HTML]{D0CECE}\textbf{7.71\%} & 6.11\% \\
+    \midrule
+    \midrule
+     $\bm{\rho}$ & $\bm{\omega}$ & $\bm{\xi}$     & CVRP (*) & CVRPTW (*) & CVRPB (*) & OCVRP (*) & OCVRPTW (*) & CVRPL \\
+    \midrule
+    $\times$ & $\checkmark$     & $\checkmark$     & 2.68\% & 6.88\% & 2.84\% & 4.64\% & \cellcolor[HTML]{D0CECE}\textbf{5.91\%} & 1.29\% \\
+    $\checkmark$     & $\times$ & $\checkmark$     & 4.15\% & 23.71\% & 5.24\% & 7.10\% & 19.10\% & 2.70\% \\
+    $\checkmark$     & $\checkmark$     & $\times$ & 4.72\% & 7.67\% & 2.83\% & 9.64\% & 6.96\% & 3.33\% \\
+    $\checkmark$     & $\checkmark$     & $\checkmark$     & \cellcolor[HTML]{D0CECE}\textbf{2.62\%} & \cellcolor[HTML]{D0CECE}\textbf{6.80\%} & \cellcolor[HTML]{D0CECE}\textbf{2.69\%} & \cellcolor[HTML]{D0CECE}\textbf{4.54\%} & 6.00\% & \cellcolor[HTML]{D0CECE}\textbf{1.23\%} \\
+    \midrule
+    \midrule
+     $\bm{\rho}$ & $\bm{\omega}$ & $\bm{\xi}$     & OCVRPB & CVRPBL & CVRPLTW & OCVRPBTW & CVRPBLTW & OCVRPL \\
+    \midrule
+    $\times$ & $\checkmark$     & $\checkmark$     & 11.87\% & 3.12\% & \cellcolor[HTML]{D0CECE}\textbf{3.34\%} & 34.34\% & 44.03\% & 4.63\% \\
+    $\checkmark$     & $\times$ & $\checkmark$     & 15.02\% & 5.47\% & 19.53\% & 30.88\% & 29.64\% & 6.98\% \\
+    $\checkmark$     & $\checkmark$     & $\times$ & 26.06\% & \cellcolor[HTML]{D0CECE}\textbf{2.69\%} & 4.13\% & 34.62\% & 26.55\% & 9.68\% \\
+    $\checkmark$     & $\checkmark$     & $\checkmark$     & \cellcolor[HTML]{D0CECE}\textbf{11.54\%} & 3.03\% & 3.38\% & \cellcolor[HTML]{D0CECE}\textbf{15.47\%} & \cellcolor[HTML]{D0CECE}\textbf{10.70\%} & \cellcolor[HTML]{D0CECE}\textbf{4.55\%} \\
+    \midrule
+    \midrule
+     $\bm{\rho}$ & $\bm{\omega}$ & $\bm{\xi}$     & CVRPBTW & OCVRPBL & OCVRPLTW & OCVRPBLTW & Avg.gap & Best Sol. \\
+    \midrule
+    $\times$ & $\checkmark$     & $\checkmark$     & 43.99\% & 11.99\% & \cellcolor[HTML]{D0CECE}\textbf{6.02\%} & 34.66\% & 11.38\% & 3/22 \\
+    $\checkmark$     & $\times$ & $\checkmark$     & 29.34\% & 14.84\% & 19.22\% & 31.02\% & 14.21\% & 0/22 \\
+    $\checkmark$     & $\checkmark$     & $\times$ & 28.60\% & 25.96\% & 7.00\% & 35.93\% & 12.01\% & 4/22 \\
+    $\checkmark$     & $\checkmark$     & $\checkmark$     & \cellcolor[HTML]{D0CECE}\textbf{10.51\%} & \cellcolor[HTML]{D0CECE}\textbf{11.68\%} & 6.08\% & \cellcolor[HTML]{D0CECE}\textbf{15.38\%} & \cellcolor[HTML]{D0CECE}\textbf{6.34\%} & \cellcolor[HTML]{D0CECE}\textbf{15/22} \\
+    \bottomrule[0.5mm]
+    \end{tabular}%
+    }
+  \label{tab:effects_each_component_udr}%
+\end{table}%
+
+\subsection{Hypernetwork vs. Adapter}
+\label{append:11_adapter}
+We train URS-Adapter, a URS variant that adopts a distinct decoder for each of the 11 variants, and compare it with the original URS using a hypernetwork on 11 seen problems (see Table \ref{tab:11_adapters}) and large-scale CVRP variants (see Table \ref{tab:large_scale_adapter}). URS consistently outperforms URS-Adapter across 11 seen problems, achieving higher parameter efficiency. This performance advantage holds consistently on large-scale CVRP variants, which further solidifies our conclusion.
+\begin{table}[h!]
+  \centering
+  \caption{Performance comparison between URS-Hypernet and URS-Adapter on 11 seen VRP variants.}
+  \resizebox{0.8\textwidth}{!}{
+    \begin{tabular}{c|cc|cc|cc|cc}
+    \toprule[0.5mm]
+    \multirow{2}[1]{*}{Method} & \multicolumn{2}{c|}{OP} & \multicolumn{2}{c|}{PCTSP} & \multicolumn{2}{c|}{PDTSP} & \multicolumn{2}{c}{ACVRP} \\
+          & Gap   & Time  & Gap   & Time  & Gap   & Time  & Gap   & Time \\
+    \midrule
+    URS-Adapter & 0.88\% & 4s    & 1.47\% & 4s    & 5.69\% & 4s    & 3.83\% & 1.5m \\
+    URS & \cellcolor[HTML]{D0CECE}\textbf{0.45\%} & 4s    & \cellcolor[HTML]{D0CECE}\textbf{1.06\%} & 4s    & \cellcolor[HTML]{D0CECE}\textbf{4.98\%} & 4s    & \cellcolor[HTML]{D0CECE}\textbf{3.06\%} & 1.5m \\
+    \midrule
+    \midrule
+    \multirow{2}[1]{*}{Method} & \multicolumn{2}{c|}{CVRPTW} & \multicolumn{2}{c|}{CVRPB} & \multicolumn{2}{c|}{OCVRP} & \multicolumn{2}{c}{OCVRPTW} \\
+          & Gap   & Time  & Gap   & Time  & Gap   & Time  & Gap   & Time \\
+    \midrule
+    URS-Adapter & 6.34\% & 8s    & 3.21\% & 5s    & 4.06\% & 6s    & \cellcolor[HTML]{D0CECE}\textbf{4.94\%} & 7s \\
+    URS & \cellcolor[HTML]{D0CECE}\textbf{6.13\%} & 8s    & \cellcolor[HTML]{D0CECE}\textbf{1.46\%} & 5s    & \cellcolor[HTML]{D0CECE}\textbf{3.24\%} & 6s    & 5.07\% & 7s \\
+    \midrule
+    \midrule
+    \multirow{2}[1]{*}{Method} & \multicolumn{2}{c|}{ATSP} & \multicolumn{2}{c|}{TSP} & \multicolumn{2}{c|}{CVRP} &  Average     & Best \\
+          & Gap   & Time  & Gap   & Time  & Gap   & Time  & Gap & Solution \\
+    \midrule
+    URS-Adapter & 2.97\% & 1.2m  & 0.82\% & 4s    & 2.85\% & 6s    & 3.37\% & 1/11 \\
+    URS & \cellcolor[HTML]{D0CECE}\textbf{2.26\%} & 1.2m  & \cellcolor[HTML]{D0CECE}\textbf{0.57\%} & 4s    & \cellcolor[HTML]{D0CECE}\textbf{1.81\%} & 6s    & \cellcolor[HTML]{D0CECE}\textbf{2.74\%} & \cellcolor[HTML]{D0CECE}\textbf{10/11} \\
+    \bottomrule[0.5mm]
+    \end{tabular}%
+   }
+  \label{tab:11_adapters}%
+\end{table}%
+
+\begin{table}[h!]
+  \centering
+  \caption{Generalization comparison between URS and URS-Adapter across diverse large-scale CVRP variants.}
+  \resizebox{\textwidth}{!}{
+    \begin{tabular}{c|c|cc|cc|cc|cc|cc}
+    \toprule[0.5mm]
+    \multirow{2}[2]{*}{Problem} & \multirow{2}[2]{*}{Method} & \multicolumn{2}{c|}{N = 1000} & \multicolumn{2}{c|}{N = 2000} & \multicolumn{2}{c|}{N = 3000} & \multicolumn{2}{c|}{N = 4000} & \multicolumn{2}{c}{N = 5000} \\
+          &       & Obj.(Gap) & Time  & Obj.(Gap) & Time  & Obj.(Gap) & Time  & Obj.(Gap) & Time  & Obj.(Gap) & Time \\
+    \midrule
+    \multirow{3}[2]{*}{CVRPTW} & PyVRP & 159.35(0.00\%) & 20m   & 337.15(0.00\%) & 40m   & 516.97(0.00\%) & 1h    & 618.58(0.00\%) & 2.7h  & 787.25(0.00\%) & 3.3h \\
+          & URS-Adapter & 173.68(8.99\%) & 1.3m  & 367.22(8.92\%) & 10.8m & 564.55(9.21\%) & 30.8m & 677.91(9.59\%) & 1.2h  & 860.63(9.32\%) & 2.3h \\
+          & URS   & \cellcolor[HTML]{D0CECE}\textbf{172.58(8.30\%)} & 1.3m  & \cellcolor[HTML]{D0CECE}\textbf{365.27(8.34\%)} & 11.1m & \cellcolor[HTML]{D0CECE}\textbf{559.03(8.14\%)} & 30.1m & \cellcolor[HTML]{D0CECE}\textbf{673.63(8.90\%)} & 1.2h  & \cellcolor[HTML]{D0CECE}\textbf{853.79(8.45\%) } & 2.3h \\
+    \midrule
+    \midrule
+    \multirow{3}[2]{*}{CVRPB} & PyVRP & 36.52(0.00\%) & 20m   & 51.80(0.00\%) & 40m   & 75.12(0.00\%) & 1h    & 93.52(0.00\%) & 2.7h  & 112.21(0.00\%) & 3.3h \\
+          & URS-Adapter & 42.71(16.96\%) & 43s   & 62.73(21.11\%) & 5.5m  & 85.72(14.11\%) & 17.5m & 107.17(14.59\%) & 41.9m & 127.93(14.01\%) & 1.3h \\
+          & URS   & \cellcolor[HTML]{D0CECE}\textbf{34.86(-4.54\%)} & 40s   & \cellcolor[HTML]{D0CECE}\textbf{50.39(-2.72\%)} & 5.1m  & \cellcolor[HTML]{D0CECE}\textbf{72.01(-4.15\%)} & 17.3m & \cellcolor[HTML]{D0CECE}\textbf{91.74(-1.91\%)} & 41.2m & \cellcolor[HTML]{D0CECE}\textbf{111.93(-0.24\%) } & 1.3h \\
+    \midrule
+    \midrule
+    \multirow{3}[2]{*}{OCVRPTW} & PyVRP & 90.91(0.00\%) & 20m   & 164.00(0.00\%) & 40m   & 224.16(0.00\%) & 1h    & 299.45(0.00\%) & 2.7h  & 367.86(0.00\%) & 3.3h \\
+          & URS-Adapter & 105.96(16.56\%) & 1.1m  & 203.52(24.10\%) & 9.9m  & 287.70(28.35\%) & 28.6m & 391.06(30.59\%) & 1h  & 483.19(31.35\%) & 1.9h \\
+          & URS   & \cellcolor[HTML]{D0CECE}\textbf{98.76(8.63\%)} & 1m    & \cellcolor[HTML]{D0CECE}\textbf{178.07(8.58\%) } & 7.6m  & \cellcolor[HTML]{D0CECE}\textbf{243.88(8.80\%)} & 25.4m & \cellcolor[HTML]{D0CECE}\textbf{325.64(8.74\%) } & 1h    & \cellcolor[HTML]{D0CECE}\textbf{398.72(8.39\%) } & 1.9h \\
+    \bottomrule[0.5mm]
+    \end{tabular}%
+    }
+  \label{tab:large_scale_adapter}%
+\end{table}%
+
+\section{Licenses for Used Resources}
+\label{append:licenses}
+
+\begin{table}[h!]
+\centering
+\caption{List of licenses for the codes and datasets we used in this work.}
+\label{table:Licenses}
+\resizebox{0.99\textwidth}{!}{%
+\begin{tabular}{l |l | l | l }
+\toprule[0.5mm]
+ Resource   &   Type  &  Link  & License    \\
+\midrule
+PyVRP \citep{wouda2024pyvrp}& Code & \url{https://github.com/PyVRP/PyVRP} & MIT License\\
+LKH3 \citep{LKH3} & Code & \url{http://webhotel4.ruc.dk/~keld/research/LKH-3/} & Available for academic research use\\
+
+OR-Tools \citep{ortools}& Code & \url{https://github.com/google/or-tools} & Apache-2.0 License\\
+\midrule
+
+POMO \citep{kwon2020pomo}& Code & \url{https://github.com/yd-kwon/POMO/tree/master/NEW\_py\_ver} & MIT License \\
+Sym-NCO \citep{kim2022symnco}& Code & \url{https://github.com/alstn12088/Sym-NCO} & Available for any non-commercial use \\
+LEHD \citep{luo2023lehd} & Code & \url{https://github.com/CIAM-Group/NCO\_code/tree/main/single\_objective/LEHD} & Available for any non-commercial use \\
+BQ \citep{drakulic2023bq}& Code & \url{https://github.com/naver/bq-nco} & CC BY-NC-SA 4.0 license \\
+ICAM \citep{zhou2024icam} & Code & \url{https://github.com/CIAM-Group/ICAM} & MIT License  \\
+ELG \citep{gao2023elg} & Code & \url{https://github.com/gaocrr/ELG} & MIT License \\
+MatNet \citep{kwon2021matnet} & Code & \url{https://github.com/yd-kwon/MatNet/tree/main} & MIT License  \\
+Heter-AM \citep{li2021pdtsp} & Code & \url{https://github.com/jingwenli0312/Heterogeneous-Attentions-PDP-DRL} & MIT License  \\
+MTPOMO \citep{liu2024mtpomo} & Code & \url{https://github.com/FeiLiu36/MTNCO} & MIT License  \\
+MVMoE \citep{zhou2024mvmoe} & Code & \url{https://github.com/RoyalSkye/Routing-MVMoE} & MIT License  \\
+RouteFinder \citep{berto2024routefinder} & Code & \url{https://github.com/ai4co/routefinder} & MIT License  \\
+CaDA \citep{li2025cada} & Code & \url{https://github.com/CIAM-Group/CaDA} & MIT License  \\
+ReLD \citep{huang2025reld} & Code & \url{https://github.com/ziweileonhuang/reld-nco} & MIT License  \\
+GOAL \citep{drakulic2025goal} & Code & \url{https://github.com/naver/goal-co} & Available for any non-commercial use  \\
+\midrule
+
+CVRPLib Set-X \citep{uchoa2017cvrplib_setx} & Dataset & \url{http://vrp.galgos.inf.puc-rio.br/index.php/en/}  & Available for academic research use \\
+CVRPLib Set-AGS \citep{arnold2019cvrplib_xxl} & Dataset & \url{http://vrp.galgos.inf.puc-rio.br/index.php/en/}  & Available for academic research use \\
+
+\bottomrule[0.5mm]
+\end{tabular}%
+}
+\end{table}
+We list the existing codes and datasets in \cref{table:Licenses}, all of which are open-source resources for academic use.
+
+\end{document}
+

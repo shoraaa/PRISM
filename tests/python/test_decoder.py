@@ -131,6 +131,8 @@ def test_search_configuration_is_exposed() -> None:
         "classical_behavior": True,
         "verify_screening_resources": False,
         "verify_incremental_srr": False,
+        "srr_exploration_budget": 0,
+        "srr_exploration_margin": pytest.approx(1.0e-6),
     }
 
 

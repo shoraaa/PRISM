@@ -63,6 +63,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--rollouts", type=int, default=32)
     parser.add_argument("--candidates", type=int, default=64)
     parser.add_argument(
+        "--srr-exploration-budget",
+        type=int,
+        default=0,
+        help=(
+            "Field-gated SRR exploration budget (bounded uphill escapes the "
+            "learned field can take; inert for the flat fields-off baseline). "
+            "Must match the value used at training time. 0 disables (default)."
+        ),
+    )
+    parser.add_argument(
         "--candidate-mode",
         choices=["schema", "geometric"],
         default="geometric",
@@ -466,6 +476,7 @@ def main() -> int:
                     device=args.device,
                     static_field=args.static_field,
                     candidate_mode=args.candidate_mode,
+                    srr_exploration_budget=args.srr_exploration_budget,
                 )
 
                 baseline_started = time.perf_counter()

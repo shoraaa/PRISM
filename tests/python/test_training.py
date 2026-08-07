@@ -656,9 +656,11 @@ def test_inference_is_deterministic() -> None:
     args.static_field = True
     static = infer_instance(model, problem, args)
 
-    # Construction is neutral; only the frozen incumbent field runs the model.
-    assert static[2]["net_evals"] == 1.0
-    assert static[2]["emissions"] == 1.0
+    # Construction now runs the field too (field-constructed bootstrap), so even
+    # the frozen-incumbent static path evaluates the model twice: once to build
+    # the initial incumbent, once for the frozen search field.
+    assert static[2]["net_evals"] == 2.0
+    assert static[2]["emissions"] == 2.0
 
 
 def test_zero_neutral_model_reproduces_plain_objective_search() -> None:

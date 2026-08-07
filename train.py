@@ -359,6 +359,21 @@ def _guidance_numpy(
     }
 
 
+def _field_guidance(model, decoder, device, risk_penalty: float = 0.0) -> dict:
+    """One no-grad model evaluation of the current decoder graph -> guidance.
+
+    Used to *construct* the bootstrap incumbent from the learned field (not just
+    to refine it), so the field is load-bearing from the first solution. It is a
+    no-grad evaluation on purpose: construction is a bootstrap, kept out of the
+    trained refinement policy batch (see collect_instance_rollout), exactly as
+    inference computes its guidance.
+    """
+    graph = build_decoder_data(decoder, device)
+    with torch.no_grad():
+        output = model(graph)
+    return _guidance_numpy(output, graph, risk_penalty=risk_penalty)
+
+
 def _neutral_guidance(decoder) -> dict:
     channels = int(decoder.metadata["resource_count"])
     multipliers = int(decoder.metadata["multiplier_count"])
@@ -473,6 +488,13 @@ def _new_decoder(
             "feasibility_lookahead_depth": getattr(
                 args, "feasibility_lookahead_depth", 2
             ),
+            # Field-gated exploration budget. A flat field (fields-off) has no
+            # energy gradient, so no exploration move ever qualifies -- the
+            # budget is inert for the baseline and benefits only the learned
+            # field, an unambiguous field-driven advantage.
+            "srr_exploration_budget": getattr(
+                args, "srr_exploration_budget", 0
+            ),
         },
         n_rollouts=args.n_rollouts,
         beta=args.beta,
@@ -484,15 +506,29 @@ def _new_decoder(
 
 
 def setup_decoder(
-    problem: dict, args: argparse.Namespace, deterministic: bool = False
+    problem: dict, args: argparse.Namespace, deterministic: bool = False,
+    model: Optional[ConstraintFieldNet] = None,
+    field_enabled: bool = True,
+    risk_penalty: float = 0.0,
 ):
     decoder = _new_decoder(problem, args, deterministic=deterministic)
+    # Field-constructed bootstrap: once the field is live, build the initial
+    # incumbent from the field itself so training and inference share the same
+    # construction path (a no-grad bootstrap, kept out of the refinement policy
+    # batch). During pretrain (field_enabled=False) or when no model is supplied,
+    # fall back to neutral distance construction.
+    if model is not None and field_enabled:
+        guidance = _field_guidance(
+            model, decoder, args.device, risk_penalty=risk_penalty
+        )
+    else:
+        guidance = _neutral_guidance(decoder)
     if deterministic:
-        incumbent = decoder.sample_greedy(**_neutral_guidance(decoder))
+        incumbent = decoder.sample_greedy(**guidance)
         if incumbent["feasible"]:
             decoder.set_incumbent(incumbent["route"])
     else:
-        incumbent = decoder.solve(1, **_neutral_guidance(decoder))
+        incumbent = decoder.solve(1, **guidance)
     if not incumbent["feasible"]:
         raise RuntimeError(f"bootstrap failed: {incumbent['error']}")
     return decoder, incumbent
@@ -504,6 +540,9 @@ def setup_decoder_resampling(
     args: argparse.Namespace,
     deterministic: bool = False,
     max_attempts: int = 8,
+    model: Optional[ConstraintFieldNet] = None,
+    field_enabled: bool = True,
+    risk_penalty: float = 0.0,
 ):
     """Bootstrap a decoder, resampling the instance on infeasible generation.
 
@@ -518,7 +557,9 @@ def setup_decoder_resampling(
     for _ in range(max_attempts):
         try:
             decoder, incumbent = setup_decoder(
-                problem, args, deterministic=deterministic
+                problem, args, deterministic=deterministic,
+                model=model, field_enabled=field_enabled,
+                risk_penalty=risk_penalty,
             )
             return decoder, incumbent, problem
         except RuntimeError as exc:
@@ -625,7 +666,10 @@ def collect_instance_rollout(
     # policy log-probabilities) with stochastic rollouts and has a much larger
     # reward scale; including it in the pooled POMO batch suppresses the
     # refinement signal that rh1gudc1 learned from.
-    decoder, incumbent, problem = setup_decoder_resampling(problem, variant, args)
+    decoder, incumbent, problem = setup_decoder_resampling(
+        problem, variant, args,
+        model=model, field_enabled=field_enabled, risk_penalty=risk_penalty,
+    )
     # Joint-training: capture the refiner teacher trajectory from the bootstrap
     # state (before the C++ search perturbs the incumbent / decoder features).
     refiner_sup = None
@@ -1916,31 +1960,45 @@ def infer_instance(
         # op/pctsp etc.: refiner has no operator yet -> fall through to SRR.
     # The fields-off baseline (model is None) breaks equal-energy SRR ties by edge
     # index so its flat E = 1 field never inherits classical_proximity. The flag
-    # only changes tie resolution under a constant energy, so the shared neutral
-    # (distance) bootstrap below is byte-identical to PRISM's -- pairing holds.
+    # only changes tie resolution under a constant energy.
     decoder = _new_decoder(
         problem, args, deterministic=True, neutral_ranking=(model is None)
     )
-    initial = list(decoder.sample(**_neutral_guidance(decoder)))
+    # Field-constructed bootstrap: the initial incumbent is built from the SAME
+    # field that drives search, so the learned field is load-bearing from the
+    # first solution rather than only during refinement. The fields-off baseline
+    # constructs from the identical flat E = 1 matrix -- no distance or objective
+    # signal -- so ablating the field now also ablates construction. Both still
+    # share the candidate graph, seed, and budget, so the paired comparison
+    # isolates the field's total (construct + refine) contribution.
+    risk_penalty = args.feasibility_risk_penalty
+    net_evals = 0
+    if model is None:
+        construct_guidance = _fields_off_guidance(decoder)
+    else:
+        model.eval()
+        construct_guidance = _field_guidance(
+            model, decoder, args.device, risk_penalty=risk_penalty
+        )
+        net_evals += 1
+    initial = list(decoder.sample(**construct_guidance))
     incumbent, _winner = _best_feasible_solution(
-        initial, context="neutral bootstrap"
+        initial, context="field bootstrap"
     )
     decoder.set_incumbent(incumbent["route"])
 
     if model is None:
         # Fields-off baseline: the identical decoder and SRR driven by a flat,
-        # identical field (E = 1 on every edge). PRISM and this baseline share the
-        # same neutral bootstrap incumbent, candidate graph, seed, and budget, so
-        # they differ only by the learned field -- a clean ablation of PRISM's own
-        # guidance rather than a neural-vs-heuristic contest.
+        # identical field (E = 1 on every edge) for BOTH construction and search.
+        # PRISM and this baseline share the same candidate graph, seed, and
+        # budget, so they differ only by the learned field -- a clean ablation of
+        # PRISM's own guidance rather than a neural-vs-heuristic contest.
         best = decoder.solve(
             args.search_iterations, **_fields_off_guidance(decoder)
         )
         return _canonical_cost(best), best, {"emissions": 0.0}
 
-    model.eval()
     dynamic = not getattr(args, "static_field", False)
-    risk_penalty = args.feasibility_risk_penalty
 
     def _refresh_guidance() -> tuple[dict, int]:
         graph = build_decoder_data(decoder, args.device)
@@ -1961,7 +2019,7 @@ def infer_instance(
 
     neural_seconds = 0.0
     decoder_seconds = 0.0
-    net_evals = 0
+    # net_evals already counts the field-construction evaluation above.
 
     start = time.perf_counter()
     guidance, refresh_evals = _refresh_guidance()
@@ -2743,6 +2801,18 @@ def parse_args() -> argparse.Namespace:
         help="Synchronize accelerator phases for exact timing metrics",
     )
     parser.add_argument("--ppo-clip", type=float, default=0.1)
+    parser.add_argument(
+        "--srr-exploration-budget",
+        type=int,
+        default=0,
+        help=(
+            "Bounded number of objective-worsening but guided-energy-descending "
+            "moves the SRR descent may accept per invocation, letting the learned "
+            "field steer uphill to escape local optima (champion tracking keeps "
+            "the best solution). A flat fields-off field has no energy gradient, "
+            "so the budget is inert for the baseline. 0 disables (default)."
+        ),
+    )
     parser.add_argument("--no-adv-norm", action="store_true")
     parser.add_argument(
         "--schema-adv-scale",

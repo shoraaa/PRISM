@@ -208,6 +208,18 @@ struct SearchConfig {
   bool neutral_ranking = false;
   bool verify_screening_resources = false;
   bool verify_incremental_srr = false;
+  // Field-gated exploration: a bounded number of guided-energy-descending but
+  // objective-worsening moves the SRR descent may accept per invocation before
+  // reverting to strict monotone descent. It lets the learned field steer the
+  // search uphill (in objective) to escape local optima, while the champion
+  // (best objective seen) and solve()'s best_solution_ guarantee we never
+  // return worse. A flat field (fields-off, E = 1) has no energy gradient, so
+  // no exploration move ever qualifies -- the baseline is strictly unaffected.
+  // 0 disables the phase (default), preserving the pure monotone hill-climb.
+  int32_t srr_exploration_budget = 0;
+  // A candidate qualifies for exploration only if it lowers the anchor guided
+  // energy by more than this margin, so numerical ties never trigger a kick.
+  float srr_exploration_margin = 1.0e-6f;
 
   void validate() const;
 };

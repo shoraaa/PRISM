@@ -1,0 +1,557 @@
+\documentclass{article} % For LaTeX2e
+\usepackage{amsmath} % Core math environments and commands
+\usepackage{amssymb} % Additional math symbols
+\usepackage{mathtools} % Extensions to amsmath (e.g., \coloneqq, \DeclarePairedDelimiter)
+\usepackage{amsthm} % Theorem-like environments (theorem, lemma, proof, etc.)
+\usepackage{iclr2026_conference,times}
+\iclrfinalcopy
+
+
+% --- Colors & code listings ---
+\usepackage{listings}
+\usepackage[table]{xcolor} % Colors (incl. table support); define palette for figures/tables
+\usepackage{listings} % Source code listings
+\newcommand{\colorr}[1]{\textcolor{red}{#1}} 
+\newcommand{\colorb}[1]{\textcolor{blue}{#1}}
+\newcommand{\colorm}[1]{\textcolor{magenta}{#1}}
+\definecolor{dkgreen}{rgb}{0,0.6,0}
+\definecolor{gray}{rgb}{0.5,0.5,0.5}
+\definecolor{mauve}{rgb}{0.58,0,0.82}
+\usepackage[colorlinks=true,linkcolor=dkgreen,citecolor=dkgreen,urlcolor=magenta,]{hyperref} % hyperlinks
+\usepackage{graphicx,txfonts}
+
+% --- Math & theorem environments ---
+% Optional math commands from https://github.com/goodfeli/dlbook_notation.
+\input{math_commands.tex}
+\usepackage{amsmath} % Core math environments and commands
+\usepackage{amssymb} % Additional math symbols
+\usepackage{mathtools} % Extensions to amsmath (e.g., \coloneqq, \DeclarePairedDelimiter)
+\usepackage{amsthm} % Theorem-like environments (theorem, lemma, proof, etc.)
+\usepackage{mathrsfs} % Script math fonts (\mathscr)
+
+% --- Figures, tables, and graphics ---
+\usepackage{graphicx} % Include and scale graphics (\includegraphics)
+\usepackage{subcaption} % Sub-figures/sub-tables via \begin{subfigure}
+\usepackage{wrapfig} % Text wrapping around figures/tables
+\usepackage{booktabs} % Professional-quality tables (\toprule, \midrule, \bottomrule)
+\usepackage{multirow,multicol}
+\usepackage{array} % Extended column definitions (e.g., >{\centering\arraybackslash}m{..})
+% \usepackage{makecell} % Line breaks and formatting inside table cells
+\usepackage{threeparttable} % Tables with title, body, and notes (table notes)
+\usepackage{rotating} % Rotate figures/tables (e.g., sidewaysfigure)
+\usepackage{tablefootnote} % Footnotes that work inside tables
+% \usepackage{arydshln} % Dashed lines in arrays/tables (e.g., \hdashline, \cdashline)
+
+% --- Lists and formatting ---
+\usepackage{enumitem} % Control list spacing/labels (compact itemize/enumerate)
+\usepackage{nicefrac} % Nice inline fractions (e.g., \nicefrac{1}{2})
+\usepackage{microtype} % Improves typography: kerning, protrusion, etc.
+
+% --- URLs and hyperlinks (load hyperref last) ---
+\usepackage{url} % Typeset bare URLs (basic); hyperref will enhance links
+\usepackage{hyperref} % Clickable references/links; ALWAYS load last
+
+
+\title{
+% \begin{tabular}{c}
+Towards Efficient Constraint Handling in Neural \\Solvers for Routing Problems
+% \end{tabular}
+}
+
+% \title{Neural Construct-and-Refine Framework for Efficient Constraint Handling in Routing Problems}
+
+
+% \author{Jieyi Bi$^{1,5 \varheartsuit\thanks{Work done during the author’s internship at MIT}}$, Zhiguang Cao$^{2}$, Jianan Zhou$^{1}$, Wen Song$^{3}$, Yaoxin Wu$^{4}$,\\ \textbf{Jie Zhang$^{1}$, Yining Ma$^{5}$\thanks{Corresponding author.} \,, Cathy Wu$^5$} \\ 
+% $^1$Nanyang Technological University 
+% $^2$Singapore Management University \\
+% $^3$Shandong University 
+% $^4$Eindhoven University of Technology 
+% % $^5$Massachusetts Institute of Technology\\
+% $^5$MIT\\
+% \texttt{jieyi001@e.ntu.edu.sg}, 
+% \texttt{zgcao@smu.edu.sg}, \\
+% \texttt{jianan004@e.ntu.edu.sg},
+% \texttt{wensong@email.sdu.edu.cn},
+% \texttt{y.wu2@tue.nl},\\
+% \texttt{zhangj@ntu.edu.sg},
+% \texttt{yiningma@mit.edu},
+% \texttt{cathywu@mit.edu}
+% }
+
+\author{
+% \begin{tabular}{c}
+  Jieyi Bi$^{1,5\varheartsuit}$, 
+  Zhiguang Cao$^{2}$, 
+  Jianan Zhou$^{1}$, 
+  Wen Song$^{3}$, 
+  Yaoxin Wu$^{4}$, 
+  \textbf{Jie Zhang$^{1}$},\\
+  \textbf{~Yining Ma$^{5 \dagger}$}, 
+  \textbf{Cathy Wu$^5$} \\
+  \noalign{\vskip 2pt}
+  ~$^1$Nanyang Technological University \quad $^2$Singapore Management University \\
+  ~$^3$Shandong University \quad $^4$Eindhoven University of Technology \quad $^5$MIT \\
+    ~\texttt{jieyi001@e.ntu.edu.sg}, 
+    \texttt{zgcao@smu.edu.sg},
+    \texttt{jianan004@e.ntu.edu.sg}, \\
+    ~\texttt{wensong@email.sdu.edu.cn},
+    \texttt{y.wu2@tue.nl},
+    \texttt{zhangj@ntu.edu.sg}, \\
+    ~\texttt{\{yiningma, cathywu\}@mit.edu}
+% \end{tabular}
+}
+
+
+\newcommand{\fix}{\marginpar{FIX}}
+\newcommand{\new}{\marginpar{NEW}}
+
+%\iclrfinalcopy % Uncomment for camera-ready version, but NOT for submission.
+\begin{document}
+
+
+\maketitle
+% {\let\thefootnote\relax\footnotetext{${\varheartsuit}$ Work done during the author’s internship at MIT.}}
+% {\let\thefootnote\relax\footnotetext{$\spadesuit$ Corresponding author.}}
+{\let\thefootnote\relax\footnotetext{${\varheartsuit}$ Work done during the author’s internship at MIT. ~~~~~~~$^\dagger$ Corresponding author.}}
+
+\begin{abstract}
+
+Neural solvers have achieved impressive progress in addressing simple routing problems, particularly excelling in computational efficiency. However, their advantages under complex constraints remain nascent, for which current constraint-handling schemes via \emph{feasibility masking} or implicit \emph{feasibility awareness} can be inefficient or inapplicable for hard constraints. In this paper, we present Construct-and-Refine (CaR), the first general and efficient constraint-handling framework for neural routing solvers based on explicit learning-based \emph{feasibility refinement}. Unlike prior construction-search hybrids that target reducing optimality gaps through heavy improvements yet still struggle with hard constraints, CaR achieves efficient constraint handling by designing a joint training framework that {guides the construction module to generate diverse and high-quality solutions well-suited for} a lightweight improvement process, e.g., 10 steps versus 5k steps in prior work. Moreover, CaR presents the first use of construction-improvement-shared representation, enabling potential knowledge sharing across paradigms by unifying the encoder, especially in more complex constrained scenarios. We evaluate CaR on typical hard routing constraints to showcase its broader applicability. Results demonstrate that CaR achieves superior feasibility, solution quality, and efficiency compared to both classical and neural state-of-the-art solvers. Our code, pre-trained models, and datasets are available at: \url{https://github.com/jieyibi/CaR-constraint}.
+\end{abstract}
+
+\section{Introduction}
+\label{sec:intro}
+
+
+Vehicle Routing Problems (VRPs) often involve complex real-world constraints~\citep{wu2023lade}. Classic VRP solvers, such as LKH-3~\citep{lkh3} and OR-Tools~\citep{ortools_routing}, have relied on heuristics carefully designed by human experts to handle these constraints and approximate near-optimal solutions. Recently, Neural Combinatorial Optimization (NCO) methods~\citep{bengio2021machine} have offered a different path: they automate solver design with deep learning and exploit GPU-batched inference for high efficiency while ensuring solution quality~\citep{kwon2020pomo}. However, recent work has primarily targeted simple variants, leaving their potential on hard-constrained VRPs underexplored.
+In those more complex settings, 
+where hand-crafted heuristics often leave certain research gaps, 
+reinforcement learning (RL)-based methods may offer a promising alternative by learning to navigate constraints directly from data. {This makes effective constraint handling a key challenge in advancing the broader applicability of NCO to real-world VRPs.}
+
+Most RL-based NCO solvers handle constraints via two schemes: \emph{feasibility masking} and implicit \emph{feasibility awareness}. Feasibility masking enforces constraints by excluding invalid actions in the Markov Decision Process (MDP). While effective for simple MDPs, it becomes \emph{intractable} in complex cases where computing mask itself is NP-hard, e.g., with complex local search operators in neural improvement solvers~\citep{ma2023learning}, or with interdependent constraints in neural construction solvers~\citep{bi2024learning}, as in Traveling Salesman Problem with Time Windows (TSPTW).
+Moreover, even when computable, the impact of strict masking in multi-constraint VRPs is often overlooked. {As shown in Section~\ref{sec:4.1}, enforcing strict masks in Capacitated VRP with backhaul, duration, and time-window constraints (CVRPBLTW) can largely hinder RL convergence to a better policy}. 
+A recent line of work instead explores \emph{feasibility awareness}, implicitly informing MDP decisions via constraint-related features~\citep{chen2024looking}, reward shaping~\citep{ma2023learning}, or approximated learnable masks~\citep{bi2024learning}. However, they still remain limited: to our knowledge, no single method is generic to be effective across typical hard VRPs (e.g., TSPTW and CVRPBLTW), feasibility and optimality gaps persist, and they often incur substantial inference overheads that undermine the efficiency. This motivates a practical research question: \textit{Can we develop a neural constraint handling framework
+that is simple, general, and crucially, preserves the efficiency of the NCO solvers?} 
+
+
+To address this, we emphasize learning-based \emph{feasibility refinement} that has been overlooked for neural solvers: rather than purely focusing on enforcing feasibility via masking or implicitly learning feasibility signals by features or reward, we ask whether RL can explicitly refine infeasible solutions in very few post-construction steps while preserving optimality. To realize this, one may consider leveraging existing search techniques, such as random reconstruction (RRC)~\citep{luo2023neural}, efficient active search (EAS)~\citep{hottung2022efficient}, or hybrid frameworks like collaborative policies (LCP)~\citep{Kim2021LearningCP}, RL4CO~\citep{berto2025rl4co}, and NCS~\citep{kong2024efficient}. However, these methods are designed and evaluated to reduce optimality gaps on simple VRPs. When applied to hard VRPs, they can yield 100\% infeasibility or rely on a prolonged improvement process that runs for hours and often fails when search steps are reduced during training or inference (see Table~\ref{tab:combined}).
+
+In this paper, we present \textbf{Construct-and-Refine (CaR)}, a simple yet effective \emph{feasibility refinement} framework as a first step toward a \emph{general} neural approach for \emph{efficient} constraint handling. 
+% Methodologically, CaR explores how RL can be used to refine or repair infeasible solutions while preserving solution quality after completing the solution construction.
+% Unlike existing methods that are
+% % paradigm-limited, 
+% inefficient or lack generality across VRPs with varying constraint complexities, 
+{CaR introduces an end-to-end joint training framework that unifies a neural construction module with a neural improvement module.} By design, it unites the complementary strengths of both paradigms while targeting efficiency: construction provides diverse {and high-quality} solutions conducive to fast refinement guided by our tailored loss function. Unlike prior hybrids that rely on heavy improvement to reduce optimality gaps, CaR uses fewer refinement steps, which can reduce runtime from hours to minutes or seconds.
+Moreover, the proposed \emph{feasibility refinement} scheme inherently motivates a novel form of synergized \emph{feasibility awareness}. CaR thus further considers a construction-improvement shared encoder for realizing the cross-paradigm representation learning, enabling potential knowledge sharing, thereby improving performance, particularly for more complex constrained scenarios.
+
+We demonstrate the effectiveness of CaR on VRPs with diverse constraints, with particular emphasis on hard-constrained settings. When feasibility masking is NP-hard (e.g., TSPTW), CaR achieves $6$-$8\times$ speedups over state-of-the-art neural baselines while improving feasibility and solution quality, even finding feasible solutions that the strong classic solver LKH-3 fails to produce. When masking is tractable but overly restrictive (e.g., multi-constraint CVRPBLTW), CaR shows dominant superiority over both neural and classic solvers. We also provide detailed analysis and ablation studies.
+
+Our contributions are as follows:
+\textbf{1)} We comprehensively analyze the limitations of existing \emph{feasibility masking} and \emph{implicit feasibility awareness} schemes, and introduce the learning-based \emph{feasibility refinement} scheme for efficient constraint handling; \textbf{2)} We present Construct-and-Refine (CaR), a simple, general, efficiency-preserving framework that performs  \textit{feasibility refinement} via end-to-end joint training that constructs diverse and high-quality solutions well-suited for rapid refinement guided by our tailored losses; \textbf{3)} CaR enables novel synergized \textit{feasibility awareness} via cross-paradigm representation learning that further boosts the constraint handling especially in complex cases; \textbf{4)} Experiments showcase that CaR can be potentially applicable to enhance most RL-based construction and improvement solvers in solving various hard-constrained VRPs, delivering superior feasibility, solution quality, and efficiency compared to classical and neural state-of-the-art solvers.
+
+\section{Literature review}
+
+We highlight the difference between CaR and existing neural solvers in Table~\ref{tab:method_comparison}: most existing neural solvers emphasize masking-based feasibility handling, whereas CaR integrates three complementary schemes for broader and more effective constraint handling.
+
+
+
+\textbf{Neural VRP solvers.}
+End-to-end neural VRP solvers mainly fall into two paradigms:
+1) \emph{Construction solvers} learn to construct solutions from scratch in an autoregressive (AR) fashion.
+Among them, {Attention Model (AM)~\citep{kool2018attention}} is a milestone for VRPs.
+% for VRPs. 
+POMO \citep{kwon2020pomo} further improved AM using diverse rollouts inspired by VRP symmetries. Subsequent studies have advanced AR solvers in inference strategies \citep{ choo2022simulation}, training paradigms \citep{drakulic2023bq, hottung2025polynet}, 
+% interpretability  \citep{kikuta2024routeexplainer}, 
+ scalability \citep{jin2023pointerformer, hou2023generalize}, robustness \citep{geisler2022generalization}, and generalization over different distributions \citep{bi2022learning}, scales \citep{zhou2023towards, gao2023towards}, and constraints \citep{ zhou2024mvmoe,berto2024routefinder}; 
+% improvement
+2) \emph{Improvement solvers} learn to iteratively improve initial solutions, inspired by classic local search such as $k$-opt~\citep{d2020learning,ma2023learning}
+% (e.g., 2-opt \citep{d2020learning}, {$k$-opt~\citep{ma2023learning}})
+, ruin-and-repair \citep{hottung2022neural, ma2022efficient}, and crossover \citep{kim2023learning}. 
+In general, they achieve near-optimal solutions with prolonged searches. Overall, either construction or improvement solvers mainly focus on simple VRP benchmarks, leaving complex constraint handling underexplored. 
+See Appendix \ref{app:liter-neural} for further discussion. 
+
+\input{tables/comparison}
+
+
+\textbf{Constraint handling for VRPs.} 
+Existing neural solvers handle constraints mainly through two schemes: \emph{feasibility masking} and implicit \emph{feasibility awareness}. Most methods enforce constraint satisfaction by excluding invalid actions, such as local search moves in neural improvement solvers or node selection in neural construction solvers, via strict feasibility masking. While effective in simple VRPs, masking becomes intractable or ineffective in complex ones (e.g., TSPTW, CVRPBLTW; see Section~\ref{sec:4.1}). Recent works have thus explored implicit \emph{feasibility awareness}, enhancing neural policies via reward/penalty-based guidance or feature augmentation, such as Lagrangian reformulation~\citep{tang2022learning}, reward shaping for infeasible-region exploration~\citep{ma2023learning}, constraint-related features~\citep{chen2024looking}, or approximated learnable masks~\citep{bi2024learning}. However, they often incur high computational cost and still yield high infeasibility. Overall, even with these two constraint handling schemes, no existing solvers is generic enough to be effective across both simple and complex VRPs, motivating a new perspective: explicit \emph{feasibility refinement}.
+
+\textbf{Hybrid neural solvers.} 
+Recent works have explored hybridizing construction with policy search or heavy improvement. \textit{One line} extends construction with additional search, e.g., active search (EAS)~\citep{hottung2022efficient} or beam search (SGBS)~\citep{choo2022simulation}, but these remain confined to the underlying construction policy and struggle with complex constraints. Another line employs reconstruction or decomposition, such as random reconstruction (RRC)~\citep{luo2023neural} and collaborative policies (LCP)~\citep{Kim2021LearningCP}. While effective on simple VRPs, these methods often break feasibility when reconstructing or decomposing solutions, simlilar as other divide-and-conquer frameworks~\citep{ye2024glop,zheng2024udc}, leading to high infeasibility even with penalties. \textit{Another line} combines construction with heavy improvement (e.g., thousands of steps). {RL4CO~\citep{berto2025rl4co}} couples pretrained POMO~\citep{kwon2020pomo} and NeuOpt~\citep{ma2023learning} only at inference, while {NCS~\citep{kong2024efficient}} integrates them via a shared critic. However, both remain limited on hard-constrained VRPs, with NCS yielding 100\% infeasibility on TSPTW in our tests.
+\emph{We differ from them in three key aspects}: 1) we jointly targets feasibility and optimality, rather than only focusing on optimality; 2) we tightly couples construction and refinement via joint training and shared representation learning, enabling knowledge transfer, instead of treating both paradigms separately{~\citep{berto2025rl4co}} or loosely coupled{~\citep{kong2024efficient}}; 3) we promote efficient and precise refinement rather than lengthy improvement (e.g., from 5k to 10 steps).
+
+\section{Preliminaries}
+
+\textbf{VRP definitions.} We define VRP on a directed graph $\mathcal{G} = (\mathcal{V}, \mathcal{E})$, where $\mathcal{V}$ consists of $n$ customer nodes $\{v_1, \dots, v_n\}$ and a depot $v_0$ (except TSP variants). Each edge $e(v_i \rightarrow v_j)$ (or $e_{ij}$) $\in \mathcal{E}$ connects node $v_i$ to $v_j~(i \neq j)$ with weight given by the 2D Euclidean distance. The objective is to minimize the total cost of a solution subject to variant-specific constraints. Empirically, we distinguish between \emph{simple VRPs} (e.g., CVRP), where feasibility masking is tractable and effective, and \emph{complex VRPs} (e.g., CVRPBLTW with multiple constraints or TSPTW where computing masks is NP-hard since future time-feasibility must be evaluated for all possible actions), where masking is ineffective or intractable. See Appendix~\ref{app:problem} for problem definitions and instance generation details.
+
+\textbf{MDP formulations.} We consider neural solvers trained with reinforcement learning (RL), where construction and improvement are formulated as Constrained Markov Decision Process (CMDP), defined by the tuple ($\mathcal{S}, \mathcal{A}, \mathcal{P}, \mathcal{R}, \mathcal{C}$), with $\mathcal{S}$ as the state space, $\mathcal{A}$ as the action space, $\mathcal{P}: \mathcal{S}\!\times\!\mathcal{A} \times\!\mathcal{S}\!\rightarrow\left[0, 1\right]$ as the state transition probability, $\mathcal{R}: \mathcal{S}\!\times\!\mathcal{A}\!\rightarrow\!\mathbb{R}$ as the reward function, and $\mathcal{C}: \mathcal{S}\!\times\!\mathcal{A}\!\rightarrow\!\mathbb{R}^{m}$ as the constraint function penalizing violations of $m$ constraints. The goal is to learn a policy $\pi_{\theta}: \mathcal{S}\!\rightarrow\!\mathcal{P}(\mathcal{A})$ that maximizes the reward while satisfiying the constraint(s), i.e., 
+\begin{equation}
+\begin{aligned}
+    \max_{\theta} \mathcal{J}(\pi_{\theta}) &= \mathbb{E}_{\tau \sim \pi_{\theta}}
+    \left[\mathcal{R}\left( \tau \vert \mathcal{G}\right)\right], 
+    \text{s.t.} ~ \pi_{\theta} \in \Pi_{{F}}, \ 
+    \Pi_{F} &= \{\pi \in \Pi ~\vert \mathcal{J}_{\mathcal{C}}(\pi_{\theta})=\boldsymbol{0}^m\},
+    \label{eq:cmdp}
+\end{aligned}
+\end{equation}
+where $\mathcal{J}$ and $\mathcal{J}_{\mathcal{C}}$ are the expected returns of the reward and constraint function {for $m$ constraints}, respectively; and $\Pi_{F}$ represents a feasible space for the policy. 
+% in the ideal case (without Lagrangian relaxation). Construction and improvement solvers differ in states, actions, transitions, and rewards. 
+\emph{Construction} solvers construct solutions sequentially from scratch: state $s_t$ includes the partial solution, vehicle status (e.g., load, time), and unvisited node representations; action $a_t$ selects the next node; and the reward $\mathcal{R}$ is the negative tour cost at completion, $\mathcal{R}(\tau \vert \mathcal{G}) = -C(\tau)$.
+\emph{Improvement} solvers learn to refine an existing solution. At step $t$, the state $s_t$ includes the current solution $\tau_t$, the best-so-far solution $\tau_t^{*}$, and instance features; the action $a_t$ applies an operator (e.g., flexible $k$-opt~\citep{ma2023learning}, remove-and-reinsert~\citep{ma2022efficient}; see Appendix~\ref{app:opt}). Following the convention \citep{chen2019learning}, the reward is the cost reduction in the best-so-far solution, i.e., $\mathcal{R}_t = \min [C(\tau_{t-1}^*) - C(\tau_{t}), 0]$. 
+
+\textbf{{Relaxation of CMDP.}} Following \cite{bi2024learning}, we apply Lagrangian relaxation to train the construction policy by penalizing constraint violations, adding a cost term to the objective in Eq.~(\ref{eq:cmdp}):
+\begin{equation}
+    C(\tau) = \sum_{e_{ij} \in \tau} \left[C_L \left( e_{ij}\right) \!+\! \sum_{\eta=1}^{m} C_V^{\eta} \left( e_{ij}\right)\right],
+    % \!+\! \sum_{\eta=1}^{m} C_T^{\eta}(\tau),
+    \label{eq:constraint_obj}
+\end{equation}
+where $C_L$ and $C_V$ represent the objective cost (i.e., tour length) and the constraint violations, respectively.
+For example, if the arrival time $t_j$ to node $v_j$ exceeds the time window ends $u_j$, the node-level cost for time window violation is calculated as {$C_V(e_{ij})$= $t_j- u_j$}. The total violation cost $C_V$ also accounts for the number of nodes with constraint violations to enhance constraint awareness.
+
+
+\section{Methodology}
+
+
+We revisit existing constraint-handling schemes for neural solvers and then introduce our CaR framework, which proposes a new perspective via \emph{feasibility refinement} and further explores shared representations across construction and refinement to enhance \emph{feasibility awareness}.
+
+\subsection{Discussion of existing constraint handling schemes}
+\label{sec:4.1}
+
+\emph{Feasibility masking} excludes invalid actions at each node-selection step in construction MDPs and each local-search step in improvement MDPs. It is widely used in prevailing neural solvers and works well when VRP constraints are simple. For instance, Table~\ref{tab:pomo_start} shows that removing masking in CVRP increases POMO’s optimality gap from 0.86\% to 0.92\%, confirming its effectiveness. However, masking faces two fundamental challenges in complex VRPs. First, mask computation itself can be \emph{intractable}. For example, in TSPTW evaluating time-interdependent feasibility at each construction step requires checking all future actions, which is NP-hard~\citep{bi2024learning}; similarly, computing feasible moves for local search operators such as $k$-opt is intractable in improvement solvers~\citep{ma2023learning}. Second, even when tractable, masks can be overly restrictive in multi-constraint VRPs. {In CVRPBLTW, for instance, strict masking filters out more than 60\% of nodes (Figure~\ref{fig:bltw_mask}), severely limiting the search space and hindering RL convergence toward a high-quality policy (more discussion in Appendix \ref{app:mask})}. In these complex VRPs, approximate mask~\citep{bi2024learning} or relaxed masks (as seen in POMO* vs. POMO in Table~\ref{tab:combined}) provide partial relief but cannot fully resolve these issues: they may still fail to guarantee feasibility, introduce computational inefficiency, or degrade solution quality. Beyond masking, recent works have turned to \emph{feasibility awareness}, implicitly guiding MDP decisions via rewards/penalties or constraint-related features. {However, the former has been shown in~\citet{bi2024learning} to lose effectiveness in complex VRPs, while the latter serves only as an auxiliary signal for policy learning. This motivates the need for alternative schemes that explicitly handle feasibility through refinement.}
+
+% Figure~\ref{fig:search_space} depicts the illustrative search behaviors of neural solvers on two hard-constrained VRPs: i) CVRPBLTW (a-c) where feasibility masking for construction is tractable but overly restrictive, leading to a fragmented feasible space due to multiple constraints; and ii) TSPTW (d-f), where computing feasibility masks is NP-hard and thus intractable, 
+% % ~\citep{bi2024learning}
+% yielding a limited feasible region. 
+
+
+% {Both construction and improvement solvers may struggle with these hard constraints. In CVRPBLTW, overly restrictive masking limits the exploration of construction in the fragmented feasible space, causing early convergence to local optima (Figure~\ref{fig:search_space}(a)). This aligns with our findings in Section~\ref{exp}: removing hard masking for CVRPBLTW improves performance (POMO* vs. POMO in Table~\ref{tab:combined}) but still yields infeasible and suboptimal solutions (Appendix~\ref{app:infsb_bltw}). For TSPTW, the relaxed CMDP in Eq.(\ref{eq:constraint_obj}) offers partial relief, but \citet{bi2024learning} shows it fails in complex cases and proposes a learnable mask to guide the policy toward near-feasible regions (Figure~\ref{fig:search_space}(d)). Still, the performance of construction methods alone remains limited due to the rigidity of inherent stepwise feasibility.
+% For improvement methods with advanced operators (e.g., $k$-opt), masking is 
+% % \colorm{inapplicable} and thus 
+% intractable in both cases, often resulting in inefficient search trajectories through both feasible and infeasible regions. As shown in Figure~\ref{fig:search_space}(b) and Figure~\ref{fig:search_space}(e), while they can refine solutions, they are computationally inefficient, often requiring substantial time to find good initial solutions, and performance degrades significantly with multiple constraints and limited search steps (Table~\ref{tab:combined}).}
+
+% To address these limitations, we propose CaR, which unites the strengths of both paradigms by using construction to generate diverse and high-quality initial solutions, thereby reducing the required refinement iterations. 
+
+% As shown in Figures~\ref{fig:search_space}(c) and (f), 
+% CaR applies lightweight refinement with only a few steps to help construction escape local optima and reach {a higher-quality one}, enabling more effective and efficient constraint handling for complex VRPs. 
+
+\subsection{Joint training feasibility refinement with a construction module}
+\label{sec: joint_train}
+
+To enable efficient feasibility refinement, we leverage the efficiency of construction and propose our CaR framework. CaR jointly trains construction and refinement by guiding construction module to generate diverse, high-quality solutions that are well-suited for rapid refinement with tailored losses.
+To integrate construction and refinement effectively, we design a joint training framework that optimizes both processes simultaneously in each gradient step, allowing them to co-evolve.
+As illustrated in Figure~\ref{fig:overall}, for each batch of training instances $\mathcal{G}$, the construction module first generates a small set of diverse, high-quality initial solutions in parallel. These solutions are then refined by a lightweight neural improvement process within $T_R$ steps (i.e., {$T_R=10$} vs. 5k in classic improvement methods), enabling rapid enhancement of high-potential candidates. The refined outputs then supervise  construction, promoting collaborative correction of infeasibility and sub-optimality.
+
+\begin{figure}[t]
+    \centering
+    \vspace{-2mm}
+    \includegraphics[width=0.99\linewidth]{figures/overall_v4.pdf}
+     \caption{{Overall framework of CaR}, where the construction module provides {diverse} and high-quality solutions for the refinement module to generate better solutions. 
+     % Red and green denote infeasible and feasible nodes, respectively. 
+    }
+    \label{fig:overall}
+    \vspace{-3mm}
+\end{figure}
+
+% \textbf{Collaborative training framework.} 
+
+
+\textbf{Construction policy loss.} The policy $\pi_\theta^{\text{C}}$ is trained by REINFORCE~\citep{williams1992simple} with loss:
+\begin{equation}
+    \mathcal{L}_\text{RL}^\text{C} = \frac{1}{S} \sum_{i=1}^{S} \left[ \left( \mathcal{R}(\tau_i) - \frac{1}{S} \sum_{j=1}^{S} \mathcal{R}(\tau_j) \right) \log \pi_\theta^{\text{C}}(\tau_i) \right],
+    \label{eq:rl}
+\end{equation}
+where the solution probability is factorized as $\pi_\theta^{\text{C}}(\tau) = \prod_{t=1}^{|\tau|} \pi_\theta^{\text{C}}(e_t \mid \tau_{<t})$, with \(\tau_{<t}\) denoting the partial solution prior to selecting edge \(e_t\) at step \(t\). We employ a group baseline with diverse rollouts to reduce the variance. For simpler variants like CVRP, $S$ solutions are generated via POMO's multi-start strategy~\citep{kwon2020pomo}, while for time-constrained variants (e.g., TSPTW and CVRPBLTW), we sample $S$ solutions to avoid infeasibility~\citep{hottung2025polynet, bi2024learning}.
+
+\textbf{Tailored losses in construction module.} To compensate for reduced diversity due to the removal of the multi-start mechanism and to enhance the diversity of initial constructed solutions for refinement, we introduce an auxiliary entropy-based diversity loss:
+\begin{equation}
+    \mathcal{L}_\text{DIV} = - \sum_{t=1}^{|\tau|} \pi_\theta^{\text{C}}(e_t \mid \tau_{<t}) \log \pi_\theta^{\text{C}}(e_t \mid \tau_{<t}),
+    \label{eq:div}
+\end{equation}
+which largely encourages policy exploration during RL training. To avoid inefficiency, we evaluate candidates using the cost in Eq.~(\ref{eq:constraint_obj}), and only feed the top $p$ high-quality candidates to subsequent refinement. If the refinement module improves a constructed solution (indicated by $\mathbb{I}=1$), the best-refined solution $\tau^*$ is used as a pseudo ground truth to supervise $\pi_\theta^{\text{C}}$: 
+\begin{equation}
+    \mathcal{L}_\text{SL} = - \mathbb{I} \cdot \sum_{t=1}^{|\tau^*|} \log \pi_\theta^{\text{C}}(e_t^* \mid \tau^*_{<t}),
+    \label{eq:sl}
+\end{equation}
+where $\mathbb{I}$ indicates whether such refinement led to improvement of the feasibility and objective. The final construction loss integrates three components, i.e., 
+$\mathcal{L}(\theta^\text{C}) = \mathcal{L}_\text{RL}^\text{C} + \alpha_1 \mathcal{L}_\text{DIV} + \alpha_2 \mathcal{L}_\text{SL}$. 
+
+\textbf{Relaxation of short-horizon CMDP for efficient refinement.} 
+Building on the success of relaxed CMDP formulations for construction~\citep{bi2024learning}, we extend it to the refinement process as well. {Unlike prior work~\citep{kong2024efficient, ma2023learning}, which models improvement as an infinite-horizon MDP under the assumption that prolonged runtime is acceptable (more discussion of short-horizon MDP design in Appendix \ref{app:shortopt}), we adopt a short-horizon rollout limit $T_R$, treating each step equally, consistent with CaR’s efficient refinement design.}
+
+\textbf{Refinement policy loss.} 
+The refinement policy \( \pi_\theta^{\text{R}} \) iteratively improves solutions over \( T_R \) steps, with probability of the refined solution at step \( t \) is factorized as $\pi_\theta^{\text{R}}(\tau_t) = \prod_{\kappa=1}^{\mathbf{K}} \pi_\theta^{\text{R}}\left(a_\kappa | a_{<\kappa}, \tau_{t-1}\right)$, where \( \mathbf{K} \) denotes the total number of sequential refinement moves/actions, with further details in Appendix~\ref{app:opt}. The RL loss \( \mathcal{L}_\text{RL}^\text{R} (t) \) for refinement is computed at each step $t$ using the REINFORCE algorithm in Eq.~(\ref{eq:rl}), where \( S \) is replaced by \( p \), since only \( p \) solutions are refined. 
+The final refinement loss is defined as the average across all \( T_R \) steps:
+$\mathcal{L}(\theta^\text{R}) = \frac{1}{T_R} \sum_{t=1}^{T_R} \mathcal{L}_\text{RL}^\text{R} (t)$,
+encouraging each refinement step to contribute meaningfully and improving overall refinement efficiency. 
+% \textbf{Joint training loss.} 
+The joint training loss combines the above two losses, i.e., 
+$\mathcal{L}(\theta) = \mathcal{L}(\theta^\text{C}) + \omega \mathcal{L}(\theta^\text{R})$,
+where $\omega$ balances 
+their scales. 
+Such joint loss promotes information exchange between modules, enhancing synergy in collaboratively handling complex constraints. 
+
+\subsection{Cross-paradigm representation learning for feasibility awareness}
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=0.99\linewidth]{figures/unified_model2.pdf}
+    \caption{Overview of the unified network architecture in CaR. Blue dashed arrows indicate information flow specific to refinement, while purple dashed arrows indicate flow exclusive to construction.}
+    \label{fig:unified_model}
+    \vspace{-3mm}
+\end{figure}
+
+Beyond implicit \emph{feasibility awareness} via features or rewards/penalties, our \emph{feasibility refinement} naturally strengthens awareness through cross-paradigm representation learning. To further reduce overhead and promote synergy, we explore shared encoders for knowledge transfer between construction and refinement, especially in hard-constrained VRPs.
+
+\textbf{Shared representation across paradigms via a unified encoder.}
+Given an instance batch $\{\mathcal{G}_i\}_{i=1}^B$, both paradigms learns to obtain high-dimensional node embeddings $h_i$ via encoders. For CVRPBLTW, each node $v_i$ is represented by its coordinates, demand (i.e., linehaul or backhaul), time window, and duration limit, i.e., $f^{\text{n}}_i = \{ x_i, y_i, q_i, l_i, u_i, \ell\}$.  Unlike construction, refinement also incorporates solution features by encoding the sequential structure via positional information. To support both paradigms, we use a shared 6-layer Transformer encoder~\citep{kwon2020pomo} with multi-head attention. Positional encoding, required only in refinement, is injected using cyclic positional encoding via the synthesis attention mechanism~\citep{ma2022efficient}. As shown in Figure~\ref{fig:unified_model}, a multi-layer perceptron (MLP) fuses node-level attention scores $a^\text{n}$ and solution-level scores $a^\text{s}$ from positional embedding vectors via element-wise aggregation. 
+
+\textbf{Decoder.} The decoder generates action probabilities from node representations, selecting the next node for construction or the modification for refinement. In CaR, we retain the original neural solver designs when applied to {\textit{one} construction and \textit{one} improvement at a time}. To validate generality, we experiment with two construction backbones, POMO~\citep{kwon2020pomo} and PIP~\citep{bi2024learning}, and two refinement backbones, NeuOpt~\citep{ma2023learning} and N2S~\citep{ma2022efficient}.
+To adapt improvement solvers for new variants (e.g., TSPTW, CVRPBLTW), we follow their original design and introduce variant-specific features, such as refinement history and node-level feasibility information (see Appendix~\ref{app:opt} for details), to enhance constraint awareness. While we also explored a unified decoder, results in Figure~\ref{fig:tw_uni} show degraded performance, suggesting that while a shared encoder benefits representation learning, separate decoders remain important for paradigm-specific optimization -- an insight for future reference.
+
+\input{tables/tw_bltw}
+
+\section{Experiments}
+\label{exp}
+\label{sec:exp}
+
+We now evaluate our proposed Construct-and-Refine (CaR) framework in handling hard-constrained TSPTW and CVRPBLTW instances. We also provide detailed analysis and ablation studies.
+
+
+\textbf{Experimental settings.} Training instances are generated on the fly as in \citep{zhou2024mvmoe,bi2024learning} (see Appendix~\ref{app:problem}). 
+For TSPTW, we mainly focus on the hard variants in \citep{bi2024learning}. 
+All experiments are conducted on problem sizes $n=$ 50 and 100, following established benchmarks~\citep{kool2018attention, wu2021learning}. Models are trained with 20,000 instances per epoch for 5,000 epochs with a batch size of 128~\citep{zhou2024mvmoe}.  We set $T_{\text{R}}=5$ during training. During inference, 
+% greedy decoding with 
+\(8\times\) augmentation~\citep{kwon2020pomo} is used to construct initial solutions, followed by \(T_{\text{R}}\)-step refinement. Hyper-parameters are detailed in Appendix~\ref{app:hyper}. 
+All experiments are conducted on servers equipped with NVIDIA GeForce RTX 4090 GPUs and Intel(R) Core i9-10940X CPUs at 3.30GHz. 
+Our code, pre-trained models, and datasets will be publicly released upon acceptance.
+
+\textbf{Baseline.} We compare our CaR framework with state-of-the-art (\textit{SoTA}) classic and neural VRP solvers. \emph{Classic solvers} include 1) LKH-3 \citep{lkh3}; 2) OR-Tools \citep{ortools_routing}; 3) Greedy heuristics, {minimizing stepwise tour length (L) and constraint violation (C)}; and 4) HGS \citep{vidal2012hybrid}. \emph{Neural solvers} include 1) construction solvers such as the single-task solvers AM \citep{kool2018attention}, POMO \citep{kwon2020pomo} (+EAS \citep{hottung2022efficient} + SGBS~\citep{choo2022simulation}), BQ-NCO~\citep{drakulic2023bq}, LEHD (+RRC) \citep{luo2023neural}, UDC (+RRC) \citep{zheng2024udc}, InViT \citep{fanginvit}, PIP \citep{bi2024learning} and PolyNet \citep{hottung2025polynet}, as well as the multi-task solvers 
+POMO-MTL \citep{liu2024multi}, MVMoE \citep{zhou2024mvmoe} and ReLD-MoEL~\citep{huang2025rethinking}; 2) the improvement solver NeuOpt-GIRE \citep{ma2023learning}; and 3) hybrid solvers, including LCP \citep{Kim2021LearningCP}. All construction and improvement methods are trained for $\sim$780k~\citep{zhou2024mvmoe} (except UDC) and $\sim$600k gradient steps~\citep{ma2023learning}, respectively, with all methods observed to be converged. For fair comparisons, we use pre-trained models.
+{We note that many baselines were originally designed for simple VRPs (e.g., CVRP) and are not directly applicable to complex variants such as TSPTW and CVRPBLTW. To ensure fair comparison, we upgrade the SoTA neural solvers NeuOpt-GIRE~\citep{ma2023learning}, UDC~\citep{zheng2024udc}, and POMO+EAS+SGBS~\citep{choo2022simulation} using our design enhancements: the relaxed CMDP formulation in Eq.~(\ref{eq:constraint_obj}) (marked with *) and the proposed solution-level features (marked with \( \ddagger \); Appendix~\ref{app:opt}). Baseline selection and implementation details are provided in Appendix~\ref{app:baseline}.}
+
+\textbf{Evaluation metrics.} 
+We evaluate performance using the metrics below: 1) average solution length (Obj.), representing the mean length of the best feasible solutions; 2) average optimality gap (Gap), measuring the difference between the best feasible solutions and (near-)optimal solutions obtained by the best-performing classic solvers (LKH-3 for TSPTW, OR-Tools for CVRPBLTW, and HGS for CVRP, marked with $\diamond$); 3) total inference time (Time) taken to solve 10,000 instances for TSPTW or 1,000 instances for CVRPBLTW and CVRP, parallelized on a single GPU; and 4) average infeasible solution ratio (Infsb\%) on the best solutions after construction and refinement per instance.
+
+\begin{figure}[!t]
+    \centering
+    \begin{minipage}{0.99\textwidth}
+        \begin{minipage}{0.24\textwidth}
+            \centering
+            \includegraphics[width=\linewidth]{plot/PI_tw100_new_gap_NEW.pdf}
+        \end{minipage}
+        \hfill
+        \begin{minipage}{0.25\textwidth}
+            \centering
+            \includegraphics[width=\linewidth]{plot/PI_tw_new_infsb_broken_axis_NEW.pdf}  %PI_tw_new_infsb
+        \end{minipage}
+        \hfill
+        \begin{minipage}{0.245\textwidth}
+            \centering
+            \includegraphics[width=\linewidth]{plot/PI_bltw_new_gap_NEW.pdf}  
+        \end{minipage}
+        \hfill
+        \begin{minipage}{0.24\textwidth}
+            \centering
+            \includegraphics[width=\linewidth]{plot/PI_bltw_new_infsb_NEW.pdf}  %PI_tw_new_infsb
+        \end{minipage}
+        \caption{ {Performance over time on TSPTW-100 (left) and CVRPBLTW-100 ({right}). For CVRPBLTW, POMO+EAS+SGBS and CaR always achieve $0\%$ infeasibility due to feasibility guarantee by masking. Dots with black circles represent results reported in Table~\ref{tab:combined}.
+        % We show the SoTA method for each paradigm for comparison.
+        }}
+        \label{fig:PI_tw100}
+        \label{fig:PI_bltw100}
+    \end{minipage}
+    \vspace{-3mm}
+\end{figure}
+
+\subsection{Model performance on VRPs with varying constraint complexities
+} 
+
+
+
+\textbf{TSPTW results.} 
+We first test CaR on TSPTW, where most neural solvers fail due to their reliance but lack of feasibility masking. We use two construction backbones: the lightweight POMO* and the heavier but more effective PIP, with CaR-POMO training 1.42× faster at $n = 50$ and 1.65× faster at $n = 100$ than CaR-PIP. 
+As shown in Table~\ref{tab:combined}, CaR-POMO consistently outperforms PIP
+% (\textit{greedy} and \textit{sampling})
+in both solution quality and feasibility.
+On TSPTW-50, CaR reduces infeasibility to 0.00\%, outperforming the best construction baseline PIP (1.87\%) and our upgraded \textit{SoTA} improvement solver NeuOpt-GIRE* (0.02\%). In terms of optimality, CaR nearly matches LKH-3, achieving a minimal gap of 0.005\%. On TSPTW-100, CaR lowers PIP’s 4.67\% infeasibility to 0.02\% and reduces the gap from 1.030\% to 0.146\%. {While NeuOpt* improves with extended search (up to 30 minutes), CaR achieves competitive results with an 8× speedup within a runtime budget of 10 minutes (Figure~\ref{fig:PI_tw100}), which aligns with CaR's aim of efficiency.} Notably, CaR surpasses LKH-3 and finds feasible solutions even when it fails, highlighting CaR's strength under complex constraints. {Moreover, we present the case study of CaR's refinement trajectories in Appendix~\ref{app:case} to show how CaR intelligently refines solutions for feasibility and optimality.}
+
+\begin{wrapfigure}{r}{0.33\textwidth}
+    \centering
+    \vspace{-11pt}
+    \includegraphics[width=0.95\linewidth]{plot/cvrplib.pdf}
+    \vspace{-10pt}
+    \caption{CVRPLIB results.}
+    \vspace{-5pt}
+    \label{fig:cvrplib}
+\end{wrapfigure}
+\textbf{CVRPBLTW results.} 
+On complex CVRPBLTW, feasibility masking filters out over 60\% of nodes, severely limiting the search space (Figure~\ref{fig:bltw_mask}). Interestingly, removing these masks and applying the relaxed CMDP in POMO significantly improves performance (e.g., CVRPBLTW-100: from 7.004\% to -1.645\% in  Table~\ref{tab:combined}). Unlike TSPTW, NeuOpt* fails in CVRPBLTW with 27-51\% infeasibility, while CaR guarantees feasibility as other construction solvers. We compare CaR with the best single-paradigm solvers in Figure~\ref{fig:PI_bltw100}. CaR achieves best area under the curve, indicating superior efficiency and effectiveness. We also validate CaR with $k$-opt and R\&R, where R\&R performs better (-2.448\% vs. -1.724\%) due to a finer-grained search better suited to multi-constraints variants.
+Lastly, we observe that the performance of multi-task neural solvers is largely bottlenecked by their backbone (e.g., POMO), suggesting CaR can serve as a stronger backbone for future NCO foundation models.
+
+\begin{figure}[t]
+\centering
+    \begin{minipage}[t]{0.36\textwidth}
+        \input{tables/tspdl}
+        \vspace{2.8pt} 
+        \input{tables/sop}
+    \end{minipage}
+    \hfill 
+    \begin{minipage}[t]{0.63\textwidth}
+        \input{tables/unified_training}
+    \end{minipage}
+\end{figure}
+
+\textbf{Results on other VRP variants.} {We also evaluate CaR on {TSP with draft limit (TSPDL), sequential ordering problem (SOP) with discrete precedence constraints} and CVRP. Results in Table~\ref{tab:tspdl}, Table~\ref{tab:sop} and Appendix~\ref{app:cvrplib} show that CaR consistently delivers competitive results while maintaining efficiency of the neural solvers across different constrained VRPs.}
+To test CaR’s generalization across scales, distributions, and simpler VRP variants, we apply it to CVRP and evaluate on CVRPLIB. As shown in Figure~\ref{fig:cvrplib}, CaR achieves strong performance and generalization. Notably, it is the first neural solver to efficiently handle constraints of varying complexity, unlike prior solvers that are either variant-specific (e.g., \citet{bi2024learning}) or inefficient (e.g., \citet{ma2023learning}). 
+
+
+\subsection{Effects of the joint training framework} 
+
+{We assess combinations of different construction (random or pretrained PIP) and improvement methods (LKH-3, pretrained long-horizon NeuOpt, and our short-horizon NeuOpt). Table~\ref{tab:joint} shows that naive combinations yield only marginal gains over PIP alone (0.172\% vs. 0.177\% gap; 2.59\% vs. 2.67\% infeasibility). Thus, simply substituting random initialization with a high-quality one is insufficient. However, CaR's joint training unlocks significant performance gains. Despite similar construction quality between pretrained PIP and CaR-PIP (results not shown), the latter exhibits markedly superior refinement. This confirms a non-trivial synergy in CaR, where initialization is specifically tailored for the subsequent refinement.}
+
+\subsection{{Effects of the diversification signal \texorpdfstring{$\mathcal{L}_{DIV}$}{L\_DIV}}}
+
+\begin{wraptable}{r}{0.36\linewidth}
+% \begin{table}[htbp]
+\vspace{-10pt}
+  \centering
+  \caption{{Effects of $\mathcal{L}_{\text{DIV}}$.}}
+  \vspace{-5pt}
+\resizebox{0.99\linewidth}{!}{
+\begin{threeparttable}
+    \begin{tabular}{c|c|cc}
+    \toprule[1.2pt]
+       \textbf{Problem}   & \textbf{$\mathcal{L}_{\text{DIV}}$} & \textbf{Gap} $\downarrow$ & \textbf{Infsb\%} $\downarrow$\\
+    \midrule[1.2pt]
+    \multirow{2}[0]{*}{\textbf{CVRP}} & $\times$ & 0.325\% & \textbf{0.00\%} \\
+          & $\checkmark$ & \textbf{0.259\%} & \textbf{0.00\%} \\
+    \midrule
+    \multirow{2}[0]{*}{\textbf{TSPTW}} & $\times$ & 0.421\% & 0.58\% \\
+          & $\checkmark$ & \textbf{0.014\%} & \textbf{0.01\%} \\
+    \bottomrule[1.2pt]
+    \end{tabular}%
+\end{threeparttable}
+}
+\vspace{-10pt}
+\label{tab:div}%
+% \end{table}%
+\end{wraptable}
+We investigate the impact of the diversity loss (Eq.~\ref{eq:div}) in our joint training framework. Recall that while multi-start mechanisms improve performance on simpler problems like CVRP (as shown in Table~\ref{tab:pomo_start}), they often degrade performance on complex constraints like time windows~\citep{bi2024learning}. Hence, we sample $S$ start nodes to calculate the group baseline in the construction module rather than enumerating all nodes. To compensate for the resulting loss of diversity, we introduce $\mathcal{L}_{\text{DIV}}$. Results in Table~\ref{tab:div} show that adding $\mathcal{L}_{\text{DIV}}$ improves overall performance, even when multi-start is enabled in simple CVRP. To verify the diversity increment, we quantify the solution diversity between the constructed solutions of CaR (trained with $\mathcal{L}_{\text{DIV}}$) and PIP (without $\mathcal{L}_{\text{DIV}}$). As shown in Appendix~\ref{app:quan_div}, adding $\mathcal{L}_{\text{DIV}}$ increases the diversity of CaR's constructed solutions by $\sim$15\% over the backbone, confirming that $\mathcal{L}_{\text{DIV}}$ effectively increases solution diversity and enhances performance.
+
+\subsection{{Effects of the supervised signal \texorpdfstring{$\mathcal{L}_{\text{SL}}$}{L\_SL}}}
+{We evaluate the impact of the supervised loss $\mathcal{L}_{\text{SL}}$ (Eq.~\ref{eq:sl}) in CaR using two construction backbones: POMO and PIP. Results in Table~\ref{tab:sl} indicate that the efficacy of the supervised loss depends on the strength of the underlying backbone. For the strong backbone (PIP), which is already highly optimized, with the gap of 0.177\% and infeasibility rate of 2.67\% (as in Table~\ref{tab:combined}), adding $\mathcal{L}_{\text{SL}}$ yields only marginal gains; specifically, the gap improves slightly from 0.006\% to 0.005\%, and the infeasibility rate improves from 0.01\% to 0.00\%. In contrast, for the weaker backbone (POMO*), where the standalone model performs poorly, with the optimality gap of 1.959\% and infeasibility rate of 38.22\%, the supervised signal is critical. In this case, joint training with $\mathcal{L}_{\text{SL}}$ markedly improves performance, reducing the gap from 0.136\% to 0.014\%, and the infeasibility from 0.29\% to 0.01\%.}
+
+
+\begin{table}[t]
+    \centering
+    \begin{minipage}{0.36\textwidth}
+        \centering
+        \caption{{Effects of $\mathcal{L}_{\text{SL}}$.}}
+        \label{tab:sl}
+        {
+        \resizebox{1.0\linewidth}{!}{
+            \begin{threeparttable}
+            \begin{tabular}{c|c|cc}
+                \toprule[1.2pt]
+                \textbf{Backbones} & 
+                \textbf{$\mathcal{L}_{\text{SL}}$} & 
+                \textbf{Gap} $\downarrow$ & 
+                \textbf{Infsb\%}$\downarrow$ \\
+                \midrule[1.2pt]
+                % \textbf{POMO*} & -- & 1.959\% & 38.22\% \\
+                % \midrule
+                CaR-POMO & $\times$ & 0.136\% & 0.29\% \\
+                CaR-POMO & $\checkmark$ & \textbf{0.014\%} & \textbf{0.01\%} \\
+                % \midrule
+                % \textbf{PIP} & --  & 0.177\% & 2.67\% \\
+                \midrule
+                CaR-PIP   &  $\times$ & 0.006\% & 0.01\% \\
+                CaR-PIP & $\checkmark$ & \textbf{0.005\%} & \textbf{0.00\%} \\
+                \bottomrule[1.2pt]
+            \end{tabular}
+            \end{threeparttable}
+        }
+        }
+    \end{minipage}
+    \hfill
+    \begin{minipage}{0.62\textwidth}
+        \centering
+        \input{tables/shared_rep}
+    \end{minipage}
+\end{table}
+
+\begin{table}[t]
+    \centering
+    \caption{{Generalization results on CVRPBLTW-200. The runtime for OR-Tools is 1.8h.}}
+    \label{tab:cvrpbltw}
+    \resizebox{0.8\linewidth}{!}{
+    \begin{threeparttable}
+    \begin{tabular}{c|c|c|c|c|c}
+        \toprule[1.2pt]
+        \textbf{Method} & \textbf{Train Scale} & \textbf{Test Scale} & \textbf{Gap} $\downarrow$ & \textbf{Infsb\%} $\downarrow$ & \textbf{Time} \\
+        \midrule[1.2pt]
+        POMO*+EAS+SGBS~\citep{choo2022simulation} & 100 & 200 & 4.51\% & \textbf{0.00\%} & 2.1m \\
+        NeuOpt*~\citep{ma2023learning} & 100 & 200 & 6.37\% & 75.78\% & 17m \\
+        {CaR (R\&R, $T_\text{R} = $ 20)} & 100 & 200 & \textbf{2.09\%} & \textbf{0.00\%} & \textbf{10s} \\
+        \bottomrule[1.2pt]
+    \end{tabular}
+    \end{threeparttable}
+    }
+\end{table}
+
+
+
+ \begin{table}[!t]
+    \centering
+    \caption{Generalization results on TSPTW-100 Hard with different time windows tightness.}
+    \label{tab:gen}
+    \resizebox{0.58\linewidth}{!}{
+    \begin{threeparttable}
+    \begin{tabular}{l|c|c|c|c|c}
+        \toprule[1.2pt]
+        \textbf{Method} & \textbf{Train} & \textbf{Test} & \textbf{Gap} $\downarrow$ & \textbf{Infsb\%} $\downarrow$ & \textbf{Time}\\
+        \midrule[1.2pt]
+        % {PIP} (greedy) & tight & tight & 0.31\% & 6.48\% & 29s \\
+        {PIP} (sample 5) & tight & tight & 0.26\% & 4.62\% & 2.3m \\
+        {PIP} (sample 5) & loose & tight & 0.03\% & 31.37\% & 2.3m \\
+        {CaR-PIP} ($T_\text{R} = $ 20) & loose & tight & \textbf{0.02\%} & \textbf{3.52\%} & 2.3m \\
+        \bottomrule[1.2pt]
+    \end{tabular}
+    \end{threeparttable}
+    }
+    \vspace{-5pt}
+\end{table}
+
+\subsection{{Effects of the shared representation}} 
+
+{We study the effect of our shared representation via a unified encoder. As shown in Table~\ref{tab:unified}, CaR with shared representation performs better on both hard-constrained cases (TSPTW-50 Hard and TSPTW-100 Medium), indicating improved knowledge transfer across paradigms. Compared with using separate encoders and decoders, which share only the constructed solutions, CaR also reduces the number of learnable parameters. See Appendix~\ref{app:unified_model} for further analysis.}
+
+
+\subsection{{Generalization results}}
+
+{We now evaluate CaR's generalization performance across problem scales and constraint hardness. Regarding {cross-scale generalization}, where CaR is trained on CVRPBLTW-100 and tested on CVRPBLTW-200, results show that CaR significantly outperforms other {SoTA} neural baselines, maintaining 0\% infeasibility and the lowest optimality gap within 10 seconds. Furthermore, for {cross-constraint generalization}, Table~\ref{tab:gen} demonstrates that CaR trained on loose constraints even outperforms PIP trained on tight constraints (see Appendix~\ref{app:tsptw} for data generation details).}
+
+
+\section{Conclusion}
+\label{conclusion}
+{This paper proposes Construct-and-Refine (CaR), the first neural framework to handle constraints through a new explicit feasibility refinement scheme, extending beyond feasibility masking and implicit feasibility awareness. CaR jointly learns to construct diverse, high-quality solutions and refine them with a lightweight improvement module, enabling \textit{efficient} constraint satisfaction. We also explore shared encoders for cross-paradigm representation learning. To best of our knowledge, CaR is the first neural solvers applicable and effective on VRPs with varying constraint hardness.} {Future work includes 1) integrating CaR with diverse backbone solvers, 2) applying to more constrained VRPs or even broader COPs, e.g. scheduling~\citep{zhangcong2020learning,zhang2024deep,andelfinger2025learning}, 3) improving scalability, 4) studying its theoretical properties, e.g. learnability~\citep{yuan2022general}, convergence~\citep{thoma2024contextual}, or generalization bound~\citep{duan2021risk}, and 5) developing foundation NCO models based on the insights of cross-paradigm representation in this paper.}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section*{Acknowledgments}
+This research is supported by the National Research Foundation, Singapore under its AI Singapore AI Research Fundamental Research Collaborative (US-NSF Researcher Call) (AISG Award No: AISG3-RP-2025-036-USNSF) and its AI Singapore Programme (AISG Award No: AISG3-RP-2022-031). Any opinions, findings and conclusions or recommendations expressed in this material are those of the author(s) and do not reflect the views of National Research Foundation, Singapore. We would like to thank the anonymous reviewers and (S)ACs of ICLR 2026 for their constructive comments and service to the community.
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section*{Reproducibility statement}
+We have made every effort to ensure the reproducibility of our results. The datasets used in our experiments are publicly available or generated following standard protocols, with all instance generation details provided in Appendix~\ref{app:problem}. The model architecture is described in Appendix~\ref{app:model_arch}, with hyperparameters and training/inference configurations detailed in Appendix~\ref{app:hyper}. Implementation details and the selection criteria for baselines are provided in Appendix~\ref{app:baseline}. Additional ablation studies and robustness checks are reported in Section~\ref{sec:exp} and Appendix~\ref{app:exp}. {Our code, pre-trained models, and datasets are available at: \url{https://github.com/jieyibi/CaR-constraint}.}
+
+\bibliography{iclr2026_conference}
+\bibliographystyle{iclr2026_conference}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\newpage
+\appendix
+\input{appendix}
+
+
+\end{document}
+

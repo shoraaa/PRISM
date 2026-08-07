@@ -537,6 +537,9 @@ void SearchConfig::validate() const {
     throw std::invalid_argument(
         "feasibility_lookahead_depth must be in [0, 4]");
   }
+  if (srr_exploration_budget < 0) {
+    throw std::invalid_argument("srr_exploration_budget must be non-negative");
+  }
 }
 
 const char *objective_name(Objective objective) {
@@ -4758,6 +4761,13 @@ Solution RoutingDecoder::scope_restricted_refine(
   int32_t incremental_rebuilds = 0;
   int32_t full_rebuilds = 0;
   int64_t rebuilt_nodes = 0;
+  // Field-gated exploration: bounded budget of objective-worsening but
+  // guided-energy-descending moves, and the champion (best objective ever seen)
+  // that is returned so an uphill excursion never degrades the result. Disabled
+  // (budget 0) unless a non-flat field is guiding the search.
+  int32_t exploration_remaining =
+      search_config_.classical_behavior ? 0 : search_config_.srr_exploration_budget;
+  Solution champion = solution;
   while (!checklist.empty()) {
     const int32_t anchor = checklist.front();
     checklist.pop_front();
@@ -4773,6 +4783,17 @@ Solution RoutingDecoder::scope_restricted_refine(
     const std::vector<float> anchor_state =
         incumbent_state_features(anchor);
     double best_guided_energy = std::numeric_limits<double>::infinity();
+    // Field-gated exploration slot for this anchor: the lowest guided-energy
+    // feasible move that strictly lowers the anchor energy (the field prefers
+    // it) even though it does not improve the objective. Committed only when no
+    // improving move exists and exploration budget remains.
+    const double current_anchor_energy =
+        search_config_.classical_behavior
+            ? std::numeric_limits<double>::infinity()
+            : guidance_energy(current_guidance, anchor_state.data());
+    Solution best_explore_move;
+    AcceptedPlan best_explore_plan;
+    double best_explore_energy = std::numeric_limits<double>::infinity();
     const auto consider = [&](const std::vector<int32_t> &trial,
                               StructuralMove structural) {
       ++full_evaluations;
@@ -4964,8 +4985,21 @@ Solution RoutingDecoder::scope_restricted_refine(
             // the classical path does, and use the guided energy only to pick
             // among strictly-improving moves. This keeps the field's influence
             // on move selection while guaranteeing SRR terminates.
-            if (!better(scored, solution) ||
-                planned_energy >= best_guided_energy - 1.0e-12)
+            //
+            // Field-gated exploration relaxes this for a bounded budget: a move
+            // that strictly lowers the anchor guided energy but does not improve
+            // the objective is admitted as an escape candidate. Termination
+            // still holds because each such move decrements exploration_remaining
+            // and the descent reverts to the strict monotone gate at zero.
+            const bool improving_gate =
+                better(scored, solution) &&
+                planned_energy < best_guided_energy - 1.0e-12;
+            const bool explore_gate =
+                exploration_remaining > 0 &&
+                planned_energy <
+                    current_anchor_energy - search_config_.srr_exploration_margin &&
+                planned_energy < best_explore_energy;
+            if (!improving_gate && !explore_gate)
               return;
           }
           std::vector<int32_t> trial;
@@ -5023,14 +5057,27 @@ Solution RoutingDecoder::scope_restricted_refine(
               best_structural = {};
             }
           } else {
-            if (!better(candidate, solution))
-              return;
-            best_move = std::move(candidate);
-            best_guided_energy = planned_energy;
-            best_plan.valid = true;
-            best_plan.plans = plans;
-            best_plan.resources = planned_resource;
-            best_structural = {};
+            if (better(candidate, solution) &&
+                planned_energy < best_guided_energy - 1.0e-12) {
+              best_move = std::move(candidate);
+              best_guided_energy = planned_energy;
+              best_plan.valid = true;
+              best_plan.plans = plans;
+              best_plan.resources = planned_resource;
+              best_structural = {};
+            } else if (exploration_remaining > 0 &&
+                       planned_energy < current_anchor_energy -
+                                            search_config_.srr_exploration_margin &&
+                       planned_energy < best_explore_energy) {
+              // No strictly-improving move at this anchor: record the field's
+              // most-preferred feasible move (lowest guided energy) as a bounded
+              // uphill escape from the local optimum.
+              best_explore_move = std::move(candidate);
+              best_explore_energy = planned_energy;
+              best_explore_plan.valid = true;
+              best_explore_plan.plans = plans;
+              best_explore_plan.resources = planned_resource;
+            }
           }
         };
     const auto new_plan = [&](int32_t route) {
@@ -5513,15 +5560,28 @@ Solution RoutingDecoder::scope_restricted_refine(
           consider_relocate_pair_plan(candidate_node, anchor);
         }
       }
-    if (best_move.feasible) {
+    // Prefer a strictly-improving move; otherwise, if the field found a bounded
+    // guided-energy-descending escape, commit that and spend one unit of budget.
+    const bool commit_improving = best_move.feasible;
+    const bool commit_explore = !commit_improving && exploration_remaining > 0 &&
+                                best_explore_plan.valid;
+    if (commit_improving || commit_explore) {
+      AcceptedPlan &commit_plan = commit_improving ? best_plan : best_explore_plan;
       std::vector<int32_t> old_route;
-      if (!best_plan.valid && !best_structural.valid())
-        old_route = solution.route;
-      solution = std::move(best_move);
+      if (commit_explore) {
+        solution = std::move(best_explore_move);
+        --exploration_remaining;
+      } else {
+        if (!best_plan.valid && !best_structural.valid())
+          old_route = solution.route;
+        solution = std::move(best_move);
+      }
       ++moves;
       std::vector<int32_t> touched;
-      if (best_plan.valid) {
-        if (!replace_planned_routes(best_plan.plans, touched, rebuilt_nodes)) {
+      // An exploration move is always a planned move (only consider_plans records
+      // the escape slot), so it takes the incremental planned-route path.
+      if (commit_explore || best_plan.valid) {
+        if (!replace_planned_routes(commit_plan.plans, touched, rebuilt_nodes)) {
           throw std::runtime_error(
               "accepted planned SRR move could not update its route cache");
         }
@@ -5543,8 +5603,8 @@ Solution RoutingDecoder::scope_restricted_refine(
       }
       if (trace != nullptr &&
           trace->screened_edges.size() < MAX_SCREENING_LABELS) {
-        current_resource = best_plan.resources.has_value()
-                               ? *best_plan.resources
+        current_resource = commit_plan.resources.has_value()
+                               ? *commit_plan.resources
                                : evaluate_resources(solution.route);
       }
       for (int32_t node : touched) {
@@ -5569,21 +5629,29 @@ Solution RoutingDecoder::scope_restricted_refine(
         }
       }
       enqueue(anchor);
+      // Track the best objective ever seen so an uphill exploration excursion
+      // can never degrade the returned solution.
+      if (better(solution, champion))
+        champion = solution;
     }
   }
-  solution.srr_moves = moves;
-  solution.srr_evaluations = full_evaluations;
-  solution.srr_certified_evaluations = certified_evaluations;
-  solution.srr_incremental_rebuilds = incremental_rebuilds;
-  solution.srr_full_rebuilds = full_rebuilds;
-  solution.srr_rebuilt_nodes = rebuilt_nodes;
+  // Return the champion (best objective seen); with exploration disabled it is
+  // always the final monotone-descent solution, so behaviour is unchanged.
+  Solution result =
+      better(champion, solution) ? std::move(champion) : std::move(solution);
+  result.srr_moves = moves;
+  result.srr_evaluations = full_evaluations;
+  result.srr_certified_evaluations = certified_evaluations;
+  result.srr_incremental_rebuilds = incremental_rebuilds;
+  result.srr_full_rebuilds = full_rebuilds;
+  result.srr_rebuilt_nodes = rebuilt_nodes;
   for (int32_t count : visits) {
     if (count > 0)
-      ++solution.srr_scope_nodes;
+      ++result.srr_scope_nodes;
     if (count > 1)
-      solution.srr_revisits += count - 1;
+      result.srr_revisits += count - 1;
   }
-  return solution;
+  return result;
 }
 
 Solution RoutingDecoder::perturb(uint64_t rollout_seed, const float *edge_field,
