@@ -31,18 +31,19 @@ The network defines the search policy: for candidate edge `e` in search state
 `s`, PRISM ranks moves by the energy
 
 ```text
-E(e | s) = c(e) + delta_obj(e)
+E_tilde(e | s) = c(e) / s_obj + delta_obj(e)
          + sum_r lambda_r(s) * [field_r(e) + a_r(e)]
          + kappa * q(e),
 ```
 
-and samples the next node from `softmax(-beta * E)`. Every term is produced by
-the network:
+and samples the next node from `softmax(-beta * E_tilde)`. The native decoder
+supplies the exact objective and scale; the remaining energy terms are learned:
 
-- `c(e)` is the exact canonical objective edge cost and `delta_obj(e)` is its
-  signed, objective-family-conditioned learned residual;
+- `c(e)` is the exact canonical objective edge cost, `s_obj` is a row-centered
+  RMS objective scale, and `delta_obj(e)` is its signed,
+  objective-family-conditioned dimensionless learned residual;
 - `field_r(e)` and `a_r(e)` are the learned per-edge field and additive term for
-  resource `r` (scaled to that resource's units);
+  resource `r`, expressed directly in dimensionless energy units;
 - `lambda_r(s)` is the learned, live-state-modulated intensity of resource `r`,
   a Lagrangian-style multiplier shaped by search reward rather than supervision;
 - `q(e)` is an optional learned continuation-risk potential.
@@ -167,9 +168,10 @@ the decoder is the source of truth for graph dimensions, resource scales, and
 active channels. Active resource tokens attend to one another before producing
 per-edge resource fields, global resource intensities, the objective residual,
 binding predictions, and live-state coupler parameters. The native decoder adds
-the residual to canonical objective edge cost before applying the single
-sampling temperature, so construction, PPO replay, and SRR share one energy
-formula. The decoder first installs one objective-only greedy incumbent, so
+the residual to normalized objective edge cost before applying the single
+sampling temperature, so native sampling, PPO replay, and SRR share one
+dimensionless energy formula. The decoder first installs one objective-only
+greedy incumbent, so
 the network's
 first input already contains incumbent route positions, forward/backward resource
 state, and incumbent-edge indicators. The neural policy does not participate in
@@ -182,9 +184,9 @@ progress, and other live variables at each stochastic choice.
 The token encoder consumes the native algebra descriptor rather than a
 constraint-identity one-hot. Field, multiplier, quota, and token-to-token state
 coupler heads are shared across rows, so appending a resource adds no model
-parameter. This is a clean `typed_resource_v4_signed_resource_energy` checkpoint
-boundary: older checkpoints are rejected and must be retrained because resource
-fields are now signed, zero-neutral energy corrections.
+parameter. This is a clean `typed_resource_v5_scale_equivariant_energy` checkpoint
+boundary: older checkpoints are rejected and must be retrained because the
+policy energy units and objective-residual units changed.
 
 ### Guaranteed-feasible action space
 

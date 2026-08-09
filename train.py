@@ -259,8 +259,13 @@ def replay_decision_logp_from_cpp_batch_trace(
     global_edge = global_edge.clamp_max(output["residual"].shape[0] - 1)
     residual = output["residual"][global_edge]
     additive = output["additive"][global_edge]
-    scales = graph.resource_scales.to(device)
-    objective = graph.objective_edge_costs.to(device)[global_edge]
+    objective_energy_scale = graph.objective_energy_scale.to(device).reshape(-1)
+    if objective_energy_scale.numel() != 1:
+        raise ValueError("PPO trace replay expects exactly one decoder graph")
+    objective = (
+        graph.objective_edge_costs.to(device)[global_edge]
+        / objective_energy_scale[0]
+    )
     channels = output["active_channels"].shape[-1]
     multiplier = model.couple(output, states)
     field_multiplier = multiplier[:, :channels]
@@ -269,8 +274,8 @@ def replay_decision_logp_from_cpp_batch_trace(
         field_multiplier = torch.zeros_like(field_multiplier)
         objective_weight = torch.ones_like(objective_weight)
     feasibility_risk = output["feasibility_risk"].detach()
-    # Match the native signed, zero-neutral resource-energy contract.
-    field_term = scales * (residual + additive)
+    # Match the native dimensionless, signed, zero-neutral energy contract.
+    field_term = residual + additive
     objective_residual = output["objective_residual"][global_edge]
     if not field_enabled:
         objective_residual = torch.zeros_like(objective_residual)
@@ -283,7 +288,7 @@ def replay_decision_logp_from_cpp_batch_trace(
     logits = (-float(beta) * energy).masked_fill(~valid, -torch.inf)
 
     chosen_edge = edge_offsets[current[selected]] + chosen[selected]
-    chosen_field = scales * (
+    chosen_field = (
         output["residual"][chosen_edge] + output["additive"][chosen_edge]
     )
     chosen_objective_residual = output["objective_residual"][chosen_edge]
@@ -291,6 +296,7 @@ def replay_decision_logp_from_cpp_batch_trace(
         chosen_objective_residual = torch.zeros_like(chosen_objective_residual)
     chosen_energy = objective_weight[selected] * (
         graph.objective_edge_costs.to(device)[chosen_edge]
+        / objective_energy_scale[0]
         + chosen_objective_residual
     ) + (field_multiplier[selected] * chosen_field).sum(dim=-1)
     chosen_energy = (
@@ -342,15 +348,14 @@ def _guidance_numpy(
         # (slot FIELD_CHANNEL_COUNT) so neutral guidance is the plain objective.
         multipliers = multipliers.clone()
         multipliers[:-1] = 0.0
-    scales = graph.resource_scales.unsqueeze(0)
     return {
         "objective_residual": (
             output["objective_residual"]
             if field_enabled
             else torch.zeros_like(output["objective_residual"])
         ).detach().cpu().numpy(),
-        "edge_field": (output["residual"] * scales).detach().cpu().numpy(),
-        "edge_additive": (output["additive"] * scales).detach().cpu().numpy(),
+        "edge_field": output["residual"].detach().cpu().numpy(),
+        "edge_additive": output["additive"].detach().cpu().numpy(),
         "multipliers": multipliers.detach().cpu().numpy(),
         "coupler_weights": output["coupler_weights"][0].detach().cpu().numpy(),
         "coupler_bias": output["coupler_bias"][0].detach().cpu().numpy(),
@@ -1091,7 +1096,7 @@ def _detached_output(
 
 
 def _objective_residual_loss(step: OptionStep, output: dict) -> torch.Tensor:
-    """Anchor policy-relevant objective-energy residual differences.
+    """Anchor policy-relevant dimensionless objective-residual differences.
 
     A constant added to every outgoing edge cancels in the decoder softmax, so
     center each source row before penalizing the learned residual.
@@ -3006,7 +3011,7 @@ def main() -> None:
         )
         if checkpoint.get("model_schema") != MODEL_SCHEMA:
             raise RuntimeError(
-                "resume checkpoint is not a typed-resource v4 signed-resource-energy "
+                "resume checkpoint is not a typed-resource v5 scale-equivariant-energy "
                 "checkpoint"
             )
         upgraded = load_constraint_field_state_dict(

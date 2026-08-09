@@ -363,6 +363,10 @@ public:
   // distance scale, in [0, 1). Gives the field the raw objective scale that
   // per-edge normalization hides, so the multiplier can calibrate its units.
   float objective_scale() const;
+  // Row-centered graph scale used to make objective energy dimensionless.
+  // Unlike objective_scale(), this is an energy-unit conversion, not a model
+  // feature.
+  float objective_energy_scale() const { return objective_energy_scale_; }
   const Solution &best_solution() const { return best_solution_; }
 
 private:
@@ -432,6 +436,7 @@ private:
   float time_scale_ = 1.0f;
   float prize_scale_ = 1.0f;
   float penalty_scale_ = 1.0f;
+  float objective_energy_scale_ = 1.0f;
   int32_t pair_count_ = 0;
 
   std::vector<float> heuristic_;
@@ -461,6 +466,7 @@ private:
   float objective_edge_cost(int32_t from, int32_t to) const;
   float resource_scale(int32_t channel) const;
   float runtime_resource_scale(int32_t resource) const;
+  void refresh_objective_energy_scale();
   float analytic_resource_pressure(int32_t from, int32_t to,
                                    int32_t channel) const;
   float runtime_resource_pressure(int32_t from, int32_t to,

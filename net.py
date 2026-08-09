@@ -22,7 +22,7 @@ INCUMBENT_EDGE_FEATURE_END = 10
 
 
 OBJECTIVE_TYPES = ("distance", "prize", "distance_plus_penalty")
-MODEL_SCHEMA = "typed_resource_v4_signed_resource_energy"
+MODEL_SCHEMA = "typed_resource_v5_scale_equivariant_energy"
 # Canonical constraint order for schema conditioning of the refiner; mirrors the
 # native CONSTRAINT_KERNEL registry so a multi-hot indexes constraints stably.
 CONSTRAINT_VOCAB = (
@@ -117,6 +117,11 @@ def build_decoder_data(decoder, device="cpu"):
         dtype=torch.float32,
         device=device,
     )
+    objective_energy_scale = torch.tensor(
+        [[float(decoder.metadata["objective_energy_scale"])]],
+        dtype=torch.float32,
+        device=device,
+    )
     multi_route = torch.tensor(
         [[float(bool(decoder.metadata["multi_route"]))]],
         dtype=torch.float32,
@@ -168,6 +173,13 @@ def build_decoder_data(decoder, device="cpu"):
     if not torch.isfinite(objective_edge_costs).all():
         raise ValueError("objective_edge_costs must contain only finite values")
     if (
+        not torch.isfinite(objective_energy_scale).all()
+        or torch.any(objective_energy_scale <= 0.0)
+    ):
+        raise ValueError(
+            "objective_energy_scale must be finite and strictly positive"
+        )
+    if (
         resource_scales.shape != (resource_count,)
         or not torch.isfinite(resource_scales).all()
         or torch.any(resource_scales <= 0.0)
@@ -190,6 +202,7 @@ def build_decoder_data(decoder, device="cpu"):
         open_route=open_route,
         objective_type=objective_type,
         objective_scale=objective_scale,
+        objective_energy_scale=objective_energy_scale,
         multi_route=multi_route,
         depot_scale=depot_scale,
         raw_resource_pressure=raw_resource_pressure,
@@ -226,13 +239,12 @@ def decode_iteration(
         decoder.set_incumbent(decoder.best_solution["route"])
         graph = build_decoder_data(decoder, device=device)
         output = model(graph)
-    scales = graph.resource_scales.unsqueeze(0)
-    edge_field = (output["residual"] * scales).detach().cpu().numpy()
+    edge_field = output["residual"].detach().cpu().numpy()
     multipliers = output["multipliers"][0].detach().cpu().numpy()
     solution = decoder.solve(
         1,
         edge_field=edge_field,
-        edge_additive=(output["additive"] * scales).detach().cpu().numpy(),
+        edge_additive=output["additive"].detach().cpu().numpy(),
         multipliers=multipliers,
         coupler_weights=output["coupler_weights"][0].detach().cpu().numpy(),
         coupler_bias=output["coupler_bias"][0].detach().cpu().numpy(),
@@ -386,8 +398,8 @@ class ConstraintFieldNet(nn.Module):
         # between distance and prize objectives.
         self.edge_logit_head = nn.Linear(units, 1)
         # Keep this final in module registration order. Each objective family
-        # gets its own signed correction to canonical objective energy while
-        # resource fields continue to handle constraints.
+        # gets its own signed, dimensionless correction to normalized objective
+        # energy while resource fields continue to handle constraints.
         self.objective_energy_residual_head = nn.Linear(
             units, len(OBJECTIVE_TYPES)
         )
@@ -674,8 +686,9 @@ class ConstraintFieldNet(nn.Module):
         ).sum(dim=1)
         # Only differences within an outgoing candidate row affect policy.
         # Center before bounding so a row-constant head output is exactly
-        # neutral. Convert the dimensionless correction into canonical
-        # objective-energy units using this graph's mean absolute edge cost.
+        # neutral. The result is a dimensionless correction because the native
+        # decoder and PPO replay both divide the raw objective by the same
+        # row-centered graph scale before adding this term.
         source = pyg.edge_index[0]
         row_sums = raw_objective_residual.new_zeros(pyg.x.shape[0])
         row_sums.scatter_add_(0, source, raw_objective_residual)
@@ -685,25 +698,7 @@ class ConstraintFieldNet(nn.Module):
         centered_objective_residual = raw_objective_residual - (
             row_sums / row_counts.clamp_min(1.0)
         )[source]
-        objective_costs = pyg.objective_edge_costs.to(
-            raw_objective_residual.device
-        )
-        if batched:
-            scale_sums = raw_objective_residual.new_zeros(batch_size)
-            scale_sums.scatter_add_(0, edge_batch, objective_costs.abs())
-            scale_counts = torch.bincount(
-                edge_batch, minlength=batch_size
-            ).to(raw_objective_residual.dtype)
-            objective_energy_scale = (
-                scale_sums / scale_counts.clamp_min(1.0)
-            ).clamp_min(1.0e-6)[edge_batch]
-        else:
-            objective_energy_scale = objective_costs.abs().mean().clamp_min(
-                1.0e-6
-            )
-        objective_residual = objective_energy_scale * torch.tanh(
-            centered_objective_residual
-        )
+        objective_residual = torch.tanh(centered_objective_residual)
         projected_tokens = self.token_projection(tokens)
         raw_channels = []
         additive_channels = []
@@ -1519,7 +1514,7 @@ def load_constraint_field_state_dict(
     if "resource_types" in state_dict:
         raise RuntimeError(
             "incompatible ConstraintFieldNet v1 checkpoint: typed-resource "
-            "v4 signed-resource-energy model requires retraining"
+            "v5 scale-equivariant-energy model requires retraining"
         )
     upgraded = False
     state_dict = dict(state_dict)

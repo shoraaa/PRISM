@@ -404,7 +404,7 @@ def main() -> int:
     )
     if checkpoint.get("model_schema") != MODEL_SCHEMA:
         raise RuntimeError(
-            "checkpoint is not a typed-resource v4 signed-resource-energy checkpoint"
+            "checkpoint is not a typed-resource v5 scale-equivariant-energy checkpoint"
         )
     model = ConstraintFieldNet().to(args.device)
     load_constraint_field_state_dict(model, checkpoint["model_state_dict"])

@@ -713,6 +713,7 @@ def test_policy_replay_uses_direct_field_not_analytic_pressure() -> None:
     graph = SimpleNamespace(
         edge_offsets=torch.tensor([0, 2], dtype=torch.long),
         objective_edge_costs=torch.zeros(2),
+        objective_energy_scale=torch.ones(1, 1),
         resource_scales=torch.ones(channels),
         # Deliberately unequal: these must be input features only, not energy.
         raw_resource_pressure=torch.stack(
@@ -741,6 +742,121 @@ def test_policy_replay_uses_direct_field_not_analytic_pressure() -> None:
     )
 
     assert logp.item() == pytest.approx(-np.log(2.0))
+
+
+def test_policy_replay_is_objective_scale_and_resource_unit_invariant() -> None:
+    channels = prism_decoder.FIELD_CHANNEL_COUNT
+    trace = {
+        "current_nodes": np.array([0], dtype=np.int32),
+        "starts": np.array([0, 1], dtype=np.int32),
+        "stochastic": np.array([1], dtype=np.uint8),
+        "chosen_indices": np.array([1], dtype=np.int32),
+        "live_state": np.zeros(
+            (1, prism_decoder.LIVE_STATE_FEATURE_COUNT), dtype=np.float32
+        ),
+        "valid_offsets": np.array([0, 2], dtype=np.int32),
+        "valid_indices": np.array([0, 1], dtype=np.int32),
+    }
+    active = torch.ones(1, channels)
+    residual = torch.arange(2 * channels, dtype=torch.float32).reshape(
+        2, channels
+    ) / 10.0
+    output = {
+        "residual": residual,
+        "additive": torch.flip(residual, dims=(1,)) / 5.0,
+        "objective_residual": torch.tensor([0.2, -0.1]),
+        "feasibility_risk": torch.tensor([0.05, 0.15]),
+        "active_channels": active,
+    }
+    field_multipliers = torch.linspace(0.1, 0.7, channels)
+
+    class FixedCoupler:
+        @staticmethod
+        def couple(_output, states):
+            weights = torch.cat((field_multipliers, torch.ones(1)))
+            return weights.unsqueeze(0).expand(states.shape[0], -1)
+
+    def replay(objective_factor: float, resource_factor: float) -> torch.Tensor:
+        graph = SimpleNamespace(
+            edge_offsets=torch.tensor([0, 2], dtype=torch.long),
+            objective_edge_costs=(
+                torch.tensor([2.0, 6.0]) * objective_factor
+            ),
+            objective_energy_scale=torch.tensor([[2.0 * objective_factor]]),
+            # Physical resource units are model inputs only and must not alter
+            # a dimensionless learned energy after inference.
+            resource_scales=torch.full((channels,), resource_factor),
+        )
+        return replay_decision_logp_from_cpp_batch_trace(
+            trace,
+            graph,
+            output,
+            FixedCoupler(),
+            beta=1.7,
+            risk_penalty=0.4,
+        )[0]
+
+    reference = replay(1.0, 1.0)
+    assert torch.allclose(reference, replay(100.0, 1.0), atol=1e-6)
+    assert torch.allclose(reference, replay(1.0, 1000.0), atol=1e-6)
+
+
+def test_policy_replay_resource_energy_is_channel_permutation_invariant() -> None:
+    channels = prism_decoder.FIELD_CHANNEL_COUNT
+    permutation = torch.arange(channels - 1, -1, -1)
+    trace = {
+        "current_nodes": np.array([0], dtype=np.int32),
+        "starts": np.array([0, 1], dtype=np.int32),
+        "stochastic": np.array([1], dtype=np.uint8),
+        "chosen_indices": np.array([0], dtype=np.int32),
+        "live_state": np.zeros(
+            (1, prism_decoder.LIVE_STATE_FEATURE_COUNT), dtype=np.float32
+        ),
+        "valid_offsets": np.array([0, 2], dtype=np.int32),
+        "valid_indices": np.array([0, 1], dtype=np.int32),
+    }
+    graph = SimpleNamespace(
+        edge_offsets=torch.tensor([0, 2], dtype=torch.long),
+        objective_edge_costs=torch.tensor([1.0, 3.0]),
+        objective_energy_scale=torch.tensor([[2.0]]),
+        resource_scales=torch.ones(channels),
+    )
+    residual = torch.arange(2 * channels, dtype=torch.float32).reshape(
+        2, channels
+    ) / 10.0
+    output = {
+        "residual": residual,
+        "additive": torch.zeros_like(residual),
+        "objective_residual": torch.zeros(2),
+        "feasibility_risk": torch.zeros(2),
+        "active_channels": torch.ones(1, channels),
+    }
+    multipliers = torch.linspace(0.1, 0.7, channels)
+
+    class FixedCoupler:
+        def __init__(self, values):
+            self.values = values
+
+        def couple(self, _output, states):
+            weights = torch.cat((self.values, torch.ones(1)))
+            return weights.unsqueeze(0).expand(states.shape[0], -1)
+
+    reference = replay_decision_logp_from_cpp_batch_trace(
+        trace, graph, output, FixedCoupler(multipliers), beta=1.0
+    )[0]
+    permuted_output = dict(output)
+    permuted_output["residual"] = residual[:, permutation]
+    permuted_output["additive"] = output["additive"][:, permutation]
+    permuted_output["active_channels"] = output["active_channels"][:, permutation]
+    permuted = replay_decision_logp_from_cpp_batch_trace(
+        trace,
+        graph,
+        permuted_output,
+        FixedCoupler(multipliers[permutation]),
+        beta=1.0,
+    )[0]
+
+    assert torch.allclose(reference, permuted, atol=1e-6)
 
 
 def test_validation_size_loads_each_requested_instance(monkeypatch) -> None:

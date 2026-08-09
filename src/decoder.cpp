@@ -806,8 +806,12 @@ void RoutingDecoder::build_resource_descriptors() {
                          ? 1.0f
                          : 0.0f;
     descriptor[28] = squash(spec.state_dim);
-    descriptor[29] = squash(std::log1p(
-        spec.scale / std::max<double>(distance_scale_, EPS)));
+    // Slot 29 used to compare spec.scale with distance_scale_. That ratio is
+    // not semantic for resources with unrelated units (capacity/distance,
+    // time/distance, battery/distance) and made the network sensitive to a
+    // harmless change of physical units. Keep the reserved slot neutral; the
+    // normalized magnitude below carries scale-free quantitative information.
+    descriptor[29] = 0.0f;
     double magnitude = 0.0;
     if (spec.edge_uses_distance)
       magnitude += std::abs(spec.edge_coefficient) * distance_scale_;
@@ -1041,6 +1045,52 @@ float RoutingDecoder::objective_scale() const {
       (total / static_cast<double>(count)) / std::max(distance_scale_, EPS);
   // ratio / (1 + ratio) squashes [0, inf) into [0, 1) without a hard clamp.
   return static_cast<float>(ratio / (1.0 + ratio));
+}
+
+void RoutingDecoder::refresh_objective_energy_scale() {
+  // Center each outgoing candidate row before taking an RMS. This measures the
+  // objective differences that can actually change a decision, rather than an
+  // arbitrary absolute offset. Under c -> k*c (k > 0), the scale also changes
+  // by k, so the complete stochastic policy is invariant at fixed beta.
+  double squared_difference = 0.0;
+  int64_t difference_count = 0;
+  for (int32_t from = 0; from < problem_.node_count; ++from) {
+    const int32_t begin = edge_offsets_[from];
+    const int32_t end = edge_offsets_[from + 1];
+    if (begin == end)
+      continue;
+    double mean = 0.0;
+    for (int32_t edge = begin; edge < end; ++edge)
+      mean += objective_edge_costs_[edge];
+    mean /= static_cast<double>(end - begin);
+    for (int32_t edge = begin; edge < end; ++edge) {
+      const double difference = objective_edge_costs_[edge] - mean;
+      squared_difference += difference * difference;
+      ++difference_count;
+    }
+  }
+  const double row_rms =
+      difference_count > 0
+          ? std::sqrt(squared_difference /
+                      static_cast<double>(difference_count))
+          : 0.0;
+  if (std::isfinite(row_rms) && row_rms > EPS) {
+    objective_energy_scale_ = static_cast<float>(row_rms);
+    return;
+  }
+
+  // Degenerate rows still need a valid scale. Mean absolute magnitude retains
+  // positive scale equivariance when all candidates in a row have equal cost.
+  double absolute_total = 0.0;
+  for (float cost : objective_edge_costs_)
+    absolute_total += std::abs(cost);
+  const double mean_absolute = objective_edge_costs_.empty()
+                                   ? 0.0
+                                   : absolute_total / objective_edge_costs_.size();
+  objective_energy_scale_ =
+      std::isfinite(mean_absolute) && mean_absolute > EPS
+          ? static_cast<float>(mean_absolute)
+          : 1.0f;
 }
 
 float RoutingDecoder::analytic_resource_pressure(int32_t from, int32_t to,
@@ -1453,7 +1503,8 @@ double RoutingDecoder::edge_energy(int32_t from, int32_t to, int32_t edge,
       objective_multiplier(), multipliers, coupler_weights, coupler_bias,
       live_state);
   return objective_weight *
-             (objective_edge_cost(from, to) + learned_objective) +
+             (objective_edge_cost(from, to) / objective_energy_scale_ +
+              learned_objective) +
          field_score(from, to, edge, edge_field, edge_additive, multipliers,
                      coupler_weights, coupler_bias, live_state) +
          risk_penalty * risk;
@@ -1683,6 +1734,7 @@ void RoutingDecoder::build_candidate_graph(const std::vector<int32_t> &incumbent
         (*edge_risk)[edge] = old_risk[old_edge];
     }
   }
+  refresh_objective_energy_scale();
   incumbent_route_ = incumbent;
   build_model_features();
   ++graph_version_;
@@ -3041,7 +3093,7 @@ Solution RoutingDecoder::scope_restricted_refine(
     double result = coupled_multiplier(
                         objective_multiplier(), multipliers, coupler_weights,
                         coupler_bias, live_state) *
-                    value.objective;
+                    value.objective / objective_energy_scale_;
     result += risk_penalty * value.feasibility_risk;
     for (int32_t channel = 0; channel < resource_count(); ++channel) {
       if (resource(channel).active) {

@@ -249,10 +249,9 @@ def test_typed_field_accepts_unseen_runtime_resource_without_new_weights() -> No
     graph = build_decoder_data(battery)
     with torch.no_grad():
         output = model(graph)
-    scales = graph.resource_scales.unsqueeze(0)
     traced = battery.sample_traced(
         edge_field=output["residual"].numpy(),
-        edge_additive=(output["additive"] * scales).numpy(),
+        edge_additive=output["additive"].numpy(),
         multipliers=output["multipliers"][0].numpy(),
         coupler_weights=output["coupler_weights"][0].numpy(),
         coupler_bias=output["coupler_bias"][0].numpy(),
@@ -465,10 +464,9 @@ def test_cpp_trace_replays_exact_state_dependent_policy() -> None:
     with torch.no_grad():
         output = model(graph)
     assert output["objective_residual"].std() > 0.0
-    scales = graph.resource_scales.unsqueeze(0)
     traced = decoder.sample_traced(
         edge_field=output["residual"].detach().numpy(),
-        edge_additive=(output["additive"] * scales).detach().numpy(),
+        edge_additive=output["additive"].detach().numpy(),
         multipliers=output["multipliers"][0].detach().numpy(),
         coupler_weights=output["coupler_weights"][0].detach().numpy(),
         coupler_bias=output["coupler_bias"][0].detach().numpy(),
@@ -539,10 +537,9 @@ def test_tsp_edge_logit_receives_objective_policy_gradient() -> None:
     graph = build_decoder_data(decoder)
     model = ConstraintFieldNet(depth=1, units=8)
     output = model(graph)
-    scales = graph.resource_scales.unsqueeze(0)
     traced = decoder.sample_traced(
         edge_field=output["residual"].detach().numpy(),
-        edge_additive=(output["additive"] * scales).detach().numpy(),
+        edge_additive=output["additive"].detach().numpy(),
         multipliers=output["multipliers"][0].detach().numpy(),
         coupler_weights=output["coupler_weights"][0].detach().numpy(),
         coupler_bias=output["coupler_bias"][0].detach().numpy(),

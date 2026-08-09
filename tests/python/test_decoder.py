@@ -497,6 +497,38 @@ def test_resource_features_use_exported_cpp_scales() -> None:
     assert np.isclose(resources["violation"][0], 0.2)
 
 
+def test_resource_semantics_are_invariant_to_physical_unit_rescaling() -> None:
+    coordinates, distance = euclidean_problem(20, 124)
+    rng = np.random.default_rng(125)
+    demand = np.r_[0.0, rng.uniform(0.01, 0.04, 19)].astype(np.float32)
+
+    def make_solver(factor: float) -> prism_decoder.Decoder:
+        return make_decoder(
+            {
+                "name": "cvrp",
+                "coordinates": coordinates,
+                "distance": distance,
+                "demand": demand * factor,
+                "capacity": 0.4 * factor,
+            },
+            n_rollouts=1,
+        )
+
+    reference = make_solver(1.0)
+    scaled = make_solver(100.0)
+    capacity = list(prism_decoder.FIELD_CHANNEL_NAMES).index("capacity")
+
+    assert scaled.resource_scales[capacity] == pytest.approx(
+        100.0 * reference.resource_scales[capacity]
+    )
+    assert np.allclose(reference.resource_features, scaled.resource_features)
+    assert np.allclose(
+        reference.resource_descriptors,
+        scaled.resource_descriptors,
+        atol=1e-7,
+    )
+
+
 def test_resource_evaluator_returns_aligned_labels() -> None:
     coordinates, distance = euclidean_problem(25, 122)
     demand = np.r_[0.0, np.full(24, 0.04, dtype=np.float32)]
@@ -756,6 +788,70 @@ def test_signed_objective_residual_guides_multi_constraint_objective() -> None:
             edge_field=field,
             multipliers=multipliers,
             objective_residual=np.zeros((objective_residual.size, 1), np.float32),
+        )
+
+
+def test_native_policy_is_invariant_to_positive_objective_rescaling() -> None:
+    coordinates, distance = euclidean_problem(24, 110)
+
+    def make_solver(factor: float) -> prism_decoder.Decoder:
+        solver = make_decoder(
+            {
+                "name": "tsp",
+                "coordinates": coordinates,
+                "distance": distance * factor,
+            },
+            search_config={"classical_behavior": False},
+            n_rollouts=5,
+            beta=2.5,
+        )
+        solver.seed(10110)
+        return solver
+
+    reference_solver = make_solver(1.0)
+    scaled_solver = make_solver(100.0)
+    reference_scale = reference_solver.objective_energy_scale
+    scaled_scale = scaled_solver.objective_energy_scale
+
+    assert reference_scale > 0.0
+    assert scaled_scale == pytest.approx(100.0 * reference_scale, rel=2e-6)
+    assert np.array_equal(reference_solver.edge_index, scaled_solver.edge_index)
+    assert np.allclose(
+        reference_solver.objective_edge_costs / reference_scale,
+        scaled_solver.objective_edge_costs / scaled_scale,
+        atol=2e-6,
+    )
+
+    edge_count = reference_solver.metadata["edge_count"]
+    objective_residual = np.linspace(-0.3, 0.3, edge_count, dtype=np.float32)
+    edge_risk = np.linspace(0.0, 0.2, edge_count, dtype=np.float32)
+    reference = reference_solver.sample_traced(
+        edge_field=np.zeros_like(reference_solver.resource_pressure),
+        objective_residual=objective_residual,
+        edge_risk=edge_risk,
+        risk_penalty=0.7,
+    )
+    scaled = scaled_solver.sample_traced(
+        edge_field=np.zeros_like(scaled_solver.resource_pressure),
+        objective_residual=objective_residual,
+        edge_risk=edge_risk,
+        risk_penalty=0.7,
+    )
+    assert np.array_equal(
+        reference["trace"]["chosen_indices"],
+        scaled["trace"]["chosen_indices"],
+    )
+    assert np.allclose(
+        reference["trace"]["log_probabilities"],
+        scaled["trace"]["log_probabilities"],
+        atol=2e-6,
+    )
+    for reference_solution, scaled_solution in zip(
+        reference["solutions"], scaled["solutions"]
+    ):
+        assert np.array_equal(reference_solution["route"], scaled_solution["route"])
+        assert scaled_solution["objective"] == pytest.approx(
+            100.0 * reference_solution["objective"], rel=2e-6
         )
 
 

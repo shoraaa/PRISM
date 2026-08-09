@@ -948,6 +948,7 @@ public:
     result["constraint_kernels"] = std::move(kernel_rows);
     result["objective"] = prism::objective_name(problem.objective);
     result["objective_scale"] = solver_.objective_scale();
+    result["objective_energy_scale"] = solver_.objective_energy_scale();
     result["direction"] = prism::objective_direction(problem.objective);
     result["multi_route"] = problem.multi_route;
     result["open_route"] = problem.open_route;
@@ -1088,6 +1089,10 @@ public:
                               {solver_.edge_count()});
   }
 
+  float objective_energy_scale() const {
+    return solver_.objective_energy_scale();
+  }
+
   py::array_t<int32_t> edge_offsets() const {
     return vector_copy<int32_t>(
         solver_.edge_offsets(),
@@ -1224,6 +1229,8 @@ PYBIND11_MODULE(prism_decoder, module) {
                              &PyDecoder::resource_descriptors)
       .def_property_readonly("objective_edge_costs",
                              &PyDecoder::objective_edge_costs)
+      .def_property_readonly("objective_energy_scale",
+                             &PyDecoder::objective_energy_scale)
       .def_property_readonly("edge_offsets", &PyDecoder::edge_offsets)
       .def_property_readonly("edge_index", &PyDecoder::edge_index)
       .def_property_readonly("graph_version", &PyDecoder::graph_version)
