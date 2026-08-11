@@ -647,6 +647,7 @@ RoutingDecoder::RoutingDecoder(Problem problem, CandidateConfig candidate_config
   }
   build_resource_registry();
   build_resource_descriptors();
+  build_resource_programs();
   build_candidate_graph({});
 }
 
@@ -802,6 +803,205 @@ void RoutingDecoder::build_resource_descriptors() {
     descriptor[31] = problem_.node_count > 0
                          ? static_cast<float>(events / problem_.node_count)
                          : 0.0f;
+  }
+}
+
+void RoutingDecoder::build_resource_programs() {
+  constexpr int32_t token_count = RESOURCE_PROGRAM_MAX_TOKENS;
+  constexpr int32_t category_count = RESOURCE_PROGRAM_CATEGORY_COUNT;
+  constexpr int32_t value_count = RESOURCE_PROGRAM_VALUE_COUNT;
+  constexpr int32_t edge_role_count = RESOURCE_PROGRAM_EDGE_ROLE_COUNT;
+  const size_t resources = static_cast<size_t>(resource_count());
+  resource_program_categories_.assign(
+      resources * token_count * category_count, 0);
+  resource_program_values_.assign(resources * token_count * value_count, 0.0f);
+  resource_program_mask_.assign(resources * token_count, 0);
+  resource_program_edges_.assign(
+      resources * edge_role_count * token_count * token_count, 0);
+  resource_program_roots_.assign(resources * token_count, 0);
+
+  const auto squash = [](double value) {
+    value = std::max(value, 0.0);
+    return static_cast<float>(value / (1.0 + value));
+  };
+  const auto signed_squash = [&](double value) {
+    if (!std::isfinite(value))
+      return 0.5f;
+    const double magnitude = std::abs(value);
+    const double signed_value = value == 0.0 ? 0.0 : std::copysign(
+        magnitude / (1.0 + magnitude), value);
+    return static_cast<float>(0.5 * (1.0 + signed_value));
+  };
+  const auto category_offset = [&](int32_t resource, int32_t token,
+                                   int32_t category) {
+    return (static_cast<size_t>(resource) * token_count + token) *
+               category_count +
+           category;
+  };
+  const auto value_offset = [&](int32_t resource, int32_t token,
+                                int32_t value) {
+    return (static_cast<size_t>(resource) * token_count + token) * value_count +
+           value;
+  };
+  const auto edge_offset = [&](int32_t resource, int32_t role, int32_t target,
+                               int32_t source) {
+    return ((static_cast<size_t>(resource) * edge_role_count + role) *
+                token_count +
+            target) *
+               token_count +
+           source;
+  };
+  const auto set_token = [&](int32_t resource, int32_t token,
+                             ResourceProgramRole role,
+                             ResourceProgramOpcode opcode,
+                             ResourceProgramInput input,
+                             const ResourceSpec &spec) {
+    resource_program_mask_[static_cast<size_t>(resource) * token_count + token] =
+        1;
+    resource_program_categories_[category_offset(resource, token, 0)] =
+        static_cast<int32_t>(role);
+    resource_program_categories_[category_offset(resource, token, 1)] =
+        static_cast<int32_t>(opcode);
+    resource_program_categories_[category_offset(resource, token, 2)] =
+        static_cast<int32_t>(input);
+    resource_program_categories_[category_offset(resource, token, 3)] =
+        static_cast<int32_t>(spec.scope);
+    resource_program_categories_[category_offset(resource, token, 4)] =
+        static_cast<int32_t>(spec.bound_check);
+    resource_program_categories_[category_offset(resource, token, 5)] =
+        static_cast<int32_t>(spec.direction);
+  };
+  const auto set_edge = [&](int32_t resource, ResourceProgramEdgeRole role,
+                            int32_t source, int32_t target) {
+    resource_program_edges_[edge_offset(
+        resource, static_cast<int32_t>(role), target, source)] = 1;
+  };
+
+  for (int32_t index = 0; index < resource_count(); ++index) {
+    const ResourceSpec &spec = resource(index);
+    ResourceSpec program_spec = spec;
+    // Compiled kernels predate the declarative ResourceSpec fields and keep
+    // their hot state elsewhere. Recover their semantic scope/check metadata
+    // for the program graph without changing exact execution.
+    if (spec.op == ResourceOperator::TOUR_LIMIT)
+      program_spec.scope = ResourceScope::TOUR;
+    if (spec.op == ResourceOperator::PRIZE_QUOTA) {
+      program_spec.scope = ResourceScope::SOLUTION;
+      program_spec.bound_check = BoundCheck::SOLUTION_END;
+    }
+    const bool has_lower = std::isfinite(spec.lower) ||
+                           spec.op == ResourceOperator::PRIZE_QUOTA;
+    const bool has_upper = std::isfinite(spec.upper) ||
+                           spec.op == ResourceOperator::CAPACITY ||
+                           spec.op == ResourceOperator::TIME_WINDOW ||
+                           spec.op == ResourceOperator::ROUTE_LIMIT ||
+                           spec.op == ResourceOperator::TOUR_LIMIT;
+    const bool predicate_guard =
+        spec.op == ResourceOperator::BACKHAUL_ORDER ||
+        spec.op == ResourceOperator::PICKUP_DELIVERY;
+
+    ResourceProgramOpcode update_opcode = ResourceProgramOpcode::ADD;
+    ResourceProgramInput update_input = ResourceProgramInput::NONE;
+    switch (spec.op) {
+    case ResourceOperator::CAPACITY:
+    case ResourceOperator::PRIZE_QUOTA:
+      update_input = ResourceProgramInput::NODE;
+      break;
+    case ResourceOperator::ROUTE_LIMIT:
+    case ResourceOperator::TOUR_LIMIT:
+      update_input = ResourceProgramInput::EDGE;
+      break;
+    case ResourceOperator::TIME_WINDOW:
+      update_opcode = ResourceProgramOpcode::MAX_PLUS;
+      update_input = ResourceProgramInput::EDGE_NODE;
+      break;
+    case ResourceOperator::BACKHAUL_ORDER:
+      update_opcode = ResourceProgramOpcode::AUTOMATON;
+      update_input = ResourceProgramInput::NODE;
+      break;
+    case ResourceOperator::PICKUP_DELIVERY:
+      update_opcode = ResourceProgramOpcode::RELATION;
+      update_input = ResourceProgramInput::PAIR;
+      break;
+    case ResourceOperator::AFFINE_ACCUMULATOR: {
+      const bool edge_input =
+          spec.edge_uses_distance || !spec.edge_values.empty();
+      const bool node_input = !spec.node_values.empty();
+      update_input = edge_input && node_input
+                         ? ResourceProgramInput::EDGE_NODE
+                         : edge_input ? ResourceProgramInput::EDGE
+                                      : node_input ? ResourceProgramInput::NODE
+                                                   : ResourceProgramInput::NONE;
+      break;
+    }
+    }
+
+    set_token(index, 0, ResourceProgramRole::STATE,
+              ResourceProgramOpcode::STATE, ResourceProgramInput::NONE,
+              program_spec);
+    resource_program_values_[value_offset(index, 0, 0)] =
+        squash(spec.state_dim);
+    resource_program_values_[value_offset(index, 0, 1)] =
+        signed_squash(spec.initial / std::max(spec.scale, EPS));
+
+    set_token(index, 1, ResourceProgramRole::UPDATE, update_opcode,
+              update_input, program_spec);
+    const bool nonnegative = spec.edge_coefficient >= 0.0f &&
+                             spec.node_coefficient >= 0.0f;
+    const bool nonpositive = spec.edge_coefficient <= 0.0f &&
+                             spec.node_coefficient <= 0.0f;
+    resource_program_values_[value_offset(index, 1, 0)] =
+        nonnegative && !nonpositive ? 1.0f
+                                    : nonpositive && !nonnegative ? 0.0f : 0.5f;
+    resource_program_values_[value_offset(index, 1, 1)] =
+        resource_descriptors_[static_cast<size_t>(index) *
+                                  RESOURCE_DESCRIPTOR_DIM +
+                              30];
+    set_edge(index, ResourceProgramEdgeRole::DATA, 0, 1);
+
+    bool has_guard = has_lower || has_upper || predicate_guard;
+    if (has_guard) {
+      const ResourceProgramOpcode guard_opcode =
+          predicate_guard
+              ? ResourceProgramOpcode::PREDICATE
+              : has_lower && has_upper
+                    ? ResourceProgramOpcode::RANGE_BOUND
+                    : has_lower ? ResourceProgramOpcode::LOWER_BOUND
+                                : ResourceProgramOpcode::UPPER_BOUND;
+      set_token(index, 2, ResourceProgramRole::GUARD, guard_opcode,
+                predicate_guard ? update_input : ResourceProgramInput::NONE,
+                program_spec);
+      resource_program_values_[value_offset(index, 2, 0)] =
+          signed_squash(spec.lower / std::max(spec.scale, EPS));
+      resource_program_values_[value_offset(index, 2, 1)] =
+          signed_squash(spec.upper / std::max(spec.scale, EPS));
+      set_edge(index, ResourceProgramEdgeRole::DATA, 1, 2);
+      resource_program_roots_[static_cast<size_t>(index) * token_count + 2] = 1;
+    } else {
+      resource_program_roots_[static_cast<size_t>(index) * token_count + 1] = 1;
+    }
+
+    const bool event_reset = !spec.reset_nodes.empty();
+    const bool has_reset = spec.reset_at_depot || event_reset;
+    if (has_reset) {
+      set_token(index, 3, ResourceProgramRole::EVENT,
+                ResourceProgramOpcode::EVENT, ResourceProgramInput::EVENT,
+                program_spec);
+      resource_program_values_[value_offset(index, 3, 0)] =
+          spec.reset_at_depot ? 1.0f : 0.0f;
+      resource_program_values_[value_offset(index, 3, 1)] =
+          resource_descriptors_[static_cast<size_t>(index) *
+                                    RESOURCE_DESCRIPTOR_DIM +
+                                31];
+      set_token(index, 4, ResourceProgramRole::RESET,
+                ResourceProgramOpcode::ASSIGN, ResourceProgramInput::EVENT,
+                program_spec);
+      resource_program_values_[value_offset(index, 4, 0)] =
+          signed_squash(spec.reset_value / std::max(spec.scale, EPS));
+      set_edge(index, ResourceProgramEdgeRole::DATA, 1, 4);
+      set_edge(index, ResourceProgramEdgeRole::CONTROL, 3, 4);
+      resource_program_roots_[static_cast<size_t>(index) * token_count + 4] = 1;
+    }
   }
 }
 

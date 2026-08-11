@@ -506,6 +506,15 @@ def test_resource_semantics_are_invariant_to_physical_unit_rescaling() -> None:
         scaled.resource_descriptors,
         atol=1e-7,
     )
+    assert np.array_equal(
+        reference.resource_program_categories,
+        scaled.resource_program_categories,
+    )
+    assert np.allclose(
+        reference.resource_program_values,
+        scaled.resource_program_values,
+        atol=1e-7,
+    )
 
 
 def test_resource_evaluator_returns_aligned_labels() -> None:
@@ -1098,6 +1107,25 @@ def test_runtime_battery_resource_enforces_reset_and_exports_dynamic_rows() -> N
         solver.metadata["resource_count"],
         prism_decoder.RESOURCE_DESCRIPTOR_DIM,
     )
+    assert solver.metadata["resource_program_version"] == "resource_program_graph_v1"
+    assert solver.resource_program_categories.shape == (
+        solver.metadata["resource_count"],
+        prism_decoder.RESOURCE_PROGRAM_MAX_TOKENS,
+        prism_decoder.RESOURCE_PROGRAM_CATEGORY_COUNT,
+    )
+    assert solver.resource_program_values.shape == (
+        solver.metadata["resource_count"],
+        prism_decoder.RESOURCE_PROGRAM_MAX_TOKENS,
+        prism_decoder.RESOURCE_PROGRAM_VALUE_COUNT,
+    )
+    assert solver.resource_program_edges.shape == (
+        solver.metadata["resource_count"],
+        prism_decoder.RESOURCE_PROGRAM_EDGE_ROLE_COUNT,
+        prism_decoder.RESOURCE_PROGRAM_MAX_TOKENS,
+        prism_decoder.RESOURCE_PROGRAM_MAX_TOKENS,
+    )
+    assert solver.resource_program_mask[-1].sum() == 5
+    assert solver.resource_program_roots[-1].sum() == 2
     assert [row["operator"] for row in solver.metadata["resources"][:7]] == [
         "capacity",
         "time_window",

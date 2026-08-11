@@ -11,6 +11,13 @@ import prism_decoder
 FIELD_CHANNEL_COUNT = prism_decoder.FIELD_CHANNEL_COUNT
 LIVE_STATE_FEATURE_COUNT = prism_decoder.LIVE_STATE_FEATURE_COUNT
 RESOURCE_DESCRIPTOR_DIM = prism_decoder.RESOURCE_DESCRIPTOR_DIM
+RESOURCE_PROGRAM_MAX_TOKENS = prism_decoder.RESOURCE_PROGRAM_MAX_TOKENS
+RESOURCE_PROGRAM_CATEGORY_COUNT = prism_decoder.RESOURCE_PROGRAM_CATEGORY_COUNT
+RESOURCE_PROGRAM_VALUE_COUNT = prism_decoder.RESOURCE_PROGRAM_VALUE_COUNT
+RESOURCE_PROGRAM_EDGE_ROLE_COUNT = prism_decoder.RESOURCE_PROGRAM_EDGE_ROLE_COUNT
+RESOURCE_PROGRAM_ROLE_COUNT = prism_decoder.RESOURCE_PROGRAM_ROLE_COUNT
+RESOURCE_PROGRAM_OPCODE_COUNT = prism_decoder.RESOURCE_PROGRAM_OPCODE_COUNT
+RESOURCE_PROGRAM_INPUT_COUNT = prism_decoder.RESOURCE_PROGRAM_INPUT_COUNT
 NODE_FEATURE_COUNT = prism_decoder.NODE_FEATURE_COUNT
 EDGE_FEATURE_COUNT = prism_decoder.EDGE_FEATURE_COUNT
 # The native feature contract places instance-static node attributes first and
@@ -42,7 +49,7 @@ OBJECTIVE_COEFF_DIM = 8
 # coefficient-conditioning layer is not gradient-starved (a zero-init output
 # layer sends zero gradient to the layer below it).
 OBJECTIVE_RESIDUAL_HEAD_INIT_STD = 0.1
-MODEL_SCHEMA = "typed_resource_v6_objective_coeff_algebra"
+MODEL_SCHEMA = "typed_resource_v7_learned_program_graph"
 
 
 def _squash_magnitude(value: float) -> float:
@@ -199,6 +206,37 @@ def build_decoder_data(decoder, device="cpu"):
     resource_descriptors = torch.as_tensor(
         decoder.resource_descriptors, dtype=torch.float32, device=device
     ).view(1, resource_count, RESOURCE_DESCRIPTOR_DIM)
+    resource_program_categories = torch.as_tensor(
+        decoder.resource_program_categories, dtype=torch.long, device=device
+    ).view(
+        1,
+        resource_count,
+        RESOURCE_PROGRAM_MAX_TOKENS,
+        RESOURCE_PROGRAM_CATEGORY_COUNT,
+    )
+    resource_program_values = torch.as_tensor(
+        decoder.resource_program_values, dtype=torch.float32, device=device
+    ).view(
+        1,
+        resource_count,
+        RESOURCE_PROGRAM_MAX_TOKENS,
+        RESOURCE_PROGRAM_VALUE_COUNT,
+    )
+    resource_program_mask = torch.as_tensor(
+        decoder.resource_program_mask, dtype=torch.bool, device=device
+    ).view(1, resource_count, RESOURCE_PROGRAM_MAX_TOKENS)
+    resource_program_edges = torch.as_tensor(
+        decoder.resource_program_edges, dtype=torch.float32, device=device
+    ).view(
+        1,
+        resource_count,
+        RESOURCE_PROGRAM_EDGE_ROLE_COUNT,
+        RESOURCE_PROGRAM_MAX_TOKENS,
+        RESOURCE_PROGRAM_MAX_TOKENS,
+    )
+    resource_program_roots = torch.as_tensor(
+        decoder.resource_program_roots, dtype=torch.bool, device=device
+    ).view(1, resource_count, RESOURCE_PROGRAM_MAX_TOKENS)
     objective_edge_costs = torch.as_tensor(
         decoder.objective_edge_costs, dtype=torch.float32, device=device
     )
@@ -245,6 +283,16 @@ def build_decoder_data(decoder, device="cpu"):
     _require_unit_interval("resource_features", resource_features)
     _require_unit_interval("resource_events", resource_events)
     _require_unit_interval("resource_descriptors", resource_descriptors)
+    _require_unit_interval("resource_program_values", resource_program_values)
+    _require_unit_interval("resource_program_edges", resource_program_edges)
+    if resource_program_mask.shape != (
+        1,
+        resource_count,
+        RESOURCE_PROGRAM_MAX_TOKENS,
+    ):
+        raise ValueError("resource_program_mask has an invalid shape")
+    if torch.any(resource_program_roots & ~resource_program_mask):
+        raise ValueError("resource program roots must select active clauses")
     return Data(
         x=x,
         edge_index=edge_index,
@@ -260,6 +308,11 @@ def build_decoder_data(decoder, device="cpu"):
         resource_features=resource_features,
         resource_events=resource_events,
         resource_descriptors=resource_descriptors,
+        resource_program_categories=resource_program_categories,
+        resource_program_values=resource_program_values,
+        resource_program_mask=resource_program_mask,
+        resource_program_edges=resource_program_edges,
+        resource_program_roots=resource_program_roots,
         objective_edge_costs=objective_edge_costs,
         resource_scales=resource_scales,
         edge_offsets=edge_offsets,
@@ -380,6 +433,137 @@ class EmbNet(nn.Module):
             return w, x
         return w
 
+
+class ResourceProgramEncoder(nn.Module):
+    """Encode a canonical resource-program dataflow graph into one token.
+
+    Categories describe executable syntax (clause role, opcode, input kind,
+    scope, check phase, and direction), never a resource or variant name. Two
+    typed message-passing steps preserve producer/consumer wiring before
+    permutation-invariant sum/max/root pooling. The output width matches the
+    existing resource-token interface; exact program execution remains native.
+    """
+
+    def __init__(self, output_units=32, hidden_units=64, message_depth=2):
+        super().__init__()
+        self.output_units = output_units
+        self.hidden_units = hidden_units
+        self.message_depth = message_depth
+        self.role_embedding = nn.Embedding(
+            RESOURCE_PROGRAM_ROLE_COUNT, hidden_units
+        )
+        self.opcode_embedding = nn.Embedding(
+            RESOURCE_PROGRAM_OPCODE_COUNT, hidden_units
+        )
+        self.input_embedding = nn.Embedding(
+            RESOURCE_PROGRAM_INPUT_COUNT, hidden_units
+        )
+        self.scope_embedding = nn.Embedding(3, hidden_units)
+        self.check_embedding = nn.Embedding(3, hidden_units)
+        self.direction_embedding = nn.Embedding(3, hidden_units)
+        self.value_projection = nn.Linear(
+            RESOURCE_PROGRAM_VALUE_COUNT, hidden_units
+        )
+        self.edge_projections = nn.ModuleList(
+            nn.Linear(hidden_units, hidden_units, bias=False)
+            for _ in range(RESOURCE_PROGRAM_EDGE_ROLE_COUNT)
+        )
+        self.message_updates = nn.ModuleList(
+            nn.Sequential(
+                nn.Linear(2 * hidden_units, hidden_units),
+                nn.SiLU(),
+                nn.Linear(hidden_units, hidden_units),
+            )
+            for _ in range(message_depth)
+        )
+        self.message_norms = nn.ModuleList(
+            nn.LayerNorm(hidden_units) for _ in range(message_depth)
+        )
+        self.output = nn.Sequential(
+            nn.Linear(3 * hidden_units + 1, hidden_units),
+            nn.SiLU(),
+            nn.Linear(hidden_units, output_units),
+        )
+
+    @staticmethod
+    def _require_category(name, values, upper):
+        if values.dtype != torch.long:
+            raise ValueError(f"{name} must use torch.long categorical indices")
+        if values.numel() and (values.min() < 0 or values.max() >= upper):
+            raise ValueError(f"{name} contains an out-of-vocabulary category")
+
+    def forward(self, categories, values, mask, edges, roots):
+        if categories.ndim != 4 or categories.shape[-2:] != (
+            RESOURCE_PROGRAM_MAX_TOKENS,
+            RESOURCE_PROGRAM_CATEGORY_COUNT,
+        ):
+            raise ValueError(
+                "resource_program_categories must have shape "
+                "[batch, resources, tokens, categories]"
+            )
+        expected_prefix = categories.shape[:3]
+        if values.shape != expected_prefix + (RESOURCE_PROGRAM_VALUE_COUNT,):
+            raise ValueError("resource_program_values has an invalid shape")
+        if mask.shape != expected_prefix or roots.shape != expected_prefix:
+            raise ValueError("resource program masks have an invalid shape")
+        expected_edges = categories.shape[:2] + (
+            RESOURCE_PROGRAM_EDGE_ROLE_COUNT,
+            RESOURCE_PROGRAM_MAX_TOKENS,
+            RESOURCE_PROGRAM_MAX_TOKENS,
+        )
+        if edges.shape != expected_edges:
+            raise ValueError("resource_program_edges has an invalid shape")
+        _require_unit_interval("resource_program_values", values)
+        _require_unit_interval("resource_program_edges", edges)
+        if torch.any(roots.bool() & ~mask.bool()):
+            raise ValueError("resource program roots must select active clauses")
+
+        category_sizes = (
+            RESOURCE_PROGRAM_ROLE_COUNT,
+            RESOURCE_PROGRAM_OPCODE_COUNT,
+            RESOURCE_PROGRAM_INPUT_COUNT,
+            3,
+            3,
+            3,
+        )
+        for index, upper in enumerate(category_sizes):
+            self._require_category(
+                f"resource_program_categories[{index}]",
+                categories[..., index],
+                upper,
+            )
+
+        h = (
+            self.role_embedding(categories[..., 0])
+            + self.opcode_embedding(categories[..., 1])
+            + self.input_embedding(categories[..., 2])
+            + self.scope_embedding(categories[..., 3])
+            + self.check_embedding(categories[..., 4])
+            + self.direction_embedding(categories[..., 5])
+            + self.value_projection(values)
+        )
+        clause_mask = mask.bool().unsqueeze(-1)
+        h = h * clause_mask
+        for update, norm in zip(self.message_updates, self.message_norms):
+            incoming = torch.zeros_like(h)
+            for role, projection in enumerate(self.edge_projections):
+                projected = projection(h)
+                incoming = incoming + torch.einsum(
+                    "brts,brsu->brtu", edges[:, :, role], projected
+                )
+            degree = edges.sum(dim=2).sum(dim=-1, keepdim=True).clamp_min(1.0)
+            incoming = incoming / degree
+            h = norm(h + update(torch.cat((h, incoming), dim=-1)))
+            h = h * clause_mask
+
+        count = mask.sum(dim=-1, keepdim=True).to(values.dtype).log1p()
+        summed = h.sum(dim=-2)
+        maximum = h.masked_fill(~clause_mask, -torch.inf).amax(dim=-2)
+        maximum = torch.where(torch.isfinite(maximum), maximum, 0.0)
+        root_mask = roots.bool().unsqueeze(-1)
+        root_sum = (h * root_mask).sum(dim=-2)
+        return self.output(torch.cat((summed, maximum, root_sum, count), dim=-1))
+
 class ConstraintFieldNet(nn.Module):
     """Shared resource-token field over the Decoder candidate graph."""
 
@@ -391,6 +575,7 @@ class ConstraintFieldNet(nn.Module):
         agg_fn="mean",
         grad_checkpointing=False,
         gate_multipliers_by_binding=True,
+        program_units=64,
     ):
         super().__init__()
         # Gate resource multipliers by the binding classifier so inactive/slack
@@ -406,14 +591,15 @@ class ConstraintFieldNet(nn.Module):
             agg_fn=agg_fn,
             grad_checkpointing=grad_checkpointing,
         )
-        # Algebra-derived type descriptor + active flag + mean/max pressure +
-        # graph context. No resource name or registry position reaches the
-        # token encoder, so the same weights apply to appended schema rows.
-        descriptor_size = (
-            RESOURCE_DESCRIPTOR_DIM + 4 + OBJECTIVE_COEFF_DIM + 1 + 2
+        # Learn resource semantics from the canonical executable program graph.
+        # The separate context adapter preserves the existing resource-token
+        # width and all downstream attention/field/coupler heads.
+        self.program_encoder = ResourceProgramEncoder(
+            output_units=units, hidden_units=program_units
         )
-        self.resource_encoder = nn.Sequential(
-            nn.Linear(descriptor_size, units),
+        context_size = 4 + OBJECTIVE_COEFF_DIM + 1 + 2
+        self.resource_context_encoder = nn.Sequential(
+            nn.Linear(context_size, units),
             nn.SiLU(),
             nn.Linear(units, units),
         )
@@ -686,26 +872,22 @@ class ConstraintFieldNet(nn.Module):
         else:
             resource_mean = normalized_resources.mean(dim=0, keepdim=True)
             resource_max = normalized_resources.amax(dim=0, keepdim=True)
-        resource_type = pyg.resource_descriptors
-        if resource_type.ndim == 2:
-            resource_type = resource_type.unsqueeze(0)
-        if resource_type.shape != (
-            batch_size,
-            resource_count,
-            RESOURCE_DESCRIPTOR_DIM,
-        ):
+        program_categories = pyg.resource_program_categories
+        program_values = pyg.resource_program_values
+        program_mask = pyg.resource_program_mask
+        program_edges = pyg.resource_program_edges
+        program_roots = pyg.resource_program_roots
+        if program_categories.shape[:2] != (batch_size, resource_count):
             raise ValueError(
-                "resource_descriptors must have shape "
-                "[num_graphs, resource_count, RESOURCE_DESCRIPTOR_DIM]"
+                "resource program tensors must begin with "
+                "[num_graphs, resource_count]"
             )
-        _require_unit_interval("resource_descriptors", resource_type)
 
         def _broadcast(column):
             return column.unsqueeze(1).expand(-1, resource_count, -1)
 
-        descriptor = torch.cat(
+        context = torch.cat(
             (
-                resource_type,
                 active.unsqueeze(-1),
                 resource_mean.unsqueeze(-1),
                 resource_max.unsqueeze(-1),
@@ -717,8 +899,14 @@ class ConstraintFieldNet(nn.Module):
             ),
             dim=-1,
         )
-        _require_unit_interval("resource_descriptors", descriptor)
-        tokens = self.resource_encoder(descriptor)
+        _require_unit_interval("resource_context", context)
+        tokens = self.program_encoder(
+            program_categories,
+            program_values,
+            program_mask,
+            program_edges,
+            program_roots,
+        ) + self.resource_context_encoder(context)
         padding_mask = ~active.bool()
         no_resources = ~active.bool().any(dim=1)
         if no_resources.any():

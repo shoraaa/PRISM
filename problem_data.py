@@ -559,6 +559,22 @@ def resource_count(name: str) -> int:
     return sum(value in resource_constraints for value in schema["constraints"])
 
 
+# Program-composition protocol: learned interaction sees at most pairs of
+# resource rows, while evaluation contains strictly higher-order stacks. Keep
+# this boundary explicit so future additions to TRAIN_VARIANTS cannot silently
+# leak a 3+-resource program into training.
+PROGRAM_TRAIN_MAX_RESOURCE_ORDER = 2
+assert all(
+    resource_count(name) <= PROGRAM_TRAIN_MAX_RESOURCE_ORDER
+    for name in TRAIN_VARIANTS
+)
+HIGHER_ORDER_BENCHMARK_VARIANTS = tuple(
+    name
+    for name in BENCHMARK_VARIANTS
+    if resource_count(name) > PROGRAM_TRAIN_MAX_RESOURCE_ORDER
+)
+
+
 @dataclass
 class VariantCurriculum:
     variants: list[str]

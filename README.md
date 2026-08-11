@@ -115,12 +115,22 @@ problem["resources"] = [{
 
 The binding resolves named arrays once, and native `extend + bound` replay then
 drives construction masks, incumbent validation, resource labels, pressure
-features, and live state. Each row also produces a 32-dimensional descriptor
-from algebraic properties (operator family, bound type, check phase, direction,
-scope, reset form, input coupling, scale, and tightness); names and registry
-positions are excluded. Resource tensors grow with the registry, while field
-channels retain their model indices so the distance-only control path retains
-exact behavior.
+features, and live state. Each row also compiles to a canonical, name-free
+program graph (`state -> update -> guard`, with optional event/reset clauses).
+A shared two-layer dataflow encoder learns a resource token from clause roles,
+opcodes, operand types, scope, check phase, direction, normalized values, and
+producer/consumer edges; there is no capacity-, battery-, or variant-specific
+neural column. Its internal width is independent of the 32-dimensional resource
+token expected by the existing attention and policy heads. The legacy
+32-dimensional descriptor remains exported for artifact diagnosis but is no
+longer consumed by the field network. Resource tensors grow with the registry,
+while field channels retain their model indices so the distance-only control
+path retains exact behavior.
+
+The default training registry contains only order-0/1/2 resource programs.
+Higher-order benchmark stacks (orders 3 and 4) are excluded from policy training
+and form an explicit compositional-transfer split. `--max-train-resource-order`
+enforces this boundary (default `2`) even when a broader variant list is supplied.
 
 Native execution requires an explicit normalized schema. `constraints`,
 `objective`, `depot_count`, `multi_route`, and `open_route` must be declared;

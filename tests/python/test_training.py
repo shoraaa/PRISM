@@ -10,7 +10,15 @@ import torch
 
 import prism_decoder
 from net import ConstraintFieldNet, build_decoder_data
-from problem_data import TRAIN_VARIANTS, VariantCurriculum, problem_schema
+from problem_data import (
+    BENCHMARK_VARIANTS,
+    HIGHER_ORDER_BENCHMARK_VARIANTS,
+    PROGRAM_TRAIN_MAX_RESOURCE_ORDER,
+    TRAIN_VARIANTS,
+    VariantCurriculum,
+    problem_schema,
+    resource_count,
+)
 from train import (
     OptionOutcome,
     OptionStep,
@@ -30,6 +38,7 @@ from train import (
     _positive_class_weight,
     _rollout_class_weights,
     _training_accumulation_size,
+    _training_variants_by_order,
     _training_variant_schedule,
     _validation_cost_groups,
     _validation_rank,
@@ -83,6 +92,26 @@ def _args() -> Namespace:
         feasibility_lookahead_depth=2,
         feasibility_risk_penalty=10.0,
     )
+
+
+def test_program_training_is_order_two_and_has_higher_order_holdouts() -> None:
+    assert PROGRAM_TRAIN_MAX_RESOURCE_ORDER == 2
+    assert max(resource_count(name) for name in TRAIN_VARIANTS) == 2
+    assert all(
+        resource_count(name) <= PROGRAM_TRAIN_MAX_RESOURCE_ORDER
+        for name in TRAIN_VARIANTS
+    )
+    assert set(HIGHER_ORDER_BENCHMARK_VARIANTS) <= set(BENCHMARK_VARIANTS)
+    assert all(
+        resource_count(name) > PROGRAM_TRAIN_MAX_RESOURCE_ORDER
+        for name in HIGHER_ORDER_BENCHMARK_VARIANTS
+    )
+    assert any(resource_count(name) == 4 for name in HIGHER_ORDER_BENCHMARK_VARIANTS)
+    selected = _training_variants_by_order(list(BENCHMARK_VARIANTS), 2)
+    assert set(selected).isdisjoint(HIGHER_ORDER_BENCHMARK_VARIANTS)
+    assert all(resource_count(name) <= 2 for name in selected)
+    with pytest.raises(ValueError, match="excludes every selected"):
+        _training_variants_by_order(list(HIGHER_ORDER_BENCHMARK_VARIANTS), 0)
 
 
 def test_setup_decoder_installs_a_neutral_greedy_incumbent() -> None:
@@ -998,6 +1027,7 @@ def test_validation_size_defaults_to_eight_instances(monkeypatch) -> None:
     assert args.val_size == 8
     assert args.val_n_rollouts is None
     assert args.variants == TRAIN_VARIANTS
+    assert args.max_train_resource_order == PROGRAM_TRAIN_MAX_RESOURCE_ORDER
     assert args.curriculum is False
     assert args.allow_missing_validation is False
     assert args.static_field is False

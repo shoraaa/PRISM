@@ -996,6 +996,7 @@ public:
     result["resource_count"] = solver_.resource_count();
     result["multiplier_count"] = solver_.multiplier_count();
     result["resource_descriptor_version"] = "resource_descriptor_v1";
+    result["resource_program_version"] = "resource_program_graph_v1";
     result["node_feature_names"] = prism::node_feature_names();
     std::vector<uint8_t> active_channels;
     active_channels.reserve(solver_.resource_count());
@@ -1066,6 +1067,40 @@ public:
     return vector_copy<float>(
         solver_.resource_descriptors(),
         {solver_.resource_count(), prism::RESOURCE_DESCRIPTOR_DIM});
+  }
+
+  py::array_t<int32_t> resource_program_categories() const {
+    return vector_copy<int32_t>(
+        solver_.resource_program_categories(),
+        {solver_.resource_count(), prism::RESOURCE_PROGRAM_MAX_TOKENS,
+         prism::RESOURCE_PROGRAM_CATEGORY_COUNT});
+  }
+
+  py::array_t<float> resource_program_values() const {
+    return vector_copy<float>(
+        solver_.resource_program_values(),
+        {solver_.resource_count(), prism::RESOURCE_PROGRAM_MAX_TOKENS,
+         prism::RESOURCE_PROGRAM_VALUE_COUNT});
+  }
+
+  py::array_t<uint8_t> resource_program_mask() const {
+    return vector_copy<uint8_t>(
+        solver_.resource_program_mask(),
+        {solver_.resource_count(), prism::RESOURCE_PROGRAM_MAX_TOKENS});
+  }
+
+  py::array_t<uint8_t> resource_program_edges() const {
+    return vector_copy<uint8_t>(
+        solver_.resource_program_edges(),
+        {solver_.resource_count(), prism::RESOURCE_PROGRAM_EDGE_ROLE_COUNT,
+         prism::RESOURCE_PROGRAM_MAX_TOKENS,
+         prism::RESOURCE_PROGRAM_MAX_TOKENS});
+  }
+
+  py::array_t<uint8_t> resource_program_roots() const {
+    return vector_copy<uint8_t>(
+        solver_.resource_program_roots(),
+        {solver_.resource_count(), prism::RESOURCE_PROGRAM_MAX_TOKENS});
   }
 
   py::array_t<float> objective_edge_costs() const {
@@ -1209,6 +1244,16 @@ PYBIND11_MODULE(prism_decoder, module) {
       .def_property_readonly("resource_scales", &PyDecoder::resource_scales)
       .def_property_readonly("resource_descriptors",
                              &PyDecoder::resource_descriptors)
+      .def_property_readonly("resource_program_categories",
+                             &PyDecoder::resource_program_categories)
+      .def_property_readonly("resource_program_values",
+                             &PyDecoder::resource_program_values)
+      .def_property_readonly("resource_program_mask",
+                             &PyDecoder::resource_program_mask)
+      .def_property_readonly("resource_program_edges",
+                             &PyDecoder::resource_program_edges)
+      .def_property_readonly("resource_program_roots",
+                             &PyDecoder::resource_program_roots)
       .def_property_readonly("objective_edge_costs",
                              &PyDecoder::objective_edge_costs)
       .def_property_readonly("objective_energy_scale",
@@ -1226,4 +1271,18 @@ PYBIND11_MODULE(prism_decoder, module) {
   module.attr("LIVE_STATE_FEATURE_COUNT") = prism::LIVE_STATE_FEATURE_COUNT;
   module.attr("MULTIPLIER_COUNT") = prism::MULTIPLIER_COUNT;
   module.attr("RESOURCE_DESCRIPTOR_DIM") = prism::RESOURCE_DESCRIPTOR_DIM;
+  module.attr("RESOURCE_PROGRAM_MAX_TOKENS") =
+      prism::RESOURCE_PROGRAM_MAX_TOKENS;
+  module.attr("RESOURCE_PROGRAM_CATEGORY_COUNT") =
+      prism::RESOURCE_PROGRAM_CATEGORY_COUNT;
+  module.attr("RESOURCE_PROGRAM_VALUE_COUNT") =
+      prism::RESOURCE_PROGRAM_VALUE_COUNT;
+  module.attr("RESOURCE_PROGRAM_EDGE_ROLE_COUNT") =
+      prism::RESOURCE_PROGRAM_EDGE_ROLE_COUNT;
+  module.attr("RESOURCE_PROGRAM_ROLE_COUNT") =
+      static_cast<int32_t>(prism::ResourceProgramRole::COUNT);
+  module.attr("RESOURCE_PROGRAM_OPCODE_COUNT") =
+      static_cast<int32_t>(prism::ResourceProgramOpcode::COUNT);
+  module.attr("RESOURCE_PROGRAM_INPUT_COUNT") =
+      static_cast<int32_t>(prism::ResourceProgramInput::COUNT);
 }

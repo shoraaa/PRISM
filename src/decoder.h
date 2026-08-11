@@ -16,6 +16,15 @@ static constexpr int32_t LIVE_STATE_FEATURE_COUNT = FIELD_CHANNEL_COUNT;
 static constexpr int32_t NODE_FEATURE_COUNT = 24;
 static constexpr int32_t EDGE_FEATURE_COUNT = 11;
 static constexpr int32_t RESOURCE_DESCRIPTOR_DIM = 32;
+// Canonical, name-free resource-program graph exported to the learned program
+// encoder.  The graph is intentionally small for the current resource algebra:
+// state -> update -> guard, with optional event/reset clauses.  The tensor
+// contract is runtime-sized in its resource axis while the clause vocabulary is
+// shared across compiled kernels and declarative programs.
+static constexpr int32_t RESOURCE_PROGRAM_MAX_TOKENS = 5;
+static constexpr int32_t RESOURCE_PROGRAM_CATEGORY_COUNT = 6;
+static constexpr int32_t RESOURCE_PROGRAM_VALUE_COUNT = 4;
+static constexpr int32_t RESOURCE_PROGRAM_EDGE_ROLE_COUNT = 2;
 // One multiplier slot beyond the resource channels carries the objective
 // weight applied to the objective edge cost. ConstraintFieldNet fixes this slot
 // to one (and its coupler to zero). A signed learned objective residual is
@@ -47,6 +56,46 @@ enum class ResourceOperator : uint8_t {
 enum class ResourceDirection : uint8_t { FORWARD, BACKWARD, BIDIRECTIONAL };
 enum class ResourceScope : uint8_t { ROUTE, TOUR, SOLUTION };
 enum class BoundCheck : uint8_t { TRANSITION, ROUTE_END, SOLUTION_END };
+
+enum class ResourceProgramRole : uint8_t {
+  STATE = 0,
+  UPDATE = 1,
+  GUARD = 2,
+  EVENT = 3,
+  RESET = 4,
+  COUNT = 5,
+};
+
+enum class ResourceProgramOpcode : uint8_t {
+  STATE = 0,
+  ADD = 1,
+  MAX_PLUS = 2,
+  AUTOMATON = 3,
+  RELATION = 4,
+  LOWER_BOUND = 5,
+  UPPER_BOUND = 6,
+  RANGE_BOUND = 7,
+  PREDICATE = 8,
+  EVENT = 9,
+  ASSIGN = 10,
+  COUNT = 11,
+};
+
+enum class ResourceProgramInput : uint8_t {
+  NONE = 0,
+  EDGE = 1,
+  NODE = 2,
+  EDGE_NODE = 3,
+  PAIR = 4,
+  EVENT = 5,
+  COUNT = 6,
+};
+
+enum class ResourceProgramEdgeRole : uint8_t {
+  DATA = 0,
+  CONTROL = 1,
+  COUNT = 2,
+};
 
 // Runtime resource row. Named input references from the Python algebra schema
 // are resolved into dense arrays once in the binding, so the hot decoder path
@@ -354,6 +403,21 @@ public:
   const std::vector<float> &resource_descriptors() const {
     return resource_descriptors_;
   }
+  const std::vector<int32_t> &resource_program_categories() const {
+    return resource_program_categories_;
+  }
+  const std::vector<float> &resource_program_values() const {
+    return resource_program_values_;
+  }
+  const std::vector<uint8_t> &resource_program_mask() const {
+    return resource_program_mask_;
+  }
+  const std::vector<uint8_t> &resource_program_edges() const {
+    return resource_program_edges_;
+  }
+  const std::vector<uint8_t> &resource_program_roots() const {
+    return resource_program_roots_;
+  }
   const std::vector<float> &candidate_resource_quotas() const {
     return candidate_resource_quotas_;
   }
@@ -447,6 +511,11 @@ private:
   std::vector<float> resource_pressure_;
   std::vector<float> resource_events_;
   std::vector<float> resource_descriptors_;
+  std::vector<int32_t> resource_program_categories_;
+  std::vector<float> resource_program_values_;
+  std::vector<uint8_t> resource_program_mask_;
+  std::vector<uint8_t> resource_program_edges_;
+  std::vector<uint8_t> resource_program_roots_;
   std::vector<float> candidate_resource_quotas_;
   std::vector<float> objective_edge_costs_;
   std::vector<float> incumbent_live_state_;
@@ -481,6 +550,7 @@ private:
   void build_resource_registry();
   void build_constraint_kernel_set();
   void build_resource_descriptors();
+  void build_resource_programs();
   float resource_state_feature(const State &state, int32_t resource) const;
   bool resource_transition_feasible(const State &state, int32_t next,
                                     int32_t resource,

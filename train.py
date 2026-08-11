@@ -42,12 +42,14 @@ from refine import neural_refine_solve, candidate_adjacency
 from problem_data import (
     ALL_VARIANTS,
     DEFAULT_DATASET_DIR,
+    PROGRAM_TRAIN_MAX_RESOURCE_ORDER,
     SavedProblems,
     TRAIN_VARIANTS,
     VariantCurriculum,
     channel_balanced_weights,
     generated_problem,
     problem_schema,
+    resource_count,
 )
 from utils import MetricsCollector, get_logger, init_logger
 
@@ -2263,6 +2265,22 @@ def _parse_variants(value: str) -> list[str]:
     return variants
 
 
+def _training_variants_by_order(
+    variants: list[str], maximum_order: int
+) -> list[str]:
+    """Keep the policy-training side of the compositional split bounded."""
+    if maximum_order < 0:
+        raise ValueError("max_train_resource_order must be nonnegative")
+    selected = [
+        name for name in variants if resource_count(name) <= maximum_order
+    ]
+    if not selected:
+        raise ValueError(
+            "--max-train-resource-order excludes every selected training variant"
+        )
+    return selected
+
+
 def validation(
     model: Optional[ConstraintFieldNet],
     dataset: list[dict],
@@ -2601,6 +2619,14 @@ def save_checkpoint(
 ) -> None:
     payload = {
         "model_schema": MODEL_SCHEMA,
+        "resource_program_schema": "resource_program_graph_v1",
+        "train_max_resource_order": int(
+            getattr(
+                args,
+                "max_train_resource_order",
+                PROGRAM_TRAIN_MAX_RESOURCE_ORDER,
+            )
+        ),
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "epoch": epoch,
@@ -2672,6 +2698,15 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Phase the selected --variants by resource count. By default all "
             "selected variants train from epoch 0."
+        ),
+    )
+    parser.add_argument(
+        "--max-train-resource-order",
+        type=int,
+        default=PROGRAM_TRAIN_MAX_RESOURCE_ORDER,
+        help=(
+            "Maximum number of active resource families in a training variant "
+            "(default: 2). Validation may still include higher-order variants."
         ),
     )
     parser.add_argument(
@@ -3111,6 +3146,8 @@ def setup_seeds(seed: int) -> None:
 
 def main() -> None:
     args = parse_args()
+    if args.max_train_resource_order < 0:
+        raise ValueError("max_train_resource_order must be nonnegative")
     if not 0.0 <= args.smdp_gamma <= 1.0:
         raise ValueError("smdp_gamma must lie in [0, 1]")
     if not 0.0 <= args.gae_lambda <= 1.0:
@@ -3146,8 +3183,11 @@ def main() -> None:
             config=vars(args),
         )
 
+    training_variants = _training_variants_by_order(
+        args.variants, args.max_train_resource_order
+    )
     curriculum = VariantCurriculum(
-        list(args.variants), random.Random(args.seed), args.seed
+        training_variants, random.Random(args.seed), args.seed
     )
     model = ConstraintFieldNet(
         grad_checkpointing=args.grad_checkpointing,
@@ -3181,8 +3221,7 @@ def main() -> None:
         )
         if checkpoint.get("model_schema") != MODEL_SCHEMA:
             raise RuntimeError(
-                "resume checkpoint is not a typed-resource v5 scale-equivariant-energy "
-                "checkpoint"
+                f"resume checkpoint schema does not match {MODEL_SCHEMA}"
             )
         upgraded = load_constraint_field_state_dict(
             model, checkpoint["model_state_dict"]

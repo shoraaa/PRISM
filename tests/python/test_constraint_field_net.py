@@ -4,13 +4,14 @@ from pathlib import Path
 import numpy as np
 import pytest
 import torch
+from torch_geometric.data import Batch
 
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
 
 import prism_decoder  # noqa: E402
-from problem_data import problem_schema  # noqa: E402
+from problem_data import generated_problem, problem_schema  # noqa: E402
 from net import (  # noqa: E402
     EDGE_FEATURE_COUNT,
     FIELD_CHANNEL_COUNT,
@@ -236,6 +237,19 @@ def test_typed_field_accepts_unseen_runtime_resource_without_new_weights() -> No
     graph = build_decoder_data(battery)
     renamed_graph = build_decoder_data(renamed)
     assert torch.equal(graph.resource_descriptors, renamed_graph.resource_descriptors)
+    assert torch.equal(
+        graph.resource_program_categories,
+        renamed_graph.resource_program_categories,
+    )
+    assert torch.equal(
+        graph.resource_program_values,
+        renamed_graph.resource_program_values,
+    )
+    assert torch.equal(graph.resource_program_mask, renamed_graph.resource_program_mask)
+    assert torch.equal(
+        graph.resource_program_edges,
+        renamed_graph.resource_program_edges,
+    )
 
     model = ConstraintFieldNet(depth=1, units=8).eval()
     with torch.no_grad():
@@ -265,6 +279,169 @@ def test_typed_field_accepts_unseen_runtime_resource_without_new_weights() -> No
     )
     assert all(solution["feasible"] for solution in traced["solutions"])
     assert traced["trace"]["live_state"].shape[1] == resource_count
+
+
+def test_program_encoder_uses_dataflow_and_ignores_legacy_descriptor() -> None:
+    coordinates = np.array(
+        [[0.0, 0.0], [0.8, 0.0], [0.4, 0.0]], dtype=np.float32
+    )
+    distance = np.linalg.norm(
+        coordinates[:, None] - coordinates[None, :], axis=-1
+    ).astype(np.float32)
+    decoder = make_decoder(
+        {
+            "name": "program_graph_probe",
+            "coordinates": coordinates,
+            "distance": distance,
+            "constraints": [],
+            "multi_route": False,
+            "node_attributes": {
+                "charger": np.array([0.0, 0.0, 1.0], dtype=np.float32)
+            },
+            "resources": [
+                {
+                    "name": "anonymous_resource",
+                    "operator": "affine_accumulator",
+                    "initial": 1.0,
+                    "scale": 1.0,
+                    "increment": {
+                        "edge_attribute": "distance",
+                        "coefficient": -1.0,
+                    },
+                    "bounds": [{"lower": 0.0}],
+                    "reset": {"node_attribute": "charger", "value": 1.0},
+                }
+            ],
+        },
+        n_rollouts=1,
+    )
+    graph = build_decoder_data(decoder)
+    torch.manual_seed(97)
+    model = ConstraintFieldNet(depth=1, units=8).eval()
+    program_args = (
+        graph.resource_program_categories,
+        graph.resource_program_values,
+        graph.resource_program_mask,
+        graph.resource_program_edges,
+        graph.resource_program_roots,
+    )
+    with torch.no_grad():
+        connected = model.program_encoder(*program_args)
+        disconnected = model.program_encoder(
+            *program_args[:3],
+            torch.zeros_like(graph.resource_program_edges),
+            program_args[4],
+        )
+        reference = model(graph)
+        graph.resource_descriptors = 1.0 - graph.resource_descriptors
+        descriptor_changed = model(graph)
+    assert not torch.allclose(connected, disconnected)
+    assert torch.equal(
+        reference["multipliers"], descriptor_changed["multipliers"]
+    )
+    assert torch.equal(
+        reference["coupler_weights"], descriptor_changed["coupler_weights"]
+    )
+
+
+def test_program_tokens_and_guidance_are_resource_row_permutation_equivariant() -> None:
+    coordinates = np.array(
+        [[0.0, 0.0], [0.4, 0.0], [0.8, 0.0]], dtype=np.float32
+    )
+    distance = np.linalg.norm(
+        coordinates[:, None] - coordinates[None, :], axis=-1
+    ).astype(np.float32)
+    node_unit = np.array([0.0, 0.4, 0.6], dtype=np.float32)
+    edge_resource = {
+        "name": "edge_budget",
+        "operator": "affine_accumulator",
+        "initial": 1.0,
+        "scale": 1.0,
+        "increment": {"edge_attribute": "distance", "coefficient": -1.0},
+        "bounds": [{"lower": 0.0}],
+    }
+    node_resource = {
+        "name": "node_budget",
+        "operator": "affine_accumulator",
+        "initial": 0.0,
+        "scale": 1.0,
+        "increment": {"node_attribute": "unit", "coefficient": 1.0},
+        "bounds": [{"upper": 1.0}],
+    }
+
+    def build(resources):
+        decoder = make_decoder(
+            {
+                "name": "resource_permutation_probe",
+                "coordinates": coordinates,
+                "distance": distance,
+                "constraints": [],
+                "multi_route": False,
+                "node_attributes": {"unit": node_unit},
+                "resources": resources,
+            },
+            n_rollouts=1,
+        )
+        return build_decoder_data(decoder)
+
+    original = build([edge_resource, node_resource])
+    permuted = build([node_resource, edge_resource])
+    assert torch.equal(
+        original.resource_program_categories[:, -2:],
+        permuted.resource_program_categories[:, -2:].flip(1),
+    )
+    torch.manual_seed(101)
+    model = ConstraintFieldNet(depth=1, units=8).eval()
+    with torch.no_grad():
+        original_output = model(original)
+        permuted_output = model(permuted)
+    assert torch.allclose(
+        original_output["multipliers"][:, -3:-1],
+        permuted_output["multipliers"][:, -3:-1].flip(1),
+        atol=1e-6,
+        rtol=1e-6,
+    )
+
+
+def test_program_graph_tensors_batch_without_changing_resource_tokens() -> None:
+    decoder = make_decoder(
+        {
+            "name": "cvrp",
+            "coordinates": np.array(
+                [[0.0, 0.0], [0.5, 0.0], [0.0, 0.5]], dtype=np.float32
+            ),
+            "demand": np.array([0.0, 0.2, 0.3], dtype=np.float32),
+            "capacity": 1.0,
+        },
+        n_rollouts=1,
+    )
+    graph = build_decoder_data(decoder)
+    batch = Batch.from_data_list([graph, graph.clone()])
+    torch.manual_seed(107)
+    model = ConstraintFieldNet(depth=1, units=8).eval()
+    with torch.no_grad():
+        single = model(graph)
+        paired = model(batch)
+    assert paired["multipliers"].shape[0] == 2
+    assert torch.allclose(paired["multipliers"][0], single["multipliers"][0])
+    assert torch.allclose(paired["multipliers"][1], single["multipliers"][0])
+
+
+def test_order_two_program_encoder_runs_unchanged_on_order_four_variant() -> None:
+    decoder = make_decoder(generated_problem("cvrpbpltw", 20), n_rollouts=1)
+    graph = build_decoder_data(decoder)
+    assert int(graph.active_channels.sum()) == 4
+    model = ConstraintFieldNet(depth=1, units=8).eval()
+    with torch.no_grad():
+        output = model(graph)
+    assert output["residual"].shape == (
+        decoder.metadata["edge_count"],
+        decoder.metadata["resource_count"],
+    )
+    assert output["multipliers"].shape == (
+        1,
+        decoder.metadata["resource_count"] + 1,
+    )
 
 
 def test_objective_conditioning_reaches_descriptor_and_field() -> None:
