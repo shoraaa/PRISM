@@ -18,17 +18,20 @@ from train import (
     _assign_smdp_returns,
     _best_feasible_solution,
     _disable_objective_residual,
+    _distance_guidance,
     _neutral_guidance,
     _new_decoder,
     _dual_loss,
     _epoch_lr,
     _objective_residual_loss,
+    _random_guidance,
     _feasibility_loss,
     _load_optimizer_state_compat,
     _positive_class_weight,
     _rollout_class_weights,
     _training_accumulation_size,
     _training_variant_schedule,
+    _validation_cost_groups,
     _validation_rank,
     _winner_temporal_advantage,
     build_validation_data,
@@ -291,7 +294,10 @@ def test_decision_level_ppo_moves_policy_without_auxiliary_losses(
         for name, parameter in model.named_parameters()
         if name in policy_before
     )
-    assert metrics["approx_kl"] == pytest.approx(0.0, abs=1e-10)
+    # First inner epoch: the policy is unchanged, so approx_kl is zero up to
+    # float32 C++/torch replay roundoff (~1e-8 now that the objective residual is
+    # a small non-zero learned term rather than exactly zero).
+    assert metrics["approx_kl"] == pytest.approx(0.0, abs=1e-5)
     assert np.isfinite(metrics["rl_loss"])
     assert abs(metrics["rl_score_proxy"]) > 1e-6
     assert metrics["policy_signal"] > 0.0
@@ -339,12 +345,14 @@ def test_tsp_refinement_transition_updates_edge_logit_head() -> None:
     assert refinement.old_logp.numel() > 0
     refinement.rewards = torch.tensor([-1.0, 1.0])
     rollout.steps = [refinement]
-    before = model.objective_energy_residual_head.weight.detach().clone()
+    before = (
+        model.objective_energy_residual_head[-1].weight.detach().clone()
+    )
 
     ppo_update(model, optimizer, [rollout], args, epoch=0)
 
     assert not torch.equal(
-        before, model.objective_energy_residual_head.weight.detach()
+        before, model.objective_energy_residual_head[-1].weight.detach()
     )
 
 
@@ -678,8 +686,8 @@ def test_zero_neutral_model_reproduces_plain_objective_search() -> None:
     args = _args()
     model = ConstraintFieldNet(depth=1, units=8).eval()
 
-    # A fresh model reproduces the plain-objective (E = c(e)) neutral search from
-    # its zero-initialized field, which is the policy training departs from.
+    # A fresh model preserves plain-objective quality; equal-cost route
+    # orientations may differ under the small v6 objective-residual initializer.
     decoder = _new_decoder(problem, args, deterministic=True)
     initial = list(decoder.sample(**_neutral_guidance(decoder)))
     incumbent, _ = _best_feasible_solution(initial, context="neutral bootstrap")
@@ -688,13 +696,99 @@ def test_zero_neutral_model_reproduces_plain_objective_search() -> None:
 
     zero_neural = infer_instance(model, problem, args)
     assert zero_neural[1]["objective"] == plain["objective"]
-    assert np.array_equal(zero_neural[1]["route"], plain["route"])
+    assert zero_neural[1]["feasible"]
 
-    # The fields-off baseline is now a flat, identical field (E = 1), a strictly
-    # weaker reference than the plain-objective search, so it need not coincide
-    # with it; it must still return a feasible solution.
-    fields_off = infer_instance(None, problem, args)
-    assert fields_off[1]["feasible"]
+    for baseline in ("constant", "distance", "random"):
+        result = infer_instance(None, problem, args, baseline=baseline)
+        assert result[1]["feasible"]
+        assert result[2]["net_evals"] == 0.0
+
+
+def test_distance_guidance_replaces_objective_energy_with_distance() -> None:
+    rng = np.random.default_rng(212)
+    coordinates = rng.random((12, 2), dtype=np.float32)
+    distance = np.linalg.norm(
+        coordinates[:, None] - coordinates[None, :], axis=-1
+    ).astype(np.float32)
+    problem = problem_schema("op") | {
+        "name": "op",
+        "coordinates": coordinates,
+        "distance": distance,
+        "prize": np.r_[0.0, rng.uniform(0.1, 1.0, 11)].astype(np.float32),
+        "tour_limit": 4.0,
+    }
+    decoder = _new_decoder(problem, _args(), deterministic=True)
+    guidance = _distance_guidance(decoder, problem)
+    edge_index = np.asarray(decoder.edge_index)
+    edge_distance = distance[edge_index[0], edge_index[1]]
+    energy = (
+        np.asarray(decoder.objective_edge_costs)
+        / float(decoder.metadata["objective_energy_scale"])
+        + guidance["objective_residual"]
+    )
+
+    assert np.corrcoef(edge_distance, energy)[0, 1] == pytest.approx(1.0)
+    assert np.asarray(guidance["multipliers"])[-1] == 1.0
+    assert np.count_nonzero(guidance["multipliers"][:-1]) == 0
+
+
+def test_random_guidance_replaces_objective_energy_reproducibly() -> None:
+    rng = np.random.default_rng(213)
+    coordinates = rng.random((12, 2), dtype=np.float32)
+    distance = np.linalg.norm(
+        coordinates[:, None] - coordinates[None, :], axis=-1
+    ).astype(np.float32)
+    problem = problem_schema("tsp") | {
+        "name": "tsp",
+        "coordinates": coordinates,
+        "distance": distance,
+    }
+    decoder = _new_decoder(problem, _args(), deterministic=True)
+    seed = 909
+    guidance = _random_guidance(decoder, seed)
+    energy = (
+        np.asarray(decoder.objective_edge_costs)
+        / float(decoder.metadata["objective_energy_scale"])
+        + guidance["objective_residual"]
+    )
+    repeated = _random_guidance(decoder, seed)
+    different = _random_guidance(decoder, seed + 1)
+
+    np.testing.assert_array_equal(
+        guidance["objective_residual"], repeated["objective_residual"]
+    )
+    assert not np.array_equal(
+        guidance["objective_residual"], different["objective_residual"]
+    )
+    assert np.std(energy) == pytest.approx(1.0, abs=0.2)
+    assert np.asarray(guidance["multipliers"])[-1] == 1.0
+    assert np.count_nonzero(guidance["multipliers"][:-1]) == 0
+
+    before = {
+        tuple(edge): value
+        for edge, value in zip(np.asarray(decoder.edge_index).T, energy)
+    }
+    samples = list(decoder.sample(**_neutral_guidance(decoder)))
+    incumbent, _ = _best_feasible_solution(samples, context="random stability")
+    decoder.set_incumbent(incumbent["route"])
+    rebuilt = _random_guidance(decoder, seed)
+    rebuilt_energy = (
+        np.asarray(decoder.objective_edge_costs)
+        / float(decoder.metadata["objective_energy_scale"])
+        + rebuilt["objective_residual"]
+    )
+    after = {
+        tuple(edge): value
+        for edge, value in zip(np.asarray(decoder.edge_index).T, rebuilt_energy)
+    }
+    shared = before.keys() & after.keys()
+    assert shared
+    np.testing.assert_allclose(
+        [before[edge] for edge in shared],
+        [after[edge] for edge in shared],
+        rtol=1.0e-5,
+        atol=1.0e-6,
+    )
 
 
 def test_policy_replay_uses_direct_field_not_analytic_pressure() -> None:
@@ -930,15 +1024,16 @@ def test_no_objective_residual_cli_zeros_and_freezes_objective_head(monkeypatch)
 
     args = parse_args()
     model = ConstraintFieldNet(depth=1, units=8)
+    final_layer = model.objective_energy_residual_head[-1]
     with torch.no_grad():
-        model.objective_energy_residual_head.weight.fill_(1.0)
-        model.objective_energy_residual_head.bias.fill_(1.0)
+        final_layer.weight.fill_(1.0)
+        final_layer.bias.fill_(1.0)
 
     _disable_objective_residual(model)
 
     assert args.objective_residual_enabled is False
-    assert torch.count_nonzero(model.objective_energy_residual_head.weight) == 0
-    assert torch.count_nonzero(model.objective_energy_residual_head.bias) == 0
+    assert torch.count_nonzero(final_layer.weight) == 0
+    assert torch.count_nonzero(final_layer.bias) == 0
     assert all(
         not parameter.requires_grad
         for parameter in model.objective_energy_residual_head.parameters()
@@ -996,7 +1091,7 @@ def test_validation_rollouts_can_override_training_rollouts(
     args.val_n_rollouts = val_n_rollouts
     observed_rollouts = []
 
-    def fake_infer(_model, _problem, inference_args):
+    def fake_infer(_model, _problem, inference_args, **_kwargs):
         observed_rollouts.append(inference_args.n_rollouts)
         return (
             1.0,
@@ -1264,7 +1359,7 @@ def test_validation_macro_score_weights_variants_equally(monkeypatch) -> None:
             (7.0, {"objective": 7.0, "direction": "minimize", "feasible": True}, {}),
         ]
     )
-    monkeypatch.setattr("train.infer_instance", lambda *_: next(solutions))
+    monkeypatch.setattr("train.infer_instance", lambda *_, **__: next(solutions))
 
     _, _, macro_gap, metrics = validation(None, dataset, _args())
 
@@ -1300,7 +1395,7 @@ def test_validation_macro_gap_uses_saved_references_only(monkeypatch) -> None:
             (99.0, {"objective": 99.0, "direction": "minimize", "feasible": True}, {}),
         ]
     )
-    monkeypatch.setattr("train.infer_instance", lambda *_: next(solutions))
+    monkeypatch.setattr("train.infer_instance", lambda *_, **__: next(solutions))
 
     _, _, macro_gap, metrics = validation(None, dataset, _args())
 
@@ -1309,6 +1404,54 @@ def test_validation_macro_gap_uses_saved_references_only(monkeypatch) -> None:
     assert metrics["gap_coverage"] == pytest.approx(0.5)
     assert metrics["saved_reference_instances"] == 1.0
     assert metrics["missing_reference_instances"] == 1.0
+
+
+def test_validation_reports_average_cost_by_semantic_group(monkeypatch) -> None:
+    symmetric = np.array([[0.0, 1.0], [1.0, 0.0]], dtype=np.float32)
+    asymmetric = np.array([[0.0, 1.0], [2.0, 0.0]], dtype=np.float32)
+    dataset = [
+        {
+            "variant": "tsp",
+            "problem": problem_schema("tsp") | {"distance": symmetric},
+            "reference": None,
+        },
+        {
+            "variant": "atsp",
+            "problem": problem_schema("atsp") | {"distance": asymmetric},
+            "reference": None,
+        },
+        {
+            "variant": "cvrpbptw",
+            "problem": problem_schema("cvrpbptw")
+            | {
+                "distance": symmetric,
+                "demand": np.array([0.0, -1.0], dtype=np.float32),
+            },
+            "reference": None,
+        },
+    ]
+    solutions = iter(
+        [
+            (4.0, {"objective": 4.0, "direction": "minimize", "feasible": True}, {}),
+            (6.0, {"objective": 6.0, "direction": "minimize", "feasible": True}, {}),
+            (10.0, {"objective": 10.0, "direction": "minimize", "feasible": True}, {}),
+        ]
+    )
+    monkeypatch.setattr("train.infer_instance", lambda *_, **__: next(solutions))
+
+    _, _, _, metrics = validation(None, dataset, _args())
+
+    assert metrics["group_cost/symmetric"] == pytest.approx(7.0)
+    assert metrics["group_cost/asymmetric"] == pytest.approx(6.0)
+    assert metrics["group_cost/single_route"] == pytest.approx(5.0)
+    assert metrics["group_cost/multi_route"] == pytest.approx(10.0)
+    assert metrics["group_cost/backhaul"] == pytest.approx(10.0)
+    assert metrics["group_cost/backhaul_order"] == pytest.approx(10.0)
+    assert metrics["group_cost/time_window"] == pytest.approx(10.0)
+    pickup_delivery = problem_schema("pdcvrp") | {
+        "demand": np.array([0.0, 1.0, -1.0], dtype=np.float32)
+    }
+    assert "backhaul" not in _validation_cost_groups(pickup_delivery)
 
 
 def test_validation_rank_uses_mean_best_cost() -> None:
@@ -1359,7 +1502,7 @@ def test_validation_mean_best_cost_canonicalizes_maximize_objectives(
             (-12.0, {"objective": 12.0, "direction": "maximize", "feasible": True}, {}),
         ]
     )
-    monkeypatch.setattr("train.infer_instance", lambda *_: next(solutions))
+    monkeypatch.setattr("train.infer_instance", lambda *_, **__: next(solutions))
 
     _, average_best_cost, _, _ = validation(None, dataset, _args())
 

@@ -407,22 +407,87 @@ def _neutral_guidance(decoder) -> dict:
     }
 
 
-def _fields_off_guidance(decoder) -> dict:
-    """Fields-off baseline guidance: a flat, identical field (E = 1 everywhere).
-
-    Unlike neutral guidance, this also zeros the objective multiplier, so the
-    objective term drops out and edge_energy collapses to the same constant on
-    every edge. The baseline therefore ranks moves with no objective or distance
-    signal at all -- "PRISM without fields" is uniform guidance, not distance
-    guidance. It differs from PRISM by the field alone: the shared neutral
-    bootstrap, candidate graph, seed, and budget stay identical, so the paired
-    comparison still isolates the learned field.
-    """
+def _constant_guidance(decoder) -> dict:
+    """Return the constant-energy control with identical candidate scores."""
     guidance = _neutral_guidance(decoder)
-    # Zero the objective weight (final multiplier slot) too. A constant energy is
-    # identical for every candidate, so the concrete value is immaterial to every
-    # ranking (softmax and the SRR edge sort); this is the E = 1 flat field.
+    # Zeroing the objective multiplier makes the concrete constant immaterial to
+    # construction sampling and SRR ranking.
     guidance["multipliers"][:] = 0.0
+    return guidance
+
+
+def _distance_guidance(decoder, problem: dict) -> dict:
+    """Return guidance whose complete candidate energy is normalized distance."""
+    edge_index = np.asarray(decoder.edge_index, dtype=np.int64)
+    if "distance" in problem:
+        distance = np.asarray(problem["distance"], dtype=np.float64)
+        edge_distance = distance[edge_index[0], edge_index[1]]
+    else:
+        coordinates = np.asarray(problem["coordinates"], dtype=np.float64)
+        edge_distance = np.linalg.norm(
+            coordinates[edge_index[0]] - coordinates[edge_index[1]], axis=1
+        )
+    offsets = np.asarray(decoder.edge_offsets, dtype=np.int64)
+
+    squared_difference = 0.0
+    difference_count = 0
+    for begin, end in zip(offsets[:-1], offsets[1:]):
+        if begin == end:
+            continue
+        row = edge_distance[begin:end]
+        squared_difference += float(np.square(row - row.mean()).sum())
+        difference_count += int(row.size)
+    scale = (
+        math.sqrt(squared_difference / difference_count)
+        if difference_count
+        else 0.0
+    )
+    if not math.isfinite(scale) or scale <= 1.0e-12:
+        scale = float(np.mean(np.abs(edge_distance))) if edge_distance.size else 1.0
+    if not math.isfinite(scale) or scale <= 1.0e-12:
+        scale = 1.0
+
+    guidance = _neutral_guidance(decoder)
+    objective_scale = float(decoder.metadata["objective_energy_scale"])
+    objective_energy = (
+        np.asarray(decoder.objective_edge_costs, dtype=np.float64)
+        / objective_scale
+    )
+    guidance["objective_residual"] = (
+        edge_distance / scale - objective_energy
+    ).astype(np.float32)
+    return guidance
+
+
+def _random_guidance(decoder, seed: int) -> dict:
+    """Return a stable random energy keyed by seed and directed edge."""
+    guidance = _neutral_guidance(decoder)
+    objective_scale = float(decoder.metadata["objective_energy_scale"])
+    objective_energy = (
+        np.asarray(decoder.objective_edge_costs, dtype=np.float64)
+        / objective_scale
+    )
+    edge_index = np.asarray(decoder.edge_index, dtype=np.uint64)
+    # Vectorized SplitMix64: stable across Python processes and candidate-graph
+    # rebuilds, unlike hash() or an advancing RNG. Mapping the upper 53 bits to
+    # a centered unit-variance uniform gives distinct, scale-controlled energy.
+    bits = (
+        np.uint64(seed)
+        ^ (edge_index[0] << np.uint64(32))
+        ^ edge_index[1]
+    )
+    bits = bits + np.uint64(0x9E3779B97F4A7C15)
+    bits = (bits ^ (bits >> np.uint64(30))) * np.uint64(0xBF58476D1CE4E5B9)
+    bits = (bits ^ (bits >> np.uint64(27))) * np.uint64(0x94D049BB133111EB)
+    bits ^= bits >> np.uint64(31)
+    unit = ((bits >> np.uint64(11)).astype(np.float64) + 0.5) / float(1 << 53)
+    random_energy = (unit - 0.5) * math.sqrt(12.0)
+    # Cancel the analytic objective term so the complete energy, not merely an
+    # additive perturbation, is random. This activates the same bounded SRR
+    # exploration mechanism without carrying task-specific guidance.
+    guidance["objective_residual"] = (
+        random_energy - objective_energy
+    ).astype(np.float32)
     return guidance
 
 
@@ -475,7 +540,7 @@ def _gain(incumbent: dict, candidate: dict, infeasible_penalty: float) -> float:
 
 def _new_decoder(
     problem: dict, args: argparse.Namespace, deterministic: bool = False,
-    use_srr: bool = True, neutral_ranking: bool = False,
+    use_srr: bool = True,
 ):
     decoder = prism_decoder.Decoder(
         problem,
@@ -484,19 +549,12 @@ def _new_decoder(
             "candidate_mode": getattr(args, "candidate_mode", "schema"),
         },
         search_config={
-            "classical_behavior": False,
             "use_srr": use_srr,
-            # The fields-off baseline runs a flat, identical field (E = 1);
-            # breaking SRR ties by edge index keeps it from silently inheriting
-            # the classical_proximity ordering. Guided search leaves this off.
-            "neutral_ranking": neutral_ranking,
             "feasibility_lookahead_depth": getattr(
                 args, "feasibility_lookahead_depth", 2
             ),
-            # Field-gated exploration budget. A flat field (fields-off) has no
-            # energy gradient, so no exploration move ever qualifies -- the
-            # budget is inert for the baseline and benefits only the learned
-            # field, an unambiguous field-driven advantage.
+            # Energy-guided exploration is inert when candidate energy is
+            # constant and remains active for learned or distance guidance.
             "srr_exploration_budget": getattr(
                 args, "srr_exploration_budget", 0
             ),
@@ -1116,8 +1174,10 @@ def _objective_residual_loss(step: OptionStep, output: dict) -> torch.Tensor:
 def _disable_objective_residual(model: ConstraintFieldNet) -> None:
     """Fix the objective-energy residual at its neutral zero value."""
     with torch.no_grad():
-        model.objective_energy_residual_head.weight.zero_()
-        model.objective_energy_residual_head.bias.zero_()
+        # Zeroing the final layer makes the shared head output identically zero
+        # for every objective coefficient vector.
+        model.objective_energy_residual_head[-1].weight.zero_()
+        model.objective_energy_residual_head[-1].bias.zero_()
     for parameter in model.objective_energy_residual_head.parameters():
         parameter.requires_grad_(False)
 
@@ -1933,14 +1993,15 @@ def infer_instance(
     problem: dict,
     args: argparse.Namespace,
     refiner: Optional[BatchedRelocate] = None,
+    initial_route: Optional[np.ndarray] = None,
+    baseline: str = "constant",
 ) -> tuple[float, dict, dict[str, float]]:
-    # Both branches bootstrap from the same neutral rollout batch. Training also
-    # installs a neutral feasible incumbent before exposing the model to search,
-    # so inference must not ask an untrained field to construct from an empty
-    # graph. This also makes fields-off a paired ablation with an identical
-    # starting incumbent.
+    # An externally guaranteed route, when supplied, is installed identically
+    # for learned guidance and every native control, bypassing only construction.
     if args.search_iterations < 1:
         raise ValueError("search_iterations must be positive")
+    if model is None and baseline not in {"constant", "distance", "random"}:
+        raise ValueError(f"unknown inference baseline: {baseline}")
     # Neural-refinement deployment: REPLACE hand-designed SRR. Build the decoder
     # with SRR off (C++ only constructs) and refine with the trained refiner.
     if getattr(args, "neural_refine", False) and refiner is not None:
@@ -1963,45 +2024,80 @@ def infer_instance(
             )
             return _canonical_cost(solution), solution, {"emissions": 0.0}
         # op/pctsp etc.: refiner has no operator yet -> fall through to SRR.
-    # The fields-off baseline (model is None) breaks equal-energy SRR ties by edge
-    # index so its flat E = 1 field never inherits classical_proximity. The flag
-    # only changes tie resolution under a constant energy.
     decoder = _new_decoder(
-        problem, args, deterministic=True, neutral_ranking=(model is None)
+        problem,
+        args,
+        deterministic=True,
     )
-    # Field-constructed bootstrap: the initial incumbent is built from the SAME
-    # field that drives search, so the learned field is load-bearing from the
-    # first solution rather than only during refinement. The fields-off baseline
-    # constructs from the identical flat E = 1 matrix -- no distance or objective
-    # signal -- so ablating the field now also ablates construction. Both still
-    # share the candidate graph, seed, and budget, so the paired comparison
-    # isolates the field's total (construct + refine) contribution.
+    # Construction and refinement use the same selected guidance mode.
     risk_penalty = args.feasibility_risk_penalty
     net_evals = 0
-    if model is None:
-        construct_guidance = _fields_off_guidance(decoder)
-    else:
-        model.eval()
-        construct_guidance = _field_guidance(
-            model, decoder, args.device, risk_penalty=risk_penalty
+    def _baseline_guidance() -> dict:
+        if baseline == "constant":
+            return _constant_guidance(decoder)
+        if baseline == "distance":
+            return _distance_guidance(decoder, problem)
+        if baseline == "random":
+            return _random_guidance(decoder, args.seed)
+        return {}
+
+    if initial_route is None:
+        if model is None:
+            construct_guidance = _baseline_guidance()
+        else:
+            model.eval()
+            construct_guidance = _field_guidance(
+                model, decoder, args.device, risk_penalty=risk_penalty
+            )
+            net_evals += 1
+        initial = list(decoder.sample(**construct_guidance))
+        incumbent, _winner = _best_feasible_solution(
+            initial, context="field bootstrap"
         )
-        net_evals += 1
-    initial = list(decoder.sample(**construct_guidance))
-    incumbent, _winner = _best_feasible_solution(
-        initial, context="field bootstrap"
-    )
+    else:
+        incumbent = decoder.evaluate(
+            np.asarray(initial_route, dtype=np.int32)
+        )
+        if not incumbent["feasible"]:
+            raise RuntimeError(
+                "provided bootstrap route is infeasible: "
+                + incumbent.get("error", "unknown route error")
+            )
     decoder.set_incumbent(incumbent["route"])
 
+    if model is not None:
+        model.eval()
+
     if model is None:
-        # Fields-off baseline: the identical decoder and SRR driven by a flat,
-        # identical field (E = 1 on every edge) for BOTH construction and search.
-        # PRISM and this baseline share the same candidate graph, seed, and
-        # budget, so they differ only by the learned field -- a clean ablation of
-        # PRISM's own guidance rather than a neural-vs-heuristic contest.
-        best = decoder.solve(
-            args.search_iterations, **_fields_off_guidance(decoder)
+        baseline_started = time.perf_counter()
+        if baseline in {"distance", "random"}:
+            # Incumbent changes can rebuild the candidate graph. Refresh the
+            # aligned control energy between iterations just as the neural
+            # branch refreshes its aligned edge outputs. Random energy is keyed
+            # by directed edge, so preserved edges retain identical values.
+            guidance = _baseline_guidance()
+            version = int(decoder.graph_version)
+            best = decoder.solve(1, **guidance)
+            for _ in range(max(args.search_iterations - 1, 0)):
+                if int(decoder.graph_version) != version:
+                    guidance = _baseline_guidance()
+                    version = int(decoder.graph_version)
+                best = decoder.solve(1, **guidance)
+        else:
+            best = decoder.solve(
+                args.search_iterations, **_baseline_guidance()
+            )
+        decoder_seconds = time.perf_counter() - baseline_started
+        return (
+            _canonical_cost(best),
+            best,
+            {
+                "emissions": 0.0,
+                "time_neural": 0.0,
+                "time_decoder": decoder_seconds,
+                "net_evals": 0.0,
+            },
         )
-        return _canonical_cost(best), best, {"emissions": 0.0}
 
     dynamic = not getattr(args, "static_field", False)
 
@@ -2083,6 +2179,71 @@ def _validation_rank(
 CHECKPOINT_RANK_METRIC = "mean_best_canonical_cost_v1"
 
 
+def _validation_cost_groups(problem: dict) -> tuple[str, ...]:
+    """Return overlapping semantic groups used for validation cost summaries."""
+    constraints = set(problem.get("constraints", ()))
+    distance = problem.get("distance")
+    if "symmetric" in problem:
+        symmetric = bool(problem["symmetric"])
+    elif distance is None:
+        # Coordinate-only routing problems use Euclidean, hence symmetric, cost.
+        symmetric = "coordinates" in problem
+    else:
+        matrix = np.asarray(distance)
+        symmetric = bool(
+            matrix.ndim == 2
+            and matrix.shape[0] == matrix.shape[1]
+            and np.allclose(matrix, matrix.T, rtol=1.0e-5, atol=1.0e-7)
+        )
+
+    groups = [
+        "symmetric" if symmetric else "asymmetric",
+        "multi_route" if problem.get("multi_route", False) else "single_route",
+        "open_route" if problem.get("open_route", False) else "closed_route",
+    ]
+
+    depot_count = int(problem.get("depot_count", 1))
+    groups.append(
+        "no_depot"
+        if depot_count == 0
+        else "single_depot"
+        if depot_count == 1
+        else "multi_depot"
+    )
+    groups.append(
+        "visit_all" if "visit_all" in constraints else "optional_visits"
+    )
+
+    objective = str(problem.get("objective", "distance"))
+    groups.append(f"objective_{objective}")
+
+    constraint_group_names = {
+        "capacity": "capacity",
+        "backhaul_order": "backhaul_order",
+        "pickup_delivery": "pickup_delivery",
+        "route_limit": "route_limit",
+        "time_windows": "time_window",
+        "tour_limit": "tour_limit",
+        "prize_quota": "prize_quota",
+    }
+    groups.extend(
+        group
+        for constraint, group in constraint_group_names.items()
+        if constraint in constraints
+    )
+
+    # Backhaul instances include both unrestricted mixed pickup/delivery demand
+    # (*b) and the ordered linehaul-before-backhaul form (*bp).
+    demand = problem.get("demand")
+    if "backhaul_order" in constraints or (
+        "pickup_delivery" not in constraints
+        and demand is not None
+        and bool(np.any(np.asarray(demand) < 0))
+    ):
+        groups.append("backhaul")
+    return tuple(groups)
+
+
 def _parse_variants(value: str) -> list[str]:
     """Parse the variants shared by training and validation."""
     if value == "train":
@@ -2127,6 +2288,7 @@ def validation(
     variant_feasible: dict[str, int] = {}
     variant_objectives: dict[str, list[float]] = {}
     variant_best_costs: dict[str, list[float]] = {}
+    group_best_costs: dict[str, list[float]] = {}
     for item in tqdm(dataset, desc="Validating", leave=False):
         average, best, metrics = infer_instance(
             model, item["problem"], validation_args, refiner=refiner
@@ -2153,6 +2315,8 @@ def validation(
             float(best["objective"])
         )
         variant_best_costs.setdefault(variant, []).append(best_cost)
+        for group in _validation_cost_groups(item["problem"]):
+            group_best_costs.setdefault(group, []).append(best_cost)
         baseline = item.get("paired_baseline")
         if baseline is not None and baseline.get("feasible", False):
             baseline_objective = float(baseline["objective"])
@@ -2263,6 +2427,12 @@ def validation(
     result["macro_score"] = result[
         "macro_baseline_improvement_percent"
     ]
+    result.update(
+        {
+            f"group_cost/{group}": float(np.mean(costs))
+            for group, costs in sorted(group_best_costs.items())
+        }
+    )
     return (
         float(np.mean(average_costs)) if average_costs else float("inf"),
         float(np.mean(best_costs)) if best_costs else float("inf"),
@@ -2814,8 +2984,8 @@ def parse_args() -> argparse.Namespace:
             "Bounded number of objective-worsening but guided-energy-descending "
             "moves the SRR descent may accept per invocation, letting the learned "
             "field steer uphill to escape local optima (champion tracking keeps "
-            "the best solution). A flat fields-off field has no energy gradient, "
-            "so the budget is inert for the baseline. 0 disables (default)."
+            "the best solution). Constant energy has no gradient, so the budget "
+            "is inert for that control. 0 disables (default)."
         ),
     )
     parser.add_argument("--no-adv-norm", action="store_true")

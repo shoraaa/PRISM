@@ -16,9 +16,11 @@ from net import (  # noqa: E402
     FIELD_CHANNEL_COUNT,
     LIVE_STATE_FEATURE_COUNT,
     NODE_FEATURE_COUNT,
+    OBJECTIVE_COEFF_DIM,
     ConstraintFieldNet,
     build_decoder_data,
     decode_iteration,
+    encode_objective_coeffs,
     load_constraint_field_state_dict,
 )
 from train import (  # noqa: E402
@@ -73,7 +75,10 @@ def test_constraint_field_net_uses_normalized_decoder_contract() -> None:
     channel_count = prism_decoder.FIELD_CHANNEL_COUNT
     assert output["residual"].shape == (edge_count, channel_count)
     assert output["objective_residual"].shape == (edge_count,)
-    assert torch.equal(output["objective_residual"], torch.zeros(edge_count))
+    # Small non-zero at init (near-neutral) so the head's hidden coefficient-
+    # conditioning layer is not gradient-starved; not exactly zero like the
+    # resource field/additive heads.
+    assert output["objective_residual"].abs().max() < 0.1
     assert output["multipliers"].shape == (1, prism_decoder.MULTIPLIER_COUNT)
     assert output["binding_logits"].shape == (1, channel_count)
     assert output["feasibility_logits"].shape == (edge_count,)
@@ -141,10 +146,12 @@ def test_v2_checkpoint_loader_is_strict_and_rejects_v1_identity() -> None:
         )
     }
     assert load_constraint_field_state_dict(restored, pre_logit_v2) is True
-    assert torch.equal(
-        restored.objective_energy_residual_head.weight,
-        torch.zeros_like(restored.objective_energy_residual_head.weight),
-    )
+    # A pre-objective checkpoint injects the model's own fresh head init: small
+    # non-zero final weight (so the hidden layer is not gradient-starved) with a
+    # zero bias so the residual starts near-neutral.
+    final_layer = restored.objective_energy_residual_head[-1]
+    assert final_layer.weight.abs().sum() > 0.0
+    assert torch.equal(final_layer.bias, torch.zeros_like(final_layer.bias))
 
 
 def test_python_dimensions_come_from_cpp_extension() -> None:
@@ -221,7 +228,6 @@ def test_typed_field_accepts_unseen_runtime_resource_without_new_weights() -> No
                     }
                 ],
             },
-            search_config={"classical_behavior": False},
             n_rollouts=1,
         )
 
@@ -287,12 +293,23 @@ def test_objective_conditioning_reaches_descriptor_and_field() -> None:
     distance_data = build_decoder_data(distance_problem)
     prize_data = build_decoder_data(prize_problem)
 
-    # One-hot objective type and a bounded per-graph scale reach the model.
-    assert distance_data.objective_type.shape == (1, 3)
-    assert torch.equal(
-        distance_data.objective_type, torch.tensor([[1.0, 0.0, 0.0]])
+    # The declared objective coefficient vector (not a one-hot type) and a
+    # bounded per-graph scale reach the model.
+    assert distance_data.objective_coeffs.shape == (1, OBJECTIVE_COEFF_DIM)
+    assert torch.allclose(
+        distance_data.objective_coeffs,
+        encode_objective_coeffs(
+            {"distance_coeff": 1.0, "visit_coeff": 0.0, "miss_coeff": 0.0,
+             "distance_regularizer": 0.0, "sense": 1.0}
+        ),
     )
-    assert torch.equal(prize_data.objective_type, torch.tensor([[0.0, 1.0, 0.0]]))
+    assert torch.allclose(
+        prize_data.objective_coeffs,
+        encode_objective_coeffs(
+            {"distance_coeff": 0.0, "visit_coeff": 1.0, "miss_coeff": 0.0,
+             "distance_regularizer": 1.0e-3, "sense": -1.0}
+        ),
+    )
     for data in (distance_data, prize_data):
         assert 0.0 <= float(data.objective_scale) <= 1.0
 
@@ -308,7 +325,12 @@ def test_objective_conditioning_reaches_descriptor_and_field() -> None:
     )
 
 
-def test_edge_logit_uses_separate_objective_weights() -> None:
+def test_objective_residual_conditions_on_coeffs() -> None:
+    """One shared head, conditioned on the declared coefficient vector. The head
+    is zero-init (residual inert by design -- an actively-trained objective
+    residual was measured net-harmful), but once given non-zero weights it must
+    produce different residuals for different objective coefficients on the same
+    graph (the conditioning is wired, not dead)."""
     rng = np.random.default_rng(315)
     coordinates = rng.random((18, 2), dtype=np.float32)
     distance = np.linalg.norm(
@@ -320,17 +342,35 @@ def test_edge_logit_uses_separate_objective_weights() -> None:
     )
     distance_data = build_decoder_data(decoder)
     prize_data = distance_data.clone()
-    prize_data.objective_type = torch.tensor([[0.0, 1.0, 0.0]])
-    model = ConstraintFieldNet(depth=2, units=16).eval()
+    prize_data.objective_coeffs = encode_objective_coeffs(
+        {"distance_coeff": 0.0, "visit_coeff": 1.0, "miss_coeff": 0.0,
+         "distance_regularizer": 1.0e-3, "sense": -1.0}
+    )
+    model = ConstraintFieldNet(depth=2, units=16)
+
+    # Head starts small non-zero (near-neutral) so it is trainable.
     with torch.no_grad():
-        direction = torch.linspace(-0.2, 0.2, 16)
-        model.objective_energy_residual_head.weight[0].copy_(direction)
-        model.objective_energy_residual_head.weight[1].copy_(-direction)
+        assert model(distance_data)["objective_residual"].abs().max() < 0.1
+
+    # The hidden (coefficient-conditioning) layer must receive gradient from the
+    # first step -- a zero-init final layer would freeze it. A linear-in-residual
+    # signal mimics the PPO policy gradient.
+    output = model(distance_data)
+    residual = output["objective_residual"]
+    (residual * torch.randn_like(residual)).sum().backward()
+    head = model.objective_energy_residual_head
+    assert head[0].weight.grad is not None and head[0].weight.grad.norm() > 0.0
+
+    # A non-trivial head must respond to the coefficient conditioning.
+    model.eval()
+    with torch.no_grad():
+        for parameter in model.objective_energy_residual_head[-1].parameters():
+            torch.nn.init.normal_(parameter, std=0.5)
         distance_logits = model(distance_data)["objective_residual"]
         prize_logits = model(prize_data)["objective_residual"]
 
     assert distance_logits.std() > 0.0
-    assert torch.allclose(distance_logits, -prize_logits)
+    assert not torch.allclose(distance_logits, prize_logits)
 
 
 def test_depot_conditioning_reaches_descriptor_and_field() -> None:
@@ -409,9 +449,6 @@ def test_model_output_drives_field_decoder_iteration() -> None:
             "demand": demand,
             "capacity": 0.5,
         },
-        search_config={
-            "classical_behavior": False,
-        },
         n_rollouts=4,
     )
     decoder.seed(3002)
@@ -443,17 +480,14 @@ def test_cpp_trace_replays_exact_state_dependent_policy() -> None:
             "demand": demand,
             "capacity": 0.5,
         },
-        search_config={"classical_behavior": False},
         n_rollouts=4,
         beta=2.0,
     )
     decoder.seed(3003)
     model = ConstraintFieldNet(depth=2, units=16).eval()
     with torch.no_grad():
-        model.objective_energy_residual_head.weight.copy_(
-            torch.linspace(-0.2, 0.2, 16)
-            .view(1, -1)
-            .expand(model.objective_energy_residual_head.out_features, -1)
+        torch.nn.init.normal_(
+            model.objective_energy_residual_head[-1].weight, std=0.2
         )
 
     incumbent = decoder.sample_greedy(**_neutral_guidance(decoder))
@@ -529,7 +563,6 @@ def test_tsp_edge_logit_receives_objective_policy_gradient() -> None:
     ).astype(np.float32)
     decoder = make_decoder(
         {"name": "tsp", "coordinates": coordinates, "distance": distance},
-        search_config={"classical_behavior": False},
         n_rollouts=6,
         beta=2.0,
     )
@@ -553,7 +586,7 @@ def test_tsp_edge_logit_receives_objective_policy_gradient() -> None:
     loss = -(replayed * advantages).mean()
     loss.backward()
 
-    gradient = model.objective_energy_residual_head.weight.grad
+    gradient = model.objective_energy_residual_head[-1].weight.grad
     assert gradient is not None
     assert torch.isfinite(gradient).all()
     assert gradient.norm() > 0.0
@@ -570,18 +603,13 @@ def test_default_depth_tsp_edge_logit_does_not_saturate_constant() -> None:
     ).astype(np.float32)
     decoder = make_decoder(
         {"name": "tsp", "coordinates": coordinates, "distance": distance},
-        search_config={"classical_behavior": False},
         n_rollouts=2,
     )
     graph = build_decoder_data(decoder)
     model = ConstraintFieldNet().eval()
     with torch.no_grad():
-        model.objective_energy_residual_head.weight.copy_(
-            torch.linspace(
-                -0.2, 0.2, model.objective_energy_residual_head.in_features
-            )
-            .view(1, -1)
-            .expand(model.objective_energy_residual_head.out_features, -1)
+        torch.nn.init.normal_(
+            model.objective_energy_residual_head[-1].weight, std=0.2
         )
         output = model(graph)
 
@@ -614,7 +642,6 @@ def test_objective_view_does_not_change_legacy_dynamic_batch_norm() -> None:
             ),
             "capacity": 0.5,
         },
-        search_config={"classical_behavior": False},
         n_rollouts=2,
     )
     incumbent = decoder.sample_greedy(**_neutral_guidance(decoder))
@@ -671,15 +698,12 @@ def test_edge_logit_is_invariant_to_incumbent_state() -> None:
             ),
             "capacity": 0.5,
         },
-        search_config={"classical_behavior": False},
         n_rollouts=2,
     )
     model = ConstraintFieldNet(depth=2, units=16).eval()
     with torch.no_grad():
-        model.objective_energy_residual_head.weight.copy_(
-            torch.linspace(-0.2, 0.2, 16)
-            .view(1, -1)
-            .expand(model.objective_energy_residual_head.out_features, -1)
+        torch.nn.init.normal_(
+            model.objective_energy_residual_head[-1].weight, std=0.2
         )
         model.field_head.weight.copy_(
             torch.linspace(-0.2, 0.2, 16).view(1, -1)

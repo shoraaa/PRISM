@@ -137,7 +137,7 @@ Commands:
 
 ```bash
 uv run --no-sync pytest -q
-uv run --no-sync python tests/urs_one_each.py --iterations 2 --guidance classical --no-pheromone
+uv run --no-sync python tests/urs_one_each.py --iterations 2 --no-pheromone
 uv run --no-sync python tests/urs_one_each.py --iterations 2 --guidance field --no-pheromone
 uv run --no-sync python tests/urs_srr_report.py --iterations 2 --no-pheromone --csv results/decoder_classical_no_pheromone_allx2.csv
 uv run --no-sync python tests/urs_screening_parity.py

@@ -510,16 +510,6 @@ void CandidateConfig::validate() const {
   if (max_candidates <= 0 || max_candidates > 64) {
     throw std::invalid_argument("max_candidates must be in [1, 64]");
   }
-  const float weights[] = {
-      gamma_unit,     gamma_wait,       gamma_time_warp, gamma_load_fit,
-      gamma_ordering, gamma_precedence, gamma_route,     gamma_prize,
-  };
-  for (float weight : weights) {
-    if (!std::isfinite(weight) || weight < 0.0f) {
-      throw std::invalid_argument(
-          "candidate proximity weights must be finite and non-negative");
-    }
-  }
 }
 
 void SearchConfig::validate() const {
@@ -542,21 +532,6 @@ void SearchConfig::validate() const {
   }
 }
 
-const char *objective_name(Objective objective) {
-  switch (objective) {
-  case Objective::MIN_DISTANCE:
-    return "distance";
-  case Objective::MAX_PRIZE:
-    return "prize";
-  case Objective::MIN_DISTANCE_PLUS_PENALTY:
-    return "distance_plus_penalty";
-  }
-  return "unknown";
-}
-
-const char *objective_direction(Objective objective) {
-  return objective == Objective::MAX_PRIZE ? "maximize" : "minimize";
-}
 
 std::vector<std::string> constraint_names(uint32_t constraints) {
   std::vector<std::string> result;
@@ -859,90 +834,6 @@ std::vector<int32_t> RoutingDecoder::rank_by_distance(int32_t from,
   return nodes;
 }
 
-float RoutingDecoder::resource_proximity(int32_t from, int32_t to,
-                                     int metric) const {
-  const CandidateConfig &config = candidate_config_;
-  const float travel = problem_.dist(from, to);
-  const float base = config.gamma_unit * travel;
-  switch (metric) {
-  case METRIC_TIME_WINDOW: {
-    // Vidal-lineage directed proximity: latest departure from i determines
-    // unavoidable waiting, while earliest departure determines time warp.
-    const float wait =
-        std::isfinite(problem_.tw_end[from])
-            ? std::max(problem_.tw_start[to] - problem_.service_time[from] -
-                           travel - problem_.tw_end[from],
-                       0.0f)
-            : 0.0f;
-    const float warp =
-        std::isfinite(problem_.tw_end[to])
-            ? std::max(problem_.tw_start[from] + problem_.service_time[from] +
-                           travel - problem_.tw_end[to],
-                       0.0f)
-            : 0.0f;
-    return base + config.gamma_wait * wait + config.gamma_time_warp * warp;
-  }
-  case METRIC_CAPACITY: {
-    const float from_demand = std::abs(problem_.demand[from]);
-    const float to_demand = std::abs(problem_.demand[to]);
-    const bool same_sign = problem_.demand[from] * problem_.demand[to] >= 0.0f;
-    const float combined = same_sign ? from_demand + to_demand : to_demand;
-    const float overflow = std::max(combined - problem_.capacity, 0.0f);
-    const float unused = std::max(
-        problem_.capacity - std::min(combined, problem_.capacity), 0.0f);
-    return base + config.gamma_load_fit * (unused + 10.0f * overflow);
-  }
-  case METRIC_BACKHAUL: {
-    const bool illegal_order = problem_.demand[from] < -FEASIBILITY_EPS &&
-                               problem_.demand[to] > FEASIBILITY_EPS;
-    return base + config.gamma_ordering * (illegal_order ? 1.0f : 0.0f);
-  }
-  case METRIC_PICKUP_DELIVERY: {
-    const int32_t required_pickup = problem_.pickup_of_delivery[to];
-    const bool direct_pair = problem_.delivery_of_pickup[from] == to;
-    const bool precedence_unknown = required_pickup >= 0 && !direct_pair;
-    return base + config.gamma_precedence * (precedence_unknown ? 1.0f : 0.0f);
-  }
-  case METRIC_ROUTE_LIMIT: {
-    float return_distance = 0.0f;
-    if (!problem_.open_route && problem_.depot_count > 0) {
-      return_distance = std::numeric_limits<float>::infinity();
-      for (int32_t depot = 0; depot < problem_.depot_count; ++depot) {
-        return_distance = std::min(return_distance, problem_.dist(to, depot));
-      }
-    }
-    return base + config.gamma_route * return_distance;
-  }
-  case METRIC_PRIZE: {
-    const float value = problem_.prize[to] + problem_.penalty[to];
-    return base + config.gamma_prize / std::max(value, EPS);
-  }
-  default:
-    return base;
-  }
-}
-
-float RoutingDecoder::classical_proximity(int32_t from, int32_t to) const {
-  const float base = candidate_config_.gamma_unit * problem_.dist(from, to);
-  float result = base;
-  const auto add_resource = [&](int metric) {
-    result += resource_proximity(from, to, metric) - base;
-  };
-  if (problem_.has(TIME_WINDOWS))
-    add_resource(METRIC_TIME_WINDOW);
-  if (problem_.has(CAPACITY))
-    add_resource(METRIC_CAPACITY);
-  if (problem_.has(BACKHAUL_ORDER))
-    add_resource(METRIC_BACKHAUL);
-  if (problem_.has(PICKUP_DELIVERY))
-    add_resource(METRIC_PICKUP_DELIVERY);
-  if (problem_.has(ROUTE_LIMIT) || problem_.has(TOUR_LIMIT))
-    add_resource(METRIC_ROUTE_LIMIT);
-  if (problem_.objective != Objective::MIN_DISTANCE)
-    add_resource(METRIC_PRIZE);
-  return result;
-}
-
 bool RoutingDecoder::field_channel_active(int32_t channel) const {
   return channel >= 0 && channel < FIELD_CHANNEL_COUNT &&
          active_field_channels_[channel] != 0;
@@ -961,15 +852,15 @@ float RoutingDecoder::objective_edge_cost(int32_t from, int32_t to) const {
     // select_next(), which drops depot options while a customer can still
     // legally extend the open route.
     return problem_.open_route ? 0.0f : travel;
-  switch (problem_.objective) {
-  case Objective::MIN_DISTANCE:
-    return travel;
-  case Objective::MAX_PRIZE:
-    return -problem_.prize[to] + 1.0e-3f * travel / distance_scale_;
-  case Objective::MIN_DISTANCE_PLUS_PENALTY:
-    return travel - problem_.penalty[to];
-  }
-  return travel;
+  // Marginal change to the (minimization-normalized) objective from traversing
+  // into `to`: it adds `travel`, collects `prize[to]`, and removes `penalty[to]`
+  // from the unvisited set. The regularizer is a scale-relative travel tie-break
+  // for node-only objectives that would otherwise leave many edges tied.
+  const ObjectiveSpec &obj = problem_.objective;
+  return obj.sense * (obj.distance_coeff * travel +
+                      obj.visit_coeff * problem_.prize[to] -
+                      obj.miss_coeff * problem_.penalty[to]) +
+         obj.distance_regularizer * travel / distance_scale_;
 }
 
 float RoutingDecoder::resource_scale(int32_t channel) const {
@@ -1216,27 +1107,14 @@ void RoutingDecoder::validate_guidance(const float *edge_field,
                                        const float *objective_residual,
                                        const float *edge_risk,
                                        float risk_penalty) const {
-  if (search_config_.classical_behavior) {
-    if (edge_field != nullptr || edge_additive != nullptr ||
-        multipliers != nullptr || coupler_weights != nullptr ||
-        coupler_bias != nullptr || objective_residual != nullptr ||
-        edge_risk != nullptr ||
-        risk_penalty != 0.0f) {
-      throw std::invalid_argument(
-          "classical_behavior does not accept a learned field");
-    }
-    return;
-  }
-  if (edge_field == nullptr) {
-    throw std::invalid_argument(
-        "edge_field is required when classical_behavior is false");
-  }
   const size_t value_count =
       static_cast<size_t>(edge_count()) * resource_count();
-  for (size_t index = 0; index < value_count; ++index) {
-    if (!std::isfinite(edge_field[index])) {
-      throw std::invalid_argument(
-          "edge_field residuals must be finite");
+  if (edge_field != nullptr) {
+    for (size_t index = 0; index < value_count; ++index) {
+      if (!std::isfinite(edge_field[index])) {
+        throw std::invalid_argument(
+            "edge_field residuals must be finite");
+      }
     }
   }
   if (edge_additive != nullptr) {
@@ -1449,9 +1327,6 @@ double RoutingDecoder::field_score(int32_t from, int32_t to, int32_t edge,
                                    const float *coupler_weights,
                                    const float *coupler_bias,
                                    const float *live_state) const {
-  if (search_config_.classical_behavior) {
-    return 0.0;
-  }
   double result = 0.0;
   for (int32_t channel = 0; channel < resource_count(); ++channel) {
     if (!resource(channel).active)
@@ -1661,8 +1536,6 @@ void RoutingDecoder::build_candidate_graph(const std::vector<int32_t> &incumbent
   for (const auto &row : rows) {
     edge_to_.insert(edge_to_.end(), row.begin(), row.end());
   }
-  proximity_.resize(edge_to_.size());
-  heuristic_.resize(edge_to_.size());
   resource_pressure_.assign(edge_to_.size() * resource_count(), 0.0f);
   resource_events_.assign(edge_to_.size() * resource_count(), 0.0f);
   objective_edge_costs_.assign(edge_to_.size(), 0.0f);
@@ -1694,8 +1567,6 @@ void RoutingDecoder::build_candidate_graph(const std::vector<int32_t> &incumbent
       while (old_edge < old_end && old_to[old_edge] < to)
         ++old_edge;
       const bool preserved = old_edge < old_end && old_to[old_edge] == to;
-      proximity_[edge] = classical_proximity(from, edge_to_[edge]);
-      heuristic_[edge] = 1.0f / std::max(proximity_[edge], EPS);
       objective_edge_costs_[edge] = objective_edge_cost(from, to);
       for (int32_t channel = 0; channel < resource_count(); ++channel) {
         resource_pressure_[static_cast<size_t>(edge) * resource_count() +
@@ -2396,17 +2267,8 @@ Solution RoutingDecoder::finish(State state) const {
   solution.distance = state.distance;
   solution.collected_prize = state.collected_prize;
   solution.off_graph_edges = state.off_graph_edges;
-  switch (problem_.objective) {
-  case Objective::MIN_DISTANCE:
-    solution.objective = solution.distance;
-    break;
-  case Objective::MAX_PRIZE:
-    solution.objective = solution.collected_prize;
-    break;
-  case Objective::MIN_DISTANCE_PLUS_PENALTY:
-    solution.objective = solution.distance + solution.missed_penalty;
-    break;
-  }
+  solution.objective = problem_.objective.report(
+      solution.distance, solution.collected_prize, solution.missed_penalty);
   solution.feasible = std::isfinite(solution.objective);
   if (!solution.feasible) {
     solution.error = "route objective is not finite";
@@ -2462,9 +2324,8 @@ int32_t RoutingDecoder::select_next(State &state,
   // (a forced close), and the local search reshapes routes afterwards. This
   // replaces the old phantom return cost with a structural rule, so the
   // ranking energy no longer contains a distortion the learned field must
-  // fight. Only the field/neutral energy path zeroes the return; the classical
-  // proximity heuristic never did, so it neither fragments nor needs the guard.
-  if (problem_.open_route && !search_config_.classical_behavior) {
+  // fight.
+  if (problem_.open_route) {
     bool has_customer = false;
     for (const Choice &choice : pool) {
       if (choice.node >= problem_.depot_count) {
@@ -2504,42 +2365,13 @@ int32_t RoutingDecoder::select_next(State &state,
 
   std::vector<double> log_weights(pool.size());
   double maximum = -std::numeric_limits<double>::infinity();
-  const uint32_t savings_flags =
-      static_cast<uint32_t>(VISIT_ALL) | static_cast<uint32_t>(CAPACITY);
-  const bool use_savings = problem_.multi_route && !problem_.open_route &&
-                           problem_.has(CAPACITY) &&
-                           (problem_.constraints & ~savings_flags) == 0;
   for (size_t index = 0; index < pool.size(); ++index) {
     const int32_t edge = pool[index].edge;
-    double value = 0.0;
-    if (search_config_.classical_behavior) {
-      float eta = edge >= 0
-                      ? heuristic_[edge]
-                      : 1.0f / std::max(classical_proximity(state.current,
-                                                            pool[index].node),
-                                        EPS);
-      if (use_savings) {
-        const int32_t node = pool[index].node;
-        if (node < problem_.depot_count) {
-          eta = EPS;
-        } else if (greedy || state.at_depot) {
-          eta = 1.0f / std::max(problem_.dist(state.current, node), EPS);
-        } else {
-          eta = std::max(problem_.dist(state.current, state.route_depot) +
-                             problem_.dist(state.route_depot, node) -
-                             problem_.dist(state.current, node),
-                         EPS);
-        }
-      }
-      value += beta_ * std::log(std::max(eta, EPS));
-    } else {
-      const double energy = edge_energy(state.current, pool[index].node, edge,
-                                        edge_field, edge_additive, multipliers,
-                                        coupler_weights, coupler_bias,
-                                        live_state.data(), objective_residual,
-                                        edge_risk, risk_penalty);
-      value -= beta_ * energy;
-    }
+    const double energy = edge_energy(
+        state.current, pool[index].node, edge, edge_field, edge_additive,
+        multipliers, coupler_weights, coupler_bias, live_state.data(),
+        objective_residual, edge_risk, risk_penalty);
+    const double value = -beta_ * energy;
     log_weights[index] = value;
     maximum = std::max(maximum, value);
   }
@@ -2642,18 +2474,6 @@ RoutingDecoder::perturbation_order(int32_t current,
   std::vector<RankedChoice> ranked;
   ranked.reserve(edge_offsets_[current + 1] - edge_offsets_[current]);
   std::uniform_real_distribution<double> uniform(0.0, 1.0);
-  const uint32_t savings_flags =
-      static_cast<uint32_t>(VISIT_ALL) | static_cast<uint32_t>(CAPACITY);
-  const bool use_savings = problem_.multi_route && !problem_.open_route &&
-                           problem_.has(CAPACITY) &&
-                           (problem_.constraints & ~savings_flags) == 0;
-  int32_t route_depot = 0;
-  if (use_savings) {
-    for (int32_t depot = 1; depot < problem_.depot_count; ++depot) {
-      if (problem_.dist(current, depot) < problem_.dist(current, route_depot))
-        route_depot = depot;
-    }
-  }
   const std::vector<float> live_state =
       incumbent_state_features(current);
   for (int32_t edge = edge_offsets_[current]; edge < edge_offsets_[current + 1];
@@ -2663,25 +2483,11 @@ RoutingDecoder::perturbation_order(int32_t current,
         (node < problem_.depot_count && !problem_.multi_route)) {
       continue;
     }
-    double log_weight = 0.0;
-    if (search_config_.classical_behavior) {
-      float eta = heuristic_[edge];
-      if (use_savings) {
-        eta = node < problem_.depot_count
-                  ? EPS
-                  : std::max(problem_.dist(current, route_depot) +
-                                 problem_.dist(route_depot, node) -
-                                 problem_.dist(current, node),
-                             EPS);
-      }
-      log_weight += beta_ * std::log(std::max(eta, EPS));
-    } else {
-      log_weight -= beta_ *
-                    edge_energy(current, node, edge, edge_field,
-                                edge_additive, multipliers, coupler_weights,
-                                coupler_bias, live_state.data(),
-                                objective_residual, edge_risk, risk_penalty);
-    }
+    const double log_weight =
+        -beta_ * edge_energy(current, node, edge, edge_field, edge_additive,
+                             multipliers, coupler_weights, coupler_bias,
+                             live_state.data(), objective_residual, edge_risk,
+                             risk_penalty);
     // Gumbel-top-k gives a weighted order without replacement.
     const double draw = greedy
                             ? std::exp(-1.0)
@@ -4774,36 +4580,24 @@ Solution RoutingDecoder::scope_restricted_refine(
   };
 
   std::vector<int32_t> ranked_local_edges(edge_count());
-  std::vector<double> ranking_energy(
-      search_config_.classical_behavior ? 0 : edge_count());
+  std::vector<double> ranking_energy(edge_count());
   for (int32_t node = 0; node < problem_.node_count; ++node) {
     const auto state = incumbent_state_features(node);
     for (int32_t edge = edge_offsets_[node];
          edge < edge_offsets_[node + 1]; ++edge) {
       ranked_local_edges[edge] = edge;
-      if (!search_config_.classical_behavior) {
-        ranking_energy[edge] = edge_energy(
-            node, edge_to_[edge], edge, edge_field, edge_additive,
-            multipliers, coupler_weights, coupler_bias, state.data(),
-            objective_residual, edge_risk, risk_penalty);
-      }
+      ranking_energy[edge] = edge_energy(
+          node, edge_to_[edge], edge, edge_field, edge_additive,
+          multipliers, coupler_weights, coupler_bias, state.data(),
+          objective_residual, edge_risk, risk_penalty);
     }
     std::stable_sort(
         ranked_local_edges.begin() + edge_offsets_[node],
         ranked_local_edges.begin() + edge_offsets_[node + 1],
         [&](int32_t lhs, int32_t rhs) {
-          if (search_config_.classical_behavior)
-            return proximity_[lhs] < proximity_[rhs];
           if (ranking_energy[lhs] != ranking_energy[rhs])
             return ranking_energy[lhs] < ranking_energy[rhs];
-          // Equal energy: guided search keeps the resource-aware
-          // classical_proximity tie-break, but the fields-off baseline breaks
-          // ties by edge index so a flat/identical field (E = 1) never inherits
-          // that heuristic ordering -- otherwise "no field" silently becomes a
-          // proximity-guided reference.
-          return search_config_.neutral_ranking
-                     ? lhs < rhs
-                     : proximity_[lhs] < proximity_[rhs];
+          return lhs < rhs;
         });
   }
 
@@ -4817,8 +4611,7 @@ Solution RoutingDecoder::scope_restricted_refine(
   // guided-energy-descending moves, and the champion (best objective ever seen)
   // that is returned so an uphill excursion never degrades the result. Disabled
   // (budget 0) unless a non-flat field is guiding the search.
-  int32_t exploration_remaining =
-      search_config_.classical_behavior ? 0 : search_config_.srr_exploration_budget;
+  int32_t exploration_remaining = search_config_.srr_exploration_budget;
   Solution champion = solution;
   while (!checklist.empty()) {
     const int32_t anchor = checklist.front();
@@ -4840,9 +4633,7 @@ Solution RoutingDecoder::scope_restricted_refine(
     // it) even though it does not improve the objective. Committed only when no
     // improving move exists and exploration budget remains.
     const double current_anchor_energy =
-        search_config_.classical_behavior
-            ? std::numeric_limits<double>::infinity()
-            : guidance_energy(current_guidance, anchor_state.data());
+        guidance_energy(current_guidance, anchor_state.data());
     Solution best_explore_move;
     AcceptedPlan best_explore_plan;
     double best_explore_energy = std::numeric_limits<double>::infinity();
@@ -5010,50 +4801,24 @@ Solution RoutingDecoder::scope_restricted_refine(
           scored.collected_prize = static_cast<float>(prize);
           scored.missed_penalty =
               static_cast<float>(std::max(missed_penalty, 0.0));
-          switch (problem_.objective) {
-          case Objective::MIN_DISTANCE:
-            scored.objective = scored.distance;
-            break;
-          case Objective::MAX_PRIZE:
-            scored.objective = scored.collected_prize;
-            break;
-          case Objective::MIN_DISTANCE_PLUS_PENALTY:
-            scored.objective = scored.distance + scored.missed_penalty;
-            break;
-          }
+          scored.objective = problem_.objective.report(
+              scored.distance, scored.collected_prize, scored.missed_penalty);
           const double planned_energy =
               guidance_energy(guided, anchor_state.data());
-          if (search_config_.classical_behavior) {
-            if (!better(scored, solution) || !better(scored, best_move))
-              return;
-          } else {
-            // The guided energy is evaluated with anchor-specific coupled
-            // multipliers, so it is not a global potential. Using it as the
-            // acceptance test lets moves anchored at different nodes lower each
-            // other's local energy while raising the objective, oscillating
-            // forever (SRR only ever accepts feasible moves, so the penalty
-            // terms price nothing here). Gate acceptance on the global
-            // objective -- a monotone, bounded-below potential -- exactly as
-            // the classical path does, and use the guided energy only to pick
-            // among strictly-improving moves. This keeps the field's influence
-            // on move selection while guaranteeing SRR terminates.
-            //
-            // Field-gated exploration relaxes this for a bounded budget: a move
-            // that strictly lowers the anchor guided energy but does not improve
-            // the objective is admitted as an escape candidate. Termination
-            // still holds because each such move decrements exploration_remaining
-            // and the descent reverts to the strict monotone gate at zero.
-            const bool improving_gate =
-                better(scored, solution) &&
-                planned_energy < best_guided_energy - 1.0e-12;
-            const bool explore_gate =
-                exploration_remaining > 0 &&
-                planned_energy <
-                    current_anchor_energy - search_config_.srr_exploration_margin &&
-                planned_energy < best_explore_energy;
-            if (!improving_gate && !explore_gate)
-              return;
-          }
+          // The guided energy is anchor-specific rather than a global
+          // potential. Keep the global objective as the monotone acceptance
+          // gate and use energy to select among improving moves. A bounded
+          // exploration budget may admit energy-descending uphill escapes.
+          const bool improving_gate =
+              better(scored, solution) &&
+              planned_energy < best_guided_energy - 1.0e-12;
+          const bool explore_gate =
+              exploration_remaining > 0 &&
+              planned_energy <
+                  current_anchor_energy - search_config_.srr_exploration_margin &&
+              planned_energy < best_explore_energy;
+          if (!improving_gate && !explore_gate)
+            return;
           std::vector<int32_t> trial;
           if (!materialize(trial))
             return;
@@ -5100,36 +4865,26 @@ Solution RoutingDecoder::scope_restricted_refine(
           }
           if (!candidate.feasible)
             return;
-          if (search_config_.classical_behavior) {
-            if (better(candidate, solution) && better(candidate, best_move)) {
-              best_move = std::move(candidate);
-              best_plan.valid = true;
-              best_plan.plans = plans;
-              best_plan.resources = planned_resource;
-              best_structural = {};
-            }
-          } else {
-            if (better(candidate, solution) &&
-                planned_energy < best_guided_energy - 1.0e-12) {
-              best_move = std::move(candidate);
-              best_guided_energy = planned_energy;
-              best_plan.valid = true;
-              best_plan.plans = plans;
-              best_plan.resources = planned_resource;
-              best_structural = {};
-            } else if (exploration_remaining > 0 &&
-                       planned_energy < current_anchor_energy -
-                                            search_config_.srr_exploration_margin &&
-                       planned_energy < best_explore_energy) {
-              // No strictly-improving move at this anchor: record the field's
-              // most-preferred feasible move (lowest guided energy) as a bounded
-              // uphill escape from the local optimum.
-              best_explore_move = std::move(candidate);
-              best_explore_energy = planned_energy;
-              best_explore_plan.valid = true;
-              best_explore_plan.plans = plans;
-              best_explore_plan.resources = planned_resource;
-            }
+          if (better(candidate, solution) &&
+              planned_energy < best_guided_energy - 1.0e-12) {
+            best_move = std::move(candidate);
+            best_guided_energy = planned_energy;
+            best_plan.valid = true;
+            best_plan.plans = plans;
+            best_plan.resources = planned_resource;
+            best_structural = {};
+          } else if (exploration_remaining > 0 &&
+                     planned_energy < current_anchor_energy -
+                                          search_config_.srr_exploration_margin &&
+                     planned_energy < best_explore_energy) {
+            // No strictly-improving move at this anchor: record the field's
+            // most-preferred feasible move (lowest guided energy) as a bounded
+            // uphill escape from the local optimum.
+            best_explore_move = std::move(candidate);
+            best_explore_energy = planned_energy;
+            best_explore_plan.valid = true;
+            best_explore_plan.plans = plans;
+            best_explore_plan.resources = planned_resource;
           }
         };
     const auto new_plan = [&](int32_t route) {
@@ -5994,13 +5749,14 @@ bool RoutingDecoder::better(const Solution &lhs, const Solution &rhs) const {
   if (!rhs.feasible) {
     return true;
   }
-  if (problem_.objective == Objective::MAX_PRIZE) {
-    if (std::abs(lhs.objective - rhs.objective) > FEASIBILITY_EPS) {
-      return lhs.objective > rhs.objective;
-    }
-    return lhs.distance < rhs.distance;
+  // Search always minimizes `sense * objective`; ties break toward shorter
+  // travel. For a pure-distance objective the tie-break is a no-op (objective is
+  // the distance) so this reduces to the former strict distance comparison.
+  const float sense = problem_.objective.sense;
+  if (std::abs(lhs.objective - rhs.objective) > FEASIBILITY_EPS) {
+    return sense * lhs.objective < sense * rhs.objective;
   }
-  return lhs.objective < rhs.objective;
+  return lhs.distance < rhs.distance;
 }
 
 Solution RoutingDecoder::solve(int32_t iterations, const float *edge_field,
@@ -6376,17 +6132,8 @@ Solution RoutingDecoder::evaluate(const std::vector<int32_t> &route) const {
   solution.collected_prize = collected_prize;
   solution.missed_penalty = total_penalty - served_penalty;
   solution.off_graph_edges = off_graph_edges;
-  switch (problem_.objective) {
-  case Objective::MIN_DISTANCE:
-    solution.objective = solution.distance;
-    break;
-  case Objective::MAX_PRIZE:
-    solution.objective = solution.collected_prize;
-    break;
-  case Objective::MIN_DISTANCE_PLUS_PENALTY:
-    solution.objective = solution.distance + solution.missed_penalty;
-    break;
-  }
+  solution.objective = problem_.objective.report(
+      solution.distance, solution.collected_prize, solution.missed_penalty);
   solution.feasible = std::isfinite(solution.objective);
   if (!solution.feasible)
     solution.error = "route objective is not finite";

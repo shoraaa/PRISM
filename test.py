@@ -7,9 +7,12 @@ import argparse
 import csv
 import json
 import logging
+import math
+import pickle
 import statistics
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -40,6 +43,10 @@ from train import _canonical_cost, infer_instance, setup_seeds  # noqa: E402
 from urs_one_each import solver_problem  # noqa: E402
 
 
+NATIVE_BASELINE_NAMES = ("constant", "distance", "random")
+BASELINE_NAMES = (*NATIVE_BASELINE_NAMES, "urs")
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -67,8 +74,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=0,
         help=(
-            "Field-gated SRR exploration budget (bounded uphill escapes the "
-            "learned field can take; inert for the flat fields-off baseline). "
+            "Energy-guided SRR exploration budget (bounded uphill escapes the "
+            "guidance can take; inert for the constant-energy baseline). "
             "Must match the value used at training time. 0 disables (default)."
         ),
     )
@@ -77,8 +84,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=["schema", "geometric"],
         default="geometric",
         help=(
-            "Candidate-graph construction shared by PRISM and the fields-off "
-            "baseline. 'schema' (default) admits resource candidates by the "
+            "Candidate-graph construction shared by PRISM and native controls. "
+            "'schema' admits resource candidates by the "
             "schema-derived relevance (uniform equal-share prior when no learned "
             "quota is installed); 'geometric' keeps only the distance "
             "neighborhood."
@@ -103,6 +110,43 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="customer count for generated 'evrp' zero-shot instances (default: 100)",
     )
     parser.add_argument(
+        "--tsptw-size",
+        type=int,
+        default=100,
+        help="node count for the optional CaR TSPTW evaluation (default: 100)",
+    )
+    parser.add_argument(
+        "--tsptw-hardness",
+        choices=("hard", "medium", "easy"),
+        default="hard",
+        help="CaR TSPTW instance hardness (default: hard)",
+    )
+    parser.add_argument(
+        "--tsptw-source",
+        choices=("dataset", "generator"),
+        default="dataset",
+        help=(
+            "Use CaR's saved TSPTW dataset and LKH references (default), or "
+            "generate fresh instances with CaR's generator"
+        ),
+    )
+    parser.add_argument(
+        "--tsptw-data-dir",
+        type=Path,
+        default=ROOT / "baselines" / "CaR-constraint" / "data" / "TSPTW",
+        help="directory containing CaR tsptw*_*.pkl datasets",
+    )
+    parser.add_argument(
+        "--tsptw-dataset-seed",
+        type=int,
+        default=2025,
+        help=(
+            "seed used to create a saved hard CaR TSPTW dataset; needed to "
+            "recover its generator-guaranteed feasible starting tours "
+            "(default: CaR's 2025)"
+        ),
+    )
+    parser.add_argument(
         "--static-field",
         action="store_true",
         help=(
@@ -118,25 +162,31 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--device", default="cuda:0" if torch.cuda.is_available() else "cpu"
     )
     parser.add_argument(
+        "--baselines",
         "--baseline",
-        choices=["fields-off"],
-        default="fields-off",
+        dest="baselines",
+        choices=(*BASELINE_NAMES, "none", "all"),
+        default=None,
         help=(
-            "Reference the neural field is scored against. Only 'fields-off' is"
-            " supported: the same decoder and search with the field ablated to a"
-            " flat, identical value (E = 1 on every edge), i.e. PRISM without any"
-            " field guidance."
+            "Controls to compare with PRISM: 'constant' assigns identical "
+            "energy to every candidate; 'distance' uses normalized edge "
+            "distance as energy; 'random' uses stable edge-keyed random energy "
+            "with the same SRR exploration budget; 'urs' runs the supplied URS "
+            "baseline; 'none' evaluates PRISM without running a baseline; 'all' "
+            "evaluates the three native controls and excludes URS. The default "
+            "is constant, or every baseline present in --cached when supplied."
         ),
     )
     parser.add_argument(
+        "--urs-baseline-id",
         "--urs-checkpoint",
         dest="urs_checkpoint",
         type=Path,
         default=None,
         help=(
-            "If set, also run the URS unified checkpoint (baselines/URS) on the"
-            " same instances in an isolated subprocess and report a paired"
-            " PRISM-vs-URS comparison. Point at e.g."
+            "URS checkpoint identifier required by '--baselines urs'. The "
+            "checkpoint runs on the same instances in an isolated subprocess. "
+            "Point at e.g."
             " baselines/URS/pretrained/unified_checkpoint_500.pt."
         ),
     )
@@ -173,9 +223,101 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Ignore any cached URS results and recompute (and overwrite them).",
     )
+    parser.add_argument(
+        "--cached",
+        type=Path,
+        help=(
+            "Reuse per-variant baseline objectives from a prior test.py CSV. "
+            "Rows must match variant, baseline, and --val-size; missing rows "
+            "fall back to normal baseline evaluation."
+        ),
+    )
     parser.add_argument("--csv", type=Path)
     parser.add_argument("--dataset-dir", type=Path, default=DEFAULT_DATASET_DIR)
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.baselines is None:
+        args.baselines = "cached" if args.cached is not None else "constant"
+    if (
+        args.baselines == "urs"
+        and args.urs_checkpoint is None
+        and args.cached is None
+    ):
+        parser.error("--baselines urs requires --urs-baseline-id")
+    return args
+
+
+def selected_baselines(value: str) -> tuple[str, ...]:
+    if value == "all":
+        return NATIVE_BASELINE_NAMES
+    if value == "none":
+        return ("none",)
+    if value not in BASELINE_NAMES:
+        raise ValueError(f"unknown baseline: {value}")
+    return (value,)
+
+
+def load_cached_baseline_rows(
+    path: Path,
+) -> tuple[dict[tuple[str, str, int], dict], tuple[str, ...]]:
+    """Load reusable per-variant baseline averages from a prior evaluator CSV."""
+    if not path.is_file():
+        raise FileNotFoundError(f"cached baseline CSV does not exist: {path}")
+    required = {
+        "variant",
+        "baseline",
+        "val_size",
+        "direction",
+        "baseline_objective",
+    }
+    cached: dict[tuple[str, str, int], dict] = {}
+    baseline_order: list[str] = []
+    with path.open(newline="") as source:
+        reader = csv.DictReader(source)
+        missing = required - set(reader.fieldnames or ())
+        if missing:
+            raise ValueError(
+                f"cached baseline CSV is missing columns: {', '.join(sorted(missing))}"
+            )
+        for line_number, row in enumerate(reader, start=2):
+            variant = row["variant"].strip()
+            baseline = row["baseline"].strip()
+            objective_text = row["baseline_objective"].strip()
+            # Neural-only rows intentionally contain no reusable comparator.
+            if baseline == "none" or not objective_text:
+                continue
+            if not variant or baseline not in BASELINE_NAMES:
+                raise ValueError(
+                    f"invalid cached variant/baseline on line {line_number}"
+                )
+            try:
+                val_size = int(row["val_size"])
+                objective = float(objective_text)
+            except ValueError as error:
+                raise ValueError(
+                    f"invalid cached numeric value on line {line_number}"
+                ) from error
+            direction = row["direction"].strip()
+            if val_size < 1 or not math.isfinite(objective):
+                raise ValueError(
+                    f"invalid cached baseline value on line {line_number}"
+                )
+            if direction not in {"minimize", "maximize"}:
+                raise ValueError(
+                    f"invalid cached direction on line {line_number}"
+                )
+            key = (variant, baseline, val_size)
+            if key in cached:
+                raise ValueError(
+                    "duplicate cached baseline row for "
+                    f"variant={variant}, baseline={baseline}, val_size={val_size}"
+                )
+            cached[key] = {
+                "baseline_objective": objective,
+                "direction": direction,
+            }
+            if baseline not in baseline_order:
+                baseline_order.append(baseline)
+    return cached, tuple(baseline_order)
 
 
 URS_RUNNER = ROOT / "baselines" / "URS" / "run_instances.py"
@@ -278,6 +420,8 @@ def run_urs_variant(
 # the zero-shot unseen-resource probe (battery via the resource algebra) and is
 # never in the 110 benchmarks, so it must be requested explicitly.
 GENERATED_VARIANTS = ("evrp",)
+OPTIONAL_VARIANTS = GENERATED_VARIANTS + ("tsptw",)
+CAR_ROOT = ROOT / "baselines" / "CaR-constraint"
 
 
 def selected_variants(value: str) -> list[str]:
@@ -285,9 +429,9 @@ def selected_variants(value: str) -> list[str]:
     if value == "all":
         return available
     requested = [name.strip() for name in value.split(",") if name.strip()]
-    unknown = sorted(set(requested) - set(available) - set(GENERATED_VARIANTS))
+    unknown = sorted(set(requested) - set(available) - set(OPTIONAL_VARIANTS))
     if unknown:
-        raise ValueError("unknown URS variants: " + ", ".join(unknown))
+        raise ValueError("unknown evaluator variants: " + ", ".join(unknown))
     if not requested:
         raise ValueError("--variants selected no variants")
     return requested
@@ -298,7 +442,7 @@ SEEN_VARIANTS = frozenset(BENCHMARK_VARIANTS) & frozenset(TRAIN_VARIANTS)
 
 def variant_split(name: str) -> str:
     """Match training's seen/held-out boundary over the 110 benchmarks."""
-    if name in GENERATED_VARIANTS:
+    if name in OPTIONAL_VARIANTS:
         return "heldout"
     if name not in BENCHMARK_VARIANTS:
         raise ValueError(f"unknown benchmark variant: {name}")
@@ -315,6 +459,157 @@ def _instance_data(data: dict, index: int) -> dict:
     }
 
 
+def _load_car_tsptw_rows(path: Path, count: int) -> tuple[dict, int]:
+    """Load CaR's native ``(xy, service, tw_start, tw_end)`` pickle format."""
+    if not path.is_file():
+        raise FileNotFoundError(f"CaR TSPTW dataset does not exist: {path}")
+    with path.open("rb") as source:
+        saved = pickle.load(source)
+    rows = saved[:count]
+    if len(rows) != count:
+        raise ValueError(
+            f"requested {count} TSPTW instances, but {path} contains "
+            f"only {len(rows)}"
+        )
+    if any(not isinstance(row, (tuple, list)) or len(row) != 4 for row in rows):
+        raise ValueError(f"unexpected CaR TSPTW row format in {path}")
+    return (
+        {
+            "xy": torch.tensor([row[0] for row in rows], dtype=torch.float32),
+            "service_time": torch.tensor(
+                [row[1] for row in rows], dtype=torch.float32
+            ),
+            "tw_start": torch.tensor(
+                [row[2] for row in rows], dtype=torch.float32
+            ),
+            "tw_end": torch.tensor(
+                [row[3] for row in rows], dtype=torch.float32
+            ),
+        },
+        len(saved),
+    )
+
+
+def _car_hard_feasible_routes(
+    xy: torch.Tensor,
+    *,
+    seed: int,
+    generated_count: int,
+) -> torch.Tensor:
+    """Recover the feasible permutations embedded by CaR's hard generator.
+
+    CaR samples all coordinates, then one permutation per instance and builds
+    each time-window sequence around that permutation. Replaying those two RNG
+    operations recovers the generator witness without using the LKH solutions.
+    Coordinate equality guards against applying a wrong seed or data provenance.
+    """
+    count, size, coordinate_dim = xy.shape
+    if coordinate_dim != 2 or generated_count < count:
+        raise ValueError("unexpected CaR hard TSPTW coordinate shape")
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(seed)
+        expected_xy = torch.rand(generated_count, size, 2) * 100.0
+        if not torch.equal(expected_xy[:count], xy):
+            raise ValueError(
+                "CaR hard TSPTW coordinates do not match --tsptw-dataset-seed; "
+                "pass the seed used to generate this dataset"
+            )
+        routes = []
+        customers = torch.arange(1, size, dtype=torch.long)
+        for index in range(generated_count):
+            permutation = customers[torch.randperm(size - 1)]
+            if index < count:
+                routes.append(
+                    torch.cat((torch.zeros(1, dtype=torch.long), permutation))
+                )
+    return torch.stack(routes)
+
+
+def _load_car_tsptw_reference(path: Path, count: int) -> float | None:
+    """Average the paired CaR LKH costs when the reference file is available."""
+    if not path.is_file():
+        return None
+    with path.open("rb") as source:
+        rows = pickle.load(source)[:count]
+    if len(rows) != count:
+        raise ValueError(
+            f"requested {count} TSPTW references, but {path} contains "
+            f"only {len(rows)}"
+        )
+    costs = [row[0] if isinstance(row, (tuple, list)) else row for row in rows]
+    values = torch.tensor(costs, dtype=torch.float64)
+    if not torch.isfinite(values).all():
+        raise ValueError(f"non-finite TSPTW reference in {path}")
+    return float(values.mean())
+
+
+def load_car_tsptw_data(
+    data_dir: Path,
+    size: int,
+    hardness: str,
+    count: int,
+    dataset_seed: int = 2025,
+) -> tuple[dict, float | None]:
+    """Load paired instances/references distributed by CaR-constraint."""
+    stem = f"tsptw{size}_{hardness}.pkl"
+    data, saved_count = _load_car_tsptw_rows(data_dir / stem, count)
+    if hardness == "hard":
+        data["initial_route"] = _car_hard_feasible_routes(
+            data["xy"], seed=dataset_seed, generated_count=saved_count
+        )
+    reference = _load_car_tsptw_reference(data_dir / f"lkh_{stem}", count)
+    return data, reference
+
+
+def generate_car_tsptw_data(
+    size: int,
+    hardness: str,
+    count: int,
+    seed: int,
+) -> dict:
+    """Generate fresh data through CaR's own TSPTW generator entry point."""
+    script = CAR_ROOT / "generate_data.py"
+    if not script.is_file():
+        raise FileNotFoundError(f"CaR TSPTW generator does not exist: {script}")
+    with tempfile.TemporaryDirectory(prefix="prism-car-tsptw-") as temporary:
+        output_root = Path(temporary)
+        command = [
+            sys.executable,
+            str(script),
+            "--problem",
+            "TSPTW",
+            "--problem_size",
+            str(size),
+            "--pomo_size",
+            str(size),
+            "--hardness",
+            hardness,
+            "--num_samples",
+            str(count),
+            "--seed",
+            str(seed),
+            "--dir",
+            str(output_root),
+            "--no_cuda",
+        ]
+        result = subprocess.run(
+            command,
+            cwd=CAR_ROOT,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            detail = result.stderr.strip() or result.stdout.strip()
+            raise RuntimeError(f"CaR TSPTW generator failed: {detail}")
+        path = output_root / "TSPTW" / f"tsptw{size}_{hardness}.pkl"
+        data, _ = _load_car_tsptw_rows(path, count)
+        if hardness == "hard":
+            data["initial_route"] = _car_hard_feasible_routes(
+                data["xy"], seed=seed, generated_count=count
+            )
+        return data
+
+
 def _gap_percent(direction: str, objective: float, reference: float) -> float:
     denominator = max(abs(reference), 1e-9)
     if direction == "maximize":
@@ -327,31 +622,49 @@ def _split_summary(
     variants: list[str],
     rows: list[dict],
     failures: list[dict],
+    baseline: str = "constant",
 ) -> dict:
     selected = {name for name in variants if variant_split(name) == split}
-    split_rows = [row for row in rows if row["variant"] in selected]
-    split_failures = [item for item in failures if item["variant"] in selected]
+    split_rows = [
+        row
+        for row in rows
+        if row["variant"] in selected
+        and row.get("baseline", "constant") == baseline
+    ]
+    split_failures = [
+        item
+        for item in failures
+        if item["variant"] in selected
+        and item.get("baseline", "constant") == baseline
+    ]
     referenced = [row for row in split_rows if row["reference"] != ""]
     summary = {
         "split": split,
+        "baseline": baseline,
         "variants": len(selected),
         "passed": len(split_rows),
         "failed": len(split_failures),
-        "neural_wins": sum(row["winner"] == "neural" for row in split_rows),
-        "ties": sum(row["winner"] == "tie" for row in split_rows),
-        "baseline_wins": sum(
-            row["winner"] == "baseline" for row in split_rows
-        ),
         "reference_variants": len(referenced),
     }
-    if split_rows:
+    if baseline != "none":
+        summary.update(
+            neural_wins=sum(
+                row["winner"] == "neural" for row in split_rows
+            ),
+            ties=sum(row["winner"] == "tie" for row in split_rows),
+            baseline_wins=sum(
+                row["winner"] == "baseline" for row in split_rows
+            ),
+        )
+    if split_rows and baseline != "none":
         improvements = [row["neural_improvement_pct"] for row in split_rows]
         summary["neural_improvement_mean"] = statistics.fmean(improvements)
         summary["neural_improvement_median"] = statistics.median(improvements)
     if referenced:
-        summary["baseline_gap_mean"] = statistics.fmean(
-            row["baseline_gap_pct"] for row in referenced
-        )
+        if baseline != "none":
+            summary["baseline_gap_mean"] = statistics.fmean(
+                row["baseline_gap_pct"] for row in referenced
+            )
         summary["neural_gap_mean"] = statistics.fmean(
             row["neural_gap_pct"] for row in referenced
         )
@@ -362,13 +675,19 @@ def _print_split_summary(summary: dict) -> None:
     fields = [
         "SPLIT_RESULTS",
         f"split={summary['split'].upper()}",
+        f"baseline={summary['baseline']}",
         f"variants={summary['variants']}",
         f"passed={summary['passed']}",
         f"failed={summary['failed']}",
-        f"neural_wins={summary['neural_wins']}",
-        f"ties={summary['ties']}",
-        f"baseline_wins={summary['baseline_wins']}",
     ]
+    if summary["baseline"] != "none":
+        fields.extend(
+            (
+                f"neural_wins={summary['neural_wins']}",
+                f"ties={summary['ties']}",
+                f"baseline_wins={summary['baseline_wins']}",
+            )
+        )
     if "neural_improvement_mean" in summary:
         fields.extend(
             (
@@ -380,13 +699,20 @@ def _print_split_summary(summary: dict) -> None:
         )
     print(*fields)
     if summary["reference_variants"]:
-        print(
+        reference_fields = [
             "SPLIT_REFERENCE_GAPS",
             f"split={summary['split'].upper()}",
+            f"baseline={summary['baseline']}",
             f"n={summary['reference_variants']}",
-            f"baseline_mean={summary['baseline_gap_mean']:.3f}%",
-            f"neural_mean={summary['neural_gap_mean']:.3f}%",
+        ]
+        if summary["baseline"] != "none":
+            reference_fields.append(
+                f"baseline_mean={summary['baseline_gap_mean']:.3f}%"
+            )
+        reference_fields.append(
+            f"neural_mean={summary['neural_gap_mean']:.3f}%"
         )
+        print(*reference_fields)
 
 
 def main() -> int:
@@ -404,7 +730,7 @@ def main() -> int:
     )
     if checkpoint.get("model_schema") != MODEL_SCHEMA:
         raise RuntimeError(
-            "checkpoint is not a typed-resource v5 scale-equivariant-energy checkpoint"
+            f"checkpoint schema does not match {MODEL_SCHEMA}"
         )
     model = ConstraintFieldNet().to(args.device)
     load_constraint_field_state_dict(model, checkpoint["model_state_dict"])
@@ -412,20 +738,52 @@ def main() -> int:
 
     finder = DatasetFinder(args.dataset_dir)
     variants = selected_variants(args.variants)
+    cached_rows: dict[tuple[str, str, int], dict] = {}
+    cached_baseline_names: tuple[str, ...] = ()
+    if args.cached is not None:
+        cached_rows, cached_baseline_names = load_cached_baseline_rows(
+            args.cached
+        )
+    if args.baselines == "cached":
+        baselines = tuple(
+            baseline
+            for baseline in cached_baseline_names
+            if any(
+                key_baseline == baseline and val_size == args.val_size
+                for _, key_baseline, val_size in cached_rows
+            )
+        )
+        if not baselines:
+            raise ValueError(
+                f"{args.cached} has no baseline rows for --val-size {args.val_size}"
+            )
+    else:
+        baselines = selected_baselines(args.baselines)
+    native_baselines = tuple(
+        baseline for baseline in baselines
+        if baseline in NATIVE_BASELINE_NAMES
+    )
+    include_urs = "urs" in baselines
     urs_cache = (
-        load_urs_cache(args.urs_cache) if args.urs_checkpoint is not None else {}
+        load_urs_cache(args.urs_cache) if include_urs else {}
     )
     rows: list[dict] = []
     failures: list[dict] = []
+    cached_baseline_hits = 0
     started = time.perf_counter()
 
     for index, name in enumerate(variants):
         test_started = time.perf_counter()
+        cached_for_variant = {
+            baseline: cached_rows[(name, baseline, args.val_size)]
+            for baseline in baselines
+            if (name, baseline, args.val_size) in cached_rows
+        }
         try:
             if name in GENERATED_VARIANTS:
                 # Zero-shot unseen-resource probe: no saved dataset and no
                 # reference oracle yet, so score PRISM's learned field only
-                # against the fields-off baseline on the same generated
+                # against the selected native controls on the same generated
                 # instances (feasibility is guaranteed by the exact decoder).
                 data = generate_evrp_data(
                     args.evrp_size, args.val_size, seed=args.seed
@@ -433,6 +791,42 @@ def main() -> int:
                 reference = None
                 has_reference = False
                 urs_result = None
+            elif name == "tsptw":
+                # External single-tour time-window probe. It is intentionally
+                # absent from the 110-variant registry and training curriculum.
+                if args.tsptw_source == "dataset":
+                    data, reference = load_car_tsptw_data(
+                        args.tsptw_data_dir,
+                        args.tsptw_size,
+                        args.tsptw_hardness,
+                        args.val_size,
+                        args.tsptw_dataset_seed,
+                    )
+                else:
+                    data = generate_car_tsptw_data(
+                        args.tsptw_size,
+                        args.tsptw_hardness,
+                        args.val_size,
+                        args.seed,
+                    )
+                    reference = None
+                has_reference = reference is not None
+                # URS does not expose this external dataset through its runner.
+                urs_result = None
+                print(
+                    "TSPTW_DATA",
+                    f"source={args.tsptw_source}",
+                    f"size={args.tsptw_size}",
+                    f"hardness={args.tsptw_hardness}",
+                    "bootstrap="
+                    + (
+                        "car_generator_witness"
+                        if "initial_route" in data
+                        else "field_construction"
+                    ),
+                    "reference=" + ("lkh" if has_reference else "none"),
+                    flush=True,
+                )
             else:
                 paths = finder.get(name, 100)
                 data, reference = load_saved_data(
@@ -443,21 +837,29 @@ def main() -> int:
                     allow_aggregate_reference=False,
                 )
                 has_reference = reference is not None
+                if (
+                    include_urs
+                    and "urs" not in cached_for_variant
+                    and args.urs_checkpoint is None
+                ):
+                    raise RuntimeError(
+                        f"URS cache miss for {name}; supply --urs-baseline-id"
+                    )
                 urs_result = (
                     run_urs_variant(
                         name, paths["data_path"], args.val_size, args, urs_cache
                     )
-                    if args.urs_checkpoint is not None
+                    if include_urs and "urs" not in cached_for_variant
                     else None
                 )
-            baseline_objectives = []
             neural_objectives = []
-            baseline_costs = []
             neural_costs = []
+            baseline_objectives = {baseline: [] for baseline in baselines}
+            baseline_costs = {baseline: [] for baseline in baselines}
+            baseline_seconds = {baseline: 0.0 for baseline in baselines}
             neural_net_evals = []
             neural_model_seconds = 0.0
             neural_decoder_seconds = 0.0
-            baseline_seconds = 0.0
             neural_seconds = 0.0
             direction = ""
 
@@ -465,6 +867,11 @@ def main() -> int:
                 problem = solver_problem(
                     name, _instance_data(data, instance_index)
                 )
+                initial_route = data.get("initial_route")
+                if torch.is_tensor(initial_route):
+                    initial_route = (
+                        initial_route[instance_index].detach().cpu().numpy()
+                    )
                 decoder_args = SimpleNamespace(
                     candidates=args.candidates,
                     n_rollouts=args.rollouts,
@@ -479,42 +886,89 @@ def main() -> int:
                     srr_exploration_budget=args.srr_exploration_budget,
                 )
 
-                baseline_started = time.perf_counter()
-                _, baseline, _ = infer_instance(None, problem, decoder_args)
-                baseline_seconds += time.perf_counter() - baseline_started
                 neural_started = time.perf_counter()
                 _, neural, neural_metrics = infer_instance(
-                    model, problem, decoder_args
+                    model, problem, decoder_args, initial_route=initial_route
                 )
                 neural_seconds += time.perf_counter() - neural_started
-                if not baseline["feasible"] or not neural["feasible"]:
+                if not neural["feasible"]:
                     raise RuntimeError(
-                        f"instance {instance_index} returned an infeasible solution"
+                        f"instance {instance_index} returned an infeasible neural solution"
                     )
-                if baseline["direction"] != neural["direction"]:
-                    raise RuntimeError("decoders returned different directions")
-
                 direction = neural["direction"]
-                baseline_objectives.append(float(baseline["objective"]))
                 neural_objectives.append(float(neural["objective"]))
-                baseline_costs.append(_canonical_cost(baseline))
                 neural_costs.append(_canonical_cost(neural))
                 neural_net_evals.append(neural_metrics["net_evals"])
                 neural_model_seconds += neural_metrics["time_neural"]
                 neural_decoder_seconds += neural_metrics["time_decoder"]
 
-            baseline_objective = statistics.fmean(baseline_objectives)
+                for baseline_name in native_baselines:
+                    if baseline_name in cached_for_variant:
+                        continue
+                    baseline_started = time.perf_counter()
+                    _, baseline_solution, _ = infer_instance(
+                        None,
+                        problem,
+                        decoder_args,
+                        initial_route=initial_route,
+                        baseline=baseline_name,
+                    )
+                    baseline_seconds[baseline_name] += (
+                        time.perf_counter() - baseline_started
+                    )
+                    if not baseline_solution["feasible"]:
+                        raise RuntimeError(
+                            f"instance {instance_index} returned an infeasible "
+                            f"{baseline_name} baseline solution"
+                        )
+                    if baseline_solution["direction"] != direction:
+                        raise RuntimeError(
+                            f"{baseline_name} baseline returned a different direction"
+                        )
+                    baseline_objectives[baseline_name].append(
+                        float(baseline_solution["objective"])
+                    )
+                    baseline_costs[baseline_name].append(
+                        _canonical_cost(baseline_solution)
+                    )
+
+            for baseline_name, cached_row in cached_for_variant.items():
+                if cached_row["direction"] != direction:
+                    raise RuntimeError(
+                        f"cached {baseline_name} baseline returned a different "
+                        f"direction for {name}"
+                    )
+                cached_objective = float(cached_row["baseline_objective"])
+                baseline_objectives[baseline_name] = [cached_objective]
+                baseline_costs[baseline_name] = [
+                    -cached_objective
+                    if direction == "maximize"
+                    else cached_objective
+                ]
+                cached_baseline_hits += 1
+
+            if include_urs:
+                if baseline_objectives["urs"]:
+                    pass
+                elif urs_result is None:
+                    raise RuntimeError(
+                        f"URS does not provide a cached result for variant {name}; "
+                        "supply --urs-baseline-id to evaluate the missing row"
+                    )
+                elif urs_result["direction"] != direction:
+                    raise RuntimeError("URS returned a different direction")
+                else:
+                    urs_values = [
+                        float(value) for value in urs_result["objectives"]
+                    ]
+                    baseline_objectives["urs"] = urs_values
+                    baseline_costs["urs"] = [
+                        -value if direction == "maximize" else value
+                        for value in urs_values
+                    ]
+
             neural_objective = statistics.fmean(neural_objectives)
-            baseline_cost = statistics.fmean(baseline_costs)
             neural_cost = statistics.fmean(neural_costs)
-            tolerance = 1e-6 * max(abs(baseline_cost), abs(neural_cost), 1.0)
-            outcome = (
-                "neural"
-                if neural_cost < baseline_cost - tolerance
-                else "baseline"
-                if baseline_cost < neural_cost - tolerance
-                else "tie"
-            )
 
             # Paired PRISM-vs-URS comparison over the same instances (dataset
             # order). URS is only compared when it covers the variant and agrees
@@ -552,21 +1006,67 @@ def main() -> int:
                     if _better(urs_objective, neural_objective)
                     else "tie"
                 )
-            rows.append(
-                {
+            neural_gap: float | str = (
+                _gap_percent(direction, neural_objective, reference)
+                if has_reference
+                else ""
+            )
+            result_reports = [
+                f"prism(objective={neural_objective:.6g},"
+                "gap="
+                + (f"{neural_gap:.3f}%" if neural_gap != "" else "n/a")
+                + ")"
+            ]
+            for baseline_name in baselines:
+                baseline_objective: float | str = ""
+                baseline_gap: float | str = ""
+                outcome = ""
+                neural_improvement: float | str = ""
+                if baseline_name != "none":
+                    baseline_objective = statistics.fmean(
+                        baseline_objectives[baseline_name]
+                    )
+                    baseline_cost = statistics.fmean(
+                        baseline_costs[baseline_name]
+                    )
+                    tolerance = 1e-6 * max(
+                        abs(baseline_cost), abs(neural_cost), 1.0
+                    )
+                    outcome = (
+                        "neural"
+                        if neural_cost < baseline_cost - tolerance
+                        else "baseline"
+                        if baseline_cost < neural_cost - tolerance
+                        else "tie"
+                    )
+                    baseline_gap = (
+                        _gap_percent(
+                            direction, baseline_objective, reference
+                        )
+                        if has_reference
+                        else ""
+                    )
+                    neural_improvement = -_gap_percent(
+                        direction, neural_objective, baseline_objective
+                    )
+                row = {
                     "variant": name,
                     "split": variant_split(name),
+                    "baseline": baseline_name,
+                    "baseline_source": (
+                        "none"
+                        if baseline_name == "none"
+                        else "cached"
+                        if baseline_name in cached_for_variant
+                        else "evaluated"
+                    ),
                     "val_size": args.val_size,
                     "field_mode": "static" if args.static_field else "dynamic",
                     "direction": direction,
                     "reference": reference if has_reference else "",
                     "baseline_objective": baseline_objective,
                     "neural_objective": neural_objective,
-                    "baseline_gap_pct": (
-                        _gap_percent(direction, baseline_objective, reference)
-                        if has_reference
-                        else ""
-                    ),
+                    "baseline_gap_pct": baseline_gap,
                     "neural_gap_pct": (
                         _gap_percent(direction, neural_objective, reference)
                         if has_reference
@@ -579,10 +1079,8 @@ def main() -> int:
                     "neural_beats_urs": neural_beats_urs,
                     "urs_neural_ties": urs_neural_ties,
                     "urs_beats_neural": urs_beats_neural,
-                    "neural_improvement_pct": -_gap_percent(
-                        direction, neural_objective, baseline_objective
-                    ),
-                    "baseline_seconds": baseline_seconds,
+                    "neural_improvement_pct": neural_improvement,
+                    "baseline_seconds": baseline_seconds[baseline_name],
                     "neural_seconds": neural_seconds,
                     "neural_net_evals_mean": statistics.fmean(
                         neural_net_evals
@@ -591,93 +1089,129 @@ def main() -> int:
                     "neural_model_seconds": neural_model_seconds,
                     "neural_decoder_seconds": neural_decoder_seconds,
                 }
-            )
-            baseline_gap = rows[-1]["baseline_gap_pct"]
-            neural_gap = rows[-1]["neural_gap_pct"]
+                rows.append(row)
+                if baseline_name != "none":
+                    source = (
+                        "cached"
+                        if baseline_name in cached_for_variant
+                        else "evaluated"
+                    )
+                    result_reports.append(
+                        f"{baseline_name}[{source}]"
+                        f"(objective={baseline_objective:.6g},"
+                        "gap="
+                        + (
+                            f"{baseline_gap:.3f}%"
+                            if baseline_gap != ""
+                            else "n/a"
+                        )
+                        + ")"
+                    )
             print(
                 "TEST",
                 f"{index + 1}/{len(variants)}",
                 f"variant={name}",
-                "status=PASS",
-                f"split={rows[-1]['split'].upper()}",
-                f"val_size={args.val_size}",
-                f"field_mode={rows[-1]['field_mode']}",
-                f"winner={outcome}",
-                f"baseline_mean={baseline_objective:.6g}",
-                f"neural_mean={neural_objective:.6g}",
-                "baseline_gap="
-                + (
-                    f"{baseline_gap:.3f}%"
-                    if baseline_gap != ""
-                    else "n/a"
-                ),
-                "neural_gap="
-                + (f"{neural_gap:.3f}%" if neural_gap != "" else "n/a"),
-                *(
-                    (
-                        f"urs_mean={urs_objective:.6g}",
-                        "urs_gap="
-                        + (f"{urs_gap:.3f}%" if urs_gap != "" else "n/a"),
-                        f"neural_vs_urs={neural_vs_urs}",
-                        f"neural_beats_urs={neural_beats_urs}/{args.val_size}",
-                        f"urs_cached={'yes' if urs_result.get('cached') else 'no'}",
-                    )
-                    if urs_result is not None and neural_vs_urs != ""
-                    else ()
-                ),
-                f"net_evals_mean={rows[-1]['neural_net_evals_mean']:.3f}",
-                f"seconds={time.perf_counter() - test_started:.3f}",
+                f"results=[{'; '.join(result_reports)}]",
                 flush=True,
             )
         except Exception as error:
             detail = f"{type(error).__name__}: {error}"
-            failures.append(
-                {
-                    "variant": name,
-                    "split": variant_split(name),
-                    "error": detail,
-                }
-            )
+            for baseline_name in baselines:
+                failures.append(
+                    {
+                        "variant": name,
+                        "split": variant_split(name),
+                        "baseline": baseline_name,
+                        "error": detail,
+                    }
+                )
             print(
                 "TEST",
                 f"{index + 1}/{len(variants)}",
                 f"variant={name}",
                 "status=FAIL",
                 f"split={variant_split(name).upper()}",
+                f"baselines=[{'; '.join(baselines)}]",
                 f"error={detail}",
                 f"seconds={time.perf_counter() - test_started:.3f}",
                 flush=True,
             )
 
-    referenced = [row for row in rows if row["reference"] != ""]
-    print(
-        "DECODER_COMPARE",
-        f"checkpoint={args.checkpoint}",
-        f"checkpoint_epoch={checkpoint.get('epoch', 'unknown')}",
-        f"val_size={args.val_size}",
-        f"field_mode={'static' if args.static_field else 'dynamic'}",
-        f"variants={len(variants)}",
-        f"passed={len(rows)}",
-        f"failed={len(failures)}",
-        f"neural_wins={sum(row['winner'] == 'neural' for row in rows)}",
-        f"ties={sum(row['winner'] == 'tie' for row in rows)}",
-        f"baseline_wins={sum(row['winner'] == 'baseline' for row in rows)}",
-        f"seconds={time.perf_counter() - started:.3f}",
-    )
-    if referenced:
+    if args.cached is not None:
         print(
-            "REFERENCE_GAPS",
-            f"n={len(referenced)}",
-            "baseline_mean="
-            f"{statistics.fmean(row['baseline_gap_pct'] for row in referenced):.3f}%",
-            "neural_mean="
-            f"{statistics.fmean(row['neural_gap_pct'] for row in referenced):.3f}%",
-            "baseline_median="
-            f"{statistics.median(row['baseline_gap_pct'] for row in referenced):.3f}%",
-            "neural_median="
-            f"{statistics.median(row['neural_gap_pct'] for row in referenced):.3f}%",
+            "CACHED_BASELINES",
+            f"path={args.cached}",
+            f"rows={len(cached_rows)}",
+            f"hits={cached_baseline_hits}",
         )
-    urs_rows = [row for row in rows if row.get("neural_vs_urs")]
+
+    for baseline_name in baselines:
+        baseline_rows = [
+            row for row in rows if row["baseline"] == baseline_name
+        ]
+        baseline_failures = [
+            failure
+            for failure in failures
+            if failure["baseline"] == baseline_name
+        ]
+        referenced = [
+            row for row in baseline_rows if row["reference"] != ""
+        ]
+        comparison_fields = [
+            "DECODER_COMPARE",
+            f"checkpoint={args.checkpoint}",
+            f"checkpoint_epoch={checkpoint.get('epoch', 'unknown')}",
+            f"baseline={baseline_name}",
+            f"val_size={args.val_size}",
+            f"field_mode={'static' if args.static_field else 'dynamic'}",
+            f"variants={len(variants)}",
+            f"passed={len(baseline_rows)}",
+            f"failed={len(baseline_failures)}",
+            f"seconds={time.perf_counter() - started:.3f}",
+        ]
+        if baseline_name != "none":
+            comparison_fields.extend(
+                (
+                    "neural_wins="
+                    f"{sum(row['winner'] == 'neural' for row in baseline_rows)}",
+                    f"ties={sum(row['winner'] == 'tie' for row in baseline_rows)}",
+                    "baseline_wins="
+                    f"{sum(row['winner'] == 'baseline' for row in baseline_rows)}",
+                )
+            )
+        print(*comparison_fields)
+        if referenced:
+            reference_fields = [
+                "REFERENCE_GAPS",
+                f"baseline={baseline_name}",
+                f"n={len(referenced)}",
+            ]
+            if baseline_name != "none":
+                reference_fields.extend(
+                    (
+                        "baseline_mean="
+                        f"{statistics.fmean(row['baseline_gap_pct'] for row in referenced):.3f}%",
+                        "baseline_median="
+                        f"{statistics.median(row['baseline_gap_pct'] for row in referenced):.3f}%",
+                    )
+                )
+            reference_fields.extend(
+                (
+                    "neural_mean="
+                    f"{statistics.fmean(row['neural_gap_pct'] for row in referenced):.3f}%",
+                    "neural_median="
+                    f"{statistics.median(row['neural_gap_pct'] for row in referenced):.3f}%",
+                )
+            )
+            print(*reference_fields)
+
+    # Neural-vs-URS is independent of the native control. Keep one row per
+    # variant when all controls are requested.
+    urs_rows = [
+        row
+        for row in rows
+        if row["baseline"] == baselines[0] and row.get("neural_vs_urs")
+    ]
     if urs_rows:
         urs_referenced = [row for row in urs_rows if row["urs_gap_pct"] != ""]
         instance_neural_wins = sum(row["neural_beats_urs"] for row in urs_rows)
@@ -712,10 +1246,20 @@ def main() -> int:
                 "urs_median="
                 f"{statistics.median(row['urs_gap_pct'] for row in urs_referenced):.3f}%",
             )
-    for split in ("seen", "heldout"):
-        _print_split_summary(_split_summary(split, variants, rows, failures))
+    for baseline_name in baselines:
+        for split in ("seen", "heldout"):
+            _print_split_summary(
+                _split_summary(
+                    split, variants, rows, failures, baseline=baseline_name
+                )
+            )
     for failure in failures:
-        print("FAIL", failure["variant"], failure["error"])
+        print(
+            "FAIL",
+            failure["variant"],
+            f"baseline={failure['baseline']}",
+            failure["error"],
+        )
 
     if args.csv:
         if not rows:

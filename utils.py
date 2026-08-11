@@ -166,6 +166,13 @@ class Logger:
         }
         values.update(
             {
+                f"val_summary/{name}": float(value)
+                for name, value in metrics.items()
+                if name.startswith("group_cost/")
+            }
+        )
+        values.update(
+            {
                 f"val/{key}": float(value)
                 for key, value in validation_metrics_for_wandb(metrics).items()
             }

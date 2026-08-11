@@ -21,8 +21,58 @@ INCUMBENT_EDGE_FEATURE_START = 8
 INCUMBENT_EDGE_FEATURE_END = 10
 
 
-OBJECTIVE_TYPES = ("distance", "prize", "distance_plus_penalty")
-MODEL_SCHEMA = "typed_resource_v5_scale_equivariant_energy"
+# The objective is conditioned on its declared coefficient algebra, not a
+# categorical type. Every objective is a signed linear combination over
+# (total travel, prize on visited nodes, penalty on unvisited nodes); the
+# encoder maps the five declared coefficients to a unit-interval vector so a
+# single shared head learns per-primitive corrections that transfer across
+# objectives (the well-trained distance primitive reaches prize/penalty
+# objectives) and generalize to any future coefficient vector.
+OBJECTIVE_COEFF_KEYS = (
+    "distance_coeff",
+    "visit_coeff",
+    "miss_coeff",
+    "distance_regularizer",
+    "sense",
+)
+# 3 signed coeffs -> (magnitude, sign) each, plus regularizer magnitude and a
+# sense sign bit.
+OBJECTIVE_COEFF_DIM = 8
+# Small non-zero init for the residual head's final layer so its hidden
+# coefficient-conditioning layer is not gradient-starved (a zero-init output
+# layer sends zero gradient to the layer below it).
+OBJECTIVE_RESIDUAL_HEAD_INIT_STD = 0.1
+MODEL_SCHEMA = "typed_resource_v6_objective_coeff_algebra"
+
+
+def _squash_magnitude(value: float) -> float:
+    magnitude = abs(float(value))
+    return magnitude / (1.0 + magnitude)
+
+
+def _sign_bit(value: float) -> float:
+    value = float(value)
+    return 0.5 * (1.0 + (1.0 if value > 0.0 else (-1.0 if value < 0.0 else 0.0)))
+
+
+def encode_objective_coeffs(coeffs: dict, device="cpu") -> torch.Tensor:
+    """Map the declared objective coefficient triple to a [1, OBJECTIVE_COEFF_DIM]
+    unit-interval descriptor. Signed coefficients become (squashed magnitude,
+    sign) pairs so the encoding is bounded, sign-aware, and general to unseen
+    coefficient values."""
+    distance = float(coeffs.get("distance_coeff", 1.0))
+    visit = float(coeffs.get("visit_coeff", 0.0))
+    miss = float(coeffs.get("miss_coeff", 0.0))
+    regularizer = float(coeffs.get("distance_regularizer", 0.0))
+    sense = float(coeffs.get("sense", 1.0))
+    values = [
+        _squash_magnitude(distance), _sign_bit(distance),
+        _squash_magnitude(visit), _sign_bit(visit),
+        _squash_magnitude(miss), _sign_bit(miss),
+        _squash_magnitude(regularizer),
+        _sign_bit(sense),
+    ]
+    return torch.tensor([values], dtype=torch.float32, device=device)
 # Canonical constraint order for schema conditioning of the refiner; mirrors the
 # native CONSTRAINT_KERNEL registry so a multi-hot indexes constraints stably.
 CONSTRAINT_VOCAB = (
@@ -110,8 +160,9 @@ def build_decoder_data(decoder, device="cpu"):
         dtype=torch.float32,
         device=device,
     )
-    objective_type = torch.zeros(1, len(OBJECTIVE_TYPES), device=device)
-    objective_type[0, OBJECTIVE_TYPES.index(decoder.metadata["objective"])] = 1.0
+    objective_coeffs = encode_objective_coeffs(
+        decoder.metadata["objective_coeffs"], device=device
+    )
     objective_scale = torch.tensor(
         [[float(decoder.metadata["objective_scale"])]],
         dtype=torch.float32,
@@ -200,7 +251,7 @@ def build_decoder_data(decoder, device="cpu"):
         edge_attr=edge_attr,
         active_channels=active_channels,
         open_route=open_route,
-        objective_type=objective_type,
+        objective_coeffs=objective_coeffs,
         objective_scale=objective_scale,
         objective_energy_scale=objective_energy_scale,
         multi_route=multi_route,
@@ -359,7 +410,7 @@ class ConstraintFieldNet(nn.Module):
         # graph context. No resource name or registry position reaches the
         # token encoder, so the same weights apply to appended schema rows.
         descriptor_size = (
-            RESOURCE_DESCRIPTOR_DIM + 4 + len(OBJECTIVE_TYPES) + 1 + 2
+            RESOURCE_DESCRIPTOR_DIM + 4 + OBJECTIVE_COEFF_DIM + 1 + 2
         )
         self.resource_encoder = nn.Sequential(
             nn.Linear(descriptor_size, units),
@@ -397,11 +448,20 @@ class ConstraintFieldNet(nn.Module):
         # used directly: one shared signed logit caused severe negative transfer
         # between distance and prize objectives.
         self.edge_logit_head = nn.Linear(units, 1)
-        # Keep this final in module registration order. Each objective family
-        # gets its own signed, dimensionless correction to normalized objective
-        # energy while resource fields continue to handle constraints.
-        self.objective_energy_residual_head = nn.Linear(
-            units, len(OBJECTIVE_TYPES)
+        # Keep this final in module registration order. A single shared head
+        # conditioned on the declared objective coefficient vector produces the
+        # signed, dimensionless correction to normalized objective energy. The
+        # coefficients modulate a per-edge correction nonlinearly (a plain linear
+        # head would push their contribution into a per-row constant that the
+        # downstream row-centering removes), so the distance primitive's learned
+        # correction is shared across every objective while prize/penalty
+        # objectives still specialize via their coefficients -- avoiding the
+        # negative transfer of a single unconditioned logit and the cold
+        # per-type columns of a one-hot head.
+        self.objective_energy_residual_head = nn.Sequential(
+            nn.Linear(units + OBJECTIVE_COEFF_DIM, units),
+            nn.SiLU(),
+            nn.Linear(units, 1),
         )
         # Schema-conditioned advantage scale g_phi(schema): a detached, learned
         # RELATIVE multiplier on the batch-pooled advantage scale. It reads the
@@ -429,8 +489,15 @@ class ConstraintFieldNet(nn.Module):
         # when upgrading an older typed-resource checkpoint.
         nn.init.zeros_(self.edge_logit_head.weight)
         nn.init.zeros_(self.edge_logit_head.bias)
-        nn.init.zeros_(self.objective_energy_residual_head.weight)
-        nn.init.zeros_(self.objective_energy_residual_head.bias)
+        # Small non-zero init on the final layer so the hidden (coefficient-
+        # conditioning) layer receives gradient from step 0. Bias stays zero so a
+        # row-constant output remains neutral after row-centering; the residual
+        # starts small and is bounded by row-center + tanh + --objective-residual-l2.
+        nn.init.normal_(
+            self.objective_energy_residual_head[-1].weight,
+            std=OBJECTIVE_RESIDUAL_HEAD_INIT_STD,
+        )
+        nn.init.zeros_(self.objective_energy_residual_head[-1].bias)
         nn.init.zeros_(self.feasibility_head.weight)
         # A fresh model must reproduce the plain-objective (E = c(e)) neutral
         # search -- the initial policy from which the field is learned, not the
@@ -581,13 +648,15 @@ class ConstraintFieldNet(nn.Module):
         open_route = _per_graph_descriptor(
             pyg, "open_route", 1, batch_size, active
         )
-        objective_type = _per_graph_descriptor(
+        objective_coeffs = _per_graph_descriptor(
             pyg,
-            "objective_type",
-            len(OBJECTIVE_TYPES),
+            "objective_coeffs",
+            OBJECTIVE_COEFF_DIM,
             batch_size,
             active,
-            default=[1.0] + [0.0] * (len(OBJECTIVE_TYPES) - 1),
+            # Neutral default = the pure-distance objective (coeff (1, 0, 0),
+            # sense +1) encoded through encode_objective_coeffs.
+            default=[0.5, 1.0, 0.0, 0.5, 0.0, 0.5, 0.0, 1.0],
         )
         objective_scale = _per_graph_descriptor(
             pyg, "objective_scale", 1, batch_size, active
@@ -641,7 +710,7 @@ class ConstraintFieldNet(nn.Module):
                 resource_mean.unsqueeze(-1),
                 resource_max.unsqueeze(-1),
                 _broadcast(open_route),
-                _broadcast(objective_type),
+                _broadcast(objective_coeffs),
                 _broadcast(objective_scale),
                 _broadcast(multi_route),
                 _broadcast(depot_scale),
@@ -673,17 +742,16 @@ class ConstraintFieldNet(nn.Module):
             objective_projected_edges,
             (objective_projected_edges.shape[-1],),
         )
-        raw_objective_residuals = self.objective_energy_residual_head(
-            objective_edge_state
-        )
-        edge_objective_type = (
-            objective_type[edge_batch]
+        # Condition the shared head on the declared objective coefficients so a
+        # single set of weights specializes per objective without siloing.
+        edge_objective_coeffs = (
+            objective_coeffs[edge_batch]
             if batched
-            else objective_type[0].expand(edge_count, -1)
+            else objective_coeffs[0].expand(edge_count, -1)
         )
-        raw_objective_residual = (
-            raw_objective_residuals * edge_objective_type
-        ).sum(dim=1)
+        raw_objective_residual = self.objective_energy_residual_head(
+            torch.cat((objective_edge_state, edge_objective_coeffs), dim=-1)
+        ).squeeze(-1)
         # Only differences within an outgoing candidate row affect policy.
         # Center before bounding so a row-constant head output is exactly
         # neutral. The result is a dimensionless correction because the native
@@ -1527,10 +1595,6 @@ def load_constraint_field_state_dict(
         )
     for prefix, head in (
         ("edge_logit_head", model.edge_logit_head),
-        (
-            "objective_energy_residual_head",
-            model.objective_energy_residual_head,
-        ),
     ):
         head_keys = {f"{prefix}.weight", f"{prefix}.bias"}
         missing_head = head_keys - state_dict.keys()
@@ -1547,8 +1611,11 @@ def load_constraint_field_state_dict(
     # checkpoints. Inject its neutral initialization (g_phi == 1, an exact no-op)
     # so strict loading succeeds without altering the restored policy.
     model_state = model.state_dict()
+    injectable = ("reward_scale_head.", "objective_energy_residual_head.")
     for key in model_state:
-        if key.startswith("reward_scale_head.") and key not in state_dict:
+        if key.startswith(injectable) and key not in state_dict:
+            # The residual head's final layer is zero-initialized, so injecting
+            # its model init reproduces the pre-objective neutral policy exactly.
             state_dict[key] = model_state[key].detach().clone()
             upgraded = True
     try:

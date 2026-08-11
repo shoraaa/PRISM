@@ -77,10 +77,30 @@ struct ResourceSpec {
 
 };
 
-enum class Objective : uint8_t {
-  MIN_DISTANCE,
-  MAX_PRIZE,
-  MIN_DISTANCE_PLUS_PENALTY,
+// The objective is declared as pure data: a signed linear combination over the
+// three quantities every route accumulates (total travel, prize collected on
+// visited nodes, penalty incurred on unvisited nodes). `sense` is +1 to
+// minimize the reported value and -1 to maximize it, so search always minimizes
+// `sense * report(...)`. `distance_regularizer` is a tiny travel tie-break that
+// only matters when `distance_coeff == 0` (e.g. pure prize). A new objective is
+// a new coefficient vector -- no enum, no switch, no new code path.
+struct ObjectiveSpec {
+  float distance_coeff = 1.0f;
+  float visit_coeff = 0.0f;
+  float miss_coeff = 0.0f;
+  float distance_regularizer = 0.0f;
+  float sense = 1.0f;
+  std::string name = "distance";
+
+  float report(float distance, float collected_prize,
+               float missed_penalty) const {
+    return distance_coeff * distance + visit_coeff * collected_prize +
+           miss_coeff * missed_penalty;
+  }
+  bool has_node_term() const {
+    return visit_coeff != 0.0f || miss_coeff != 0.0f;
+  }
+  const char *direction() const { return sense < 0.0f ? "maximize" : "minimize"; }
 };
 
 enum Constraint : uint32_t {
@@ -134,7 +154,7 @@ struct Problem {
   int32_t node_count = 0;
   int32_t depot_count = 0;
   uint32_t constraints = 0;
-  Objective objective = Objective::MIN_DISTANCE;
+  ObjectiveSpec objective;
   bool multi_route = false;
   bool open_route = false;
 
@@ -181,15 +201,6 @@ struct CandidateConfig {
   int32_t max_candidates = 64;
   CandidateMode candidate_mode = CandidateMode::SCHEMA;
 
-  float gamma_unit = 1.0f;
-  float gamma_wait = 1.0f;
-  float gamma_time_warp = 10.0f;
-  float gamma_load_fit = 1.0f;
-  float gamma_ordering = 10.0f;
-  float gamma_precedence = 10.0f;
-  float gamma_route = 1.0f;
-  float gamma_prize = 1.0f;
-
   void validate() const;
 };
 
@@ -199,13 +210,6 @@ struct SearchConfig {
   int32_t or_opt_max_segment = 3;
   int32_t feasibility_lookahead_depth = 2;
   bool use_srr = true;
-  bool classical_behavior = true;
-  // Fields-off baseline: break equal-energy ties in the SRR edge ranking by edge
-  // index rather than classical_proximity, so a flat/identical field (E = 1)
-  // carries no resource-aware heuristic. Without this, a constant energy makes
-  // every edge tie and the sort silently falls through to classical_proximity,
-  // turning the "no field" reference into a proximity-guided one.
-  bool neutral_ranking = false;
   bool verify_screening_resources = false;
   bool verify_incremental_srr = false;
   // Field-gated exploration: a bounded number of guided-energy-descending but
@@ -213,7 +217,7 @@ struct SearchConfig {
   // reverting to strict monotone descent. It lets the learned field steer the
   // search uphill (in objective) to escape local optima, while the champion
   // (best objective seen) and solve()'s best_solution_ guarantee we never
-  // return worse. A flat field (fields-off, E = 1) has no energy gradient, so
+  // return worse. Constant energy has no gradient, so
   // no exploration move ever qualifies -- the baseline is strictly unaffected.
   // 0 disables the phase (default), preserving the pure monotone hill-climb.
   int32_t srr_exploration_budget = 0;
@@ -320,10 +324,8 @@ public:
   int32_t edge_count() const { return static_cast<int32_t>(edge_to_.size()); }
   uint64_t graph_version() const { return graph_version_; }
   float beta() const { return beta_; }
-  const std::vector<float> &heuristic() const { return heuristic_; }
   const std::vector<int32_t> &edge_offsets() const { return edge_offsets_; }
   const std::vector<int32_t> &edge_to() const { return edge_to_; }
-  const std::vector<float> &proximity() const { return proximity_; }
   const std::vector<float> &edge_features() const { return edge_features_; }
   const std::vector<float> &node_features() const { return node_features_; }
   const std::vector<float> &incumbent_live_state() const {
@@ -439,8 +441,6 @@ private:
   float objective_energy_scale_ = 1.0f;
   int32_t pair_count_ = 0;
 
-  std::vector<float> heuristic_;
-  std::vector<float> proximity_;
   std::vector<float> edge_features_;
   std::vector<float> node_features_;
   std::vector<float> resource_features_;
@@ -461,8 +461,6 @@ private:
                              std::vector<float> *objective_residual = nullptr,
                              std::vector<float> *edge_risk = nullptr);
   std::vector<int32_t> rank_by_distance(int32_t from, int32_t limit) const;
-  float resource_proximity(int32_t from, int32_t to, int metric) const;
-  float classical_proximity(int32_t from, int32_t to) const;
   float objective_edge_cost(int32_t from, int32_t to) const;
   float resource_scale(int32_t channel) const;
   float runtime_resource_scale(int32_t resource) const;
@@ -588,8 +586,6 @@ private:
   bool better(const Solution &lhs, const Solution &rhs) const;
 };
 
-const char *objective_name(Objective objective);
-const char *objective_direction(Objective objective);
 std::vector<std::string> constraint_names(uint32_t constraints);
 std::vector<std::string> candidate_feature_names();
 std::vector<std::string> node_feature_names();

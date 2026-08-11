@@ -50,9 +50,6 @@ def main() -> int:
     parser.add_argument(
         "--threads", type=int, default=prism_decoder.get_available_threads()
     )
-    parser.add_argument(
-        "--guidance", choices=("classical", "field"), default="classical"
-    )
     parser.add_argument("--verify-incremental-srr", action="store_true")
     parser.add_argument("--dataset-dir", type=Path, default=DEFAULT_DATASET_DIR)
     args = parser.parse_args()
@@ -93,7 +90,6 @@ def main() -> int:
             solver = prism_decoder.Decoder(
                 solver_problem(name, data),
                 search_config={
-                    "classical_behavior": args.guidance == "classical",
                     "verify_incremental_srr": args.verify_incremental_srr,
                 },
                 n_rollouts=rollouts,
@@ -102,8 +98,6 @@ def main() -> int:
             assert_normalized_model_inputs(solver)
 
             def guidance() -> dict:
-                if args.guidance == "classical":
-                    return {}
                 field = np.ones(
                     (
                         solver.metadata["edge_count"],

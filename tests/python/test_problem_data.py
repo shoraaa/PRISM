@@ -45,6 +45,8 @@ def test_registry_includes_capacity_free_vrptw_training_problem() -> None:
             "ocvrp",
             "ocvrptw",
             "pdtsp",
+            "pdcvrp",
+            "opdcvrp",
             "mdocvrp",
             "amdocvrp",
             "mdcvrptw",

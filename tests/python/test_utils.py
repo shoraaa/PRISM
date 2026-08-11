@@ -47,6 +47,8 @@ def test_log_validation_uses_macro_summary_namespace() -> None:
         {
             "macro_baseline_improvement_percent": 1.4,
             "macro_score": 1.5,
+            "group_cost/symmetric": 2.5,
+            "group_cost/time_window": 3.5,
         },
         is_best=True,
         step=96,
@@ -59,6 +61,8 @@ def test_log_validation_uses_macro_summary_namespace() -> None:
     assert captured["val_summary/macro_gap"] == -0.5
     assert captured["val_summary/macro_improvement"] == 1.4
     assert captured["val_summary/macro_score"] == 1.5
+    assert captured["val_summary/group_cost/symmetric"] == 2.5
+    assert captured["val_summary/group_cost/time_window"] == 3.5
 
 
 def test_epoch_summary_marks_saved_best_and_reports_val_cost() -> None:

@@ -6,6 +6,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -20,7 +21,7 @@ using prism::CandidateConfig;
 using prism::CAPACITY;
 using prism::Constraint;
 using prism::DecisionTrace;
-using prism::Objective;
+using prism::ObjectiveSpec;
 using prism::PICKUP_DELIVERY;
 using prism::PRIZE_QUOTA;
 using prism::Problem;
@@ -120,20 +121,40 @@ uint32_t parse_constraints(const py::dict &data) {
   return flags;
 }
 
-Objective parse_objective(const py::dict &data) {
+template <typename T>
+T value_or(const py::dict &data, const char *key, T default_value);
+
+ObjectiveSpec parse_objective(const py::dict &data) {
   if (!data.contains("objective"))
     throw std::invalid_argument("normalized schema is missing 'objective'");
-  const std::string objective = data["objective"].cast<std::string>();
-  if (objective == "distance") {
-    return Objective::MIN_DISTANCE;
+  const py::object spec = data["objective"];
+  // A dict declares the coefficient algebra directly, so a brand-new objective
+  // is expressible from the schema with no C++ change.
+  if (py::isinstance<py::dict>(spec)) {
+    const py::dict fields = spec.cast<py::dict>();
+    ObjectiveSpec objective;
+    objective.name = value_or<std::string>(fields, "name", "custom");
+    objective.distance_coeff = value_or<float>(fields, "distance_coeff", 1.0f);
+    objective.visit_coeff = value_or<float>(fields, "visit_coeff", 0.0f);
+    objective.miss_coeff = value_or<float>(fields, "miss_coeff", 0.0f);
+    objective.distance_regularizer =
+        value_or<float>(fields, "distance_regularizer", 0.0f);
+    objective.sense = value_or<float>(fields, "sense", 1.0f);
+    return objective;
   }
-  if (objective == "prize") {
-    return Objective::MAX_PRIZE;
-  }
-  if (objective == "distance_plus_penalty") {
-    return Objective::MIN_DISTANCE_PLUS_PENALTY;
-  }
-  throw std::invalid_argument("unknown objective: " + objective);
+  // A string names a pre-declared objective resolved from a data table (not a
+  // control-flow switch): {distance, visit(prize), miss(penalty), reg, sense}.
+  static const std::unordered_map<std::string, ObjectiveSpec> table = {
+      {"distance", {1.0f, 0.0f, 0.0f, 0.0f, 1.0f, "distance"}},
+      {"prize", {0.0f, 1.0f, 0.0f, 1.0e-3f, -1.0f, "prize"}},
+      {"distance_plus_penalty",
+       {1.0f, 0.0f, 1.0f, 0.0f, 1.0f, "distance_plus_penalty"}},
+  };
+  const auto found = table.find(spec.cast<std::string>());
+  if (found == table.end())
+    throw std::invalid_argument("unknown objective: " +
+                                spec.cast<std::string>());
+  return found->second;
 }
 
 py::dict normalize_problem_schema(const py::dict &source) {
@@ -427,8 +448,6 @@ CandidateConfig parse_candidate_config(const py::dict &data) {
   }
 #define CONFIG_INT(field)                                                      \
   config.field = value_or<int32_t>(data, #field, config.field)
-#define CONFIG_FLOAT(field)                                                    \
-  config.field = value_or<float>(data, #field, config.field)
   CONFIG_INT(max_candidates);
   if (data.contains("candidate_mode")) {
     const std::string mode = data["candidate_mode"].cast<std::string>();
@@ -439,15 +458,6 @@ CandidateConfig parse_candidate_config(const py::dict &data) {
     else
       throw std::invalid_argument("unknown candidate_mode: " + mode);
   }
-  CONFIG_FLOAT(gamma_unit);
-  CONFIG_FLOAT(gamma_wait);
-  CONFIG_FLOAT(gamma_time_warp);
-  CONFIG_FLOAT(gamma_load_fit);
-  CONFIG_FLOAT(gamma_ordering);
-  CONFIG_FLOAT(gamma_precedence);
-  CONFIG_FLOAT(gamma_route);
-  CONFIG_FLOAT(gamma_prize);
-#undef CONFIG_FLOAT
 #undef CONFIG_INT
   return config;
 }
@@ -467,10 +477,6 @@ SearchConfig parse_search_config(const py::dict &data) {
       data, "feasibility_lookahead_depth",
       config.feasibility_lookahead_depth);
   config.use_srr = value_or<bool>(data, "use_srr", config.use_srr);
-  config.classical_behavior =
-      value_or<bool>(data, "classical_behavior", config.classical_behavior);
-  config.neutral_ranking =
-      value_or<bool>(data, "neutral_ranking", config.neutral_ranking);
   config.verify_screening_resources = value_or<bool>(
       data, "verify_screening_resources",
       config.verify_screening_resources);
@@ -483,14 +489,15 @@ SearchConfig parse_search_config(const py::dict &data) {
   return config;
 }
 
-py::dict solution_to_dict(const Solution &solution, Objective objective) {
+py::dict solution_to_dict(const Solution &solution,
+                          const ObjectiveSpec &objective) {
   py::dict result;
   result["route"] = vector_copy<int32_t>(
       solution.route, {static_cast<py::ssize_t>(solution.route.size())});
   result["feasible"] = solution.feasible;
   result["objective"] = solution.objective;
-  result["objective_name"] = prism::objective_name(objective);
-  result["direction"] = prism::objective_direction(objective);
+  result["objective_name"] = objective.name;
+  result["direction"] = objective.direction();
   result["distance"] = solution.distance;
   result["collected_prize"] = solution.collected_prize;
   result["missed_penalty"] = solution.missed_penalty;
@@ -516,7 +523,6 @@ void parse_guidance(py::object edge_field, py::object edge_additive,
                     py::object objective_residual, py::object edge_risk,
                     int32_t edge_count, int32_t resource_count,
                     int32_t multiplier_count, int32_t live_state_count,
-                    bool classical_behavior,
                     py::array_t<float> &field_storage,
                     py::array_t<float> &additive_storage,
                     py::array_t<float> &multiplier_storage,
@@ -538,29 +544,17 @@ void parse_guidance(py::object edge_field, py::object edge_additive,
   coupler_bias_values = nullptr;
   residual_values = nullptr;
   risk_values = nullptr;
-  if (classical_behavior) {
-    if (!edge_field.is_none() || !edge_additive.is_none() ||
-        !multipliers.is_none() ||
-        !coupler_weights.is_none() || !coupler_bias.is_none() ||
-        !objective_residual.is_none() || !edge_risk.is_none()) {
+  if (!edge_field.is_none()) {
+    field_storage = edge_field.cast<
+        py::array_t<float, py::array::c_style | py::array::forcecast>>();
+    const py::buffer_info field_buffer = field_storage.request();
+    if (field_buffer.ndim != 2 || field_buffer.shape[0] != edge_count ||
+        field_buffer.shape[1] != resource_count) {
       throw std::invalid_argument(
-          "classical_behavior does not accept edge_field or multipliers");
+          "edge_field must have shape (edge_count, resource_count)");
     }
-    return;
+    field_values = static_cast<const float *>(field_buffer.ptr);
   }
-  if (edge_field.is_none()) {
-    throw std::invalid_argument(
-        "edge_field is required when classical_behavior is false");
-  }
-  field_storage = edge_field.cast<
-      py::array_t<float, py::array::c_style | py::array::forcecast>>();
-  const py::buffer_info field_buffer = field_storage.request();
-  if (field_buffer.ndim != 2 || field_buffer.shape[0] != edge_count ||
-      field_buffer.shape[1] != resource_count) {
-    throw std::invalid_argument(
-        "edge_field must have shape (edge_count, resource_count)");
-  }
-  field_values = static_cast<const float *>(field_buffer.ptr);
   if (!edge_additive.is_none()) {
     additive_storage = edge_additive.cast<
         py::array_t<float, py::array::c_style | py::array::forcecast>>();
@@ -711,7 +705,7 @@ public:
                    coupler_bias, objective_residual, edge_risk, solver_.edge_count(),
                    solver_.resource_count(), solver_.multiplier_count(),
                    solver_.live_state_feature_count(),
-                   solver_.search_config().classical_behavior, field_storage,
+                   field_storage,
                    additive_storage, multiplier_storage,
                    coupler_weight_storage, coupler_bias_storage, residual_storage,
                    risk_storage,
@@ -756,7 +750,7 @@ public:
                    coupler_bias, objective_residual, edge_risk, solver_.edge_count(),
                    solver_.resource_count(), solver_.multiplier_count(),
                    solver_.live_state_feature_count(),
-                   solver_.search_config().classical_behavior, field_storage,
+                   field_storage,
                    additive_storage, multiplier_storage,
                    coupler_weight_storage, coupler_bias_storage, residual_storage,
                    risk_storage,
@@ -806,7 +800,7 @@ public:
                    coupler_bias, objective_residual, edge_risk, solver_.edge_count(),
                    solver_.resource_count(), solver_.multiplier_count(),
                    solver_.live_state_feature_count(),
-                   solver_.search_config().classical_behavior, field_storage,
+                   field_storage,
                    additive_storage, multiplier_storage,
                    coupler_weight_storage, coupler_bias_storage, residual_storage,
                    risk_storage,
@@ -847,7 +841,7 @@ public:
                    coupler_bias, objective_residual, edge_risk, solver_.edge_count(),
                    solver_.resource_count(), solver_.multiplier_count(),
                    solver_.live_state_feature_count(),
-                   solver_.search_config().classical_behavior, field_storage,
+                   field_storage,
                    additive_storage, multiplier_storage,
                    coupler_weight_storage, coupler_bias_storage, residual_storage,
                    risk_storage,
@@ -946,16 +940,25 @@ public:
       kernel_rows.append(std::move(row));
     }
     result["constraint_kernels"] = std::move(kernel_rows);
-    result["objective"] = prism::objective_name(problem.objective);
+    result["objective"] = problem.objective.name;
     result["objective_scale"] = solver_.objective_scale();
     result["objective_energy_scale"] = solver_.objective_energy_scale();
-    result["direction"] = prism::objective_direction(problem.objective);
+    result["direction"] = problem.objective.direction();
+    // Expose the declared objective algebra so the network conditions on the
+    // coefficient vector (shared head) instead of a categorical one-hot.
+    py::dict objective_coeffs;
+    objective_coeffs["distance_coeff"] = problem.objective.distance_coeff;
+    objective_coeffs["visit_coeff"] = problem.objective.visit_coeff;
+    objective_coeffs["miss_coeff"] = problem.objective.miss_coeff;
+    objective_coeffs["distance_regularizer"] =
+        problem.objective.distance_regularizer;
+    objective_coeffs["sense"] = problem.objective.sense;
+    result["objective_coeffs"] = std::move(objective_coeffs);
     result["multi_route"] = problem.multi_route;
     result["open_route"] = problem.open_route;
     result["edge_count"] = solver_.edge_count();
     result["graph_version"] = solver_.graph_version();
-    result["guidance_mode"] =
-        solver_.search_config().classical_behavior ? "classical" : "field";
+    result["guidance_mode"] = "energy";
     result["max_candidates"] = solver_.candidate_config().max_candidates;
     int32_t maximum_degree = 0;
     const auto &offsets = solver_.edge_offsets();
@@ -978,16 +981,6 @@ public:
     result["candidate_resource_quotas"] = vector_copy<float>(
         solver_.candidate_resource_quotas(),
         {static_cast<py::ssize_t>(solver_.candidate_resource_quotas().size())});
-    py::dict weights;
-    weights["unit"] = config.gamma_unit;
-    weights["wait"] = config.gamma_wait;
-    weights["time_warp"] = config.gamma_time_warp;
-    weights["load_fit"] = config.gamma_load_fit;
-    weights["ordering"] = config.gamma_ordering;
-    weights["precedence"] = config.gamma_precedence;
-    weights["route"] = config.gamma_route;
-    weights["prize"] = config.gamma_prize;
-    result["proximity_weights"] = weights;
     result["candidate_feature_names"] = prism::candidate_feature_names();
     result["field_channel_names"] = prism::field_channel_names();
     py::list resource_rows;
@@ -1018,7 +1011,6 @@ public:
     search_values["feasibility_lookahead_depth"] =
         search.feasibility_lookahead_depth;
     search_values["use_srr"] = search.use_srr;
-    search_values["classical_behavior"] = search.classical_behavior;
     search_values["verify_screening_resources"] =
         search.verify_screening_resources;
     search_values["verify_incremental_srr"] =
@@ -1027,14 +1019,6 @@ public:
     search_values["srr_exploration_margin"] = search.srr_exploration_margin;
     result["search"] = search_values;
     return result;
-  }
-
-  py::array_t<float> heuristic() const {
-    return vector_copy<float>(solver_.heuristic(), {solver_.edge_count()});
-  }
-
-  py::array_t<float> proximity() const {
-    return vector_copy<float>(solver_.proximity(), {solver_.edge_count()});
   }
 
   py::array_t<float> edge_features() const {
@@ -1213,8 +1197,6 @@ PYBIND11_MODULE(prism_decoder, module) {
            &PyDecoder::set_candidate_resource_quotas, py::arg("quotas"))
       .def("mask", &PyDecoder::mask, py::arg("prefix"))
       .def_property_readonly("metadata", &PyDecoder::metadata)
-      .def_property_readonly("heuristic", &PyDecoder::heuristic)
-      .def_property_readonly("proximity", &PyDecoder::proximity)
       .def_property_readonly("edge_features", &PyDecoder::edge_features)
       .def_property_readonly("node_features", &PyDecoder::node_features)
       .def_property_readonly("incumbent_live_state",

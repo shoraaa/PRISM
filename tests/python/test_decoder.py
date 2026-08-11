@@ -128,7 +128,6 @@ def test_search_configuration_is_exposed() -> None:
         "or_opt_max_segment": 2,
         "feasibility_lookahead_depth": 2,
         "use_srr": True,
-        "classical_behavior": True,
         "verify_screening_resources": False,
         "verify_incremental_srr": False,
         "srr_exploration_budget": 0,
@@ -314,30 +313,10 @@ def test_incremental_screening_resources_match_full_evaluation_and_search(
         assert actual["srr_full_rebuilds"] == 0
 
 
-def test_classical_behavior_flag_matches_default() -> None:
-    coordinates, distance = euclidean_problem(35, 101)
-
-    def run(search_config: dict | None = None) -> dict:
-        solver = make_decoder(
-            {"name": "tsp", "coordinates": coordinates, "distance": distance},
-            search_config=search_config or {},
-            n_rollouts=8,
-        )
-        solver.seed(818)
-        return solver.solve(1)
-
-    implicit = run()
-    explicit = run({"classical_behavior": True})
-
-    assert np.array_equal(implicit["route"], explicit["route"])
-    assert implicit["objective"] == explicit["objective"]
-
-
 def test_typed_field_mode_is_exposed_and_feasible() -> None:
     coordinates, distance = euclidean_problem(36, 102)
     solver = make_decoder(
         {"name": "tsp", "coordinates": coordinates, "distance": distance},
-        search_config={"classical_behavior": False},
         n_rollouts=8,
     )
     channels = list(prism_decoder.FIELD_CHANNEL_NAMES)
@@ -350,14 +329,14 @@ def test_typed_field_mode_is_exposed_and_feasible() -> None:
         "pickup_delivery",
         "prize_quota",
     ]
-    assert solver.metadata["guidance_mode"] == "field"
+    assert solver.metadata["guidance_mode"] == "energy"
     assert np.array_equal(
         solver.metadata["field_channel_mask"],
         np.zeros(len(channels), dtype=np.uint8),
     )
 
-    with np.testing.assert_raises_regex(ValueError, "edge_field is required"):
-        solver.solve(1)
+    default_energy = solver.solve(1)
+    assert default_energy["feasible"]
 
     field = np.ones(
         (solver.metadata["edge_count"], len(channels)), dtype=np.float32
@@ -561,7 +540,6 @@ def test_guidance_validation_and_inactive_channel_masking() -> None:
     def make_solver() -> prism_decoder.Decoder:
         solver = make_decoder(
             {"name": "tsp", "coordinates": coordinates, "distance": distance},
-            search_config={"classical_behavior": False},
             n_rollouts=4,
         )
         solver.seed(919)
@@ -597,18 +575,6 @@ def test_guidance_validation_and_inactive_channel_masking() -> None:
             ),
         )
 
-    classical = make_decoder(
-        {"name": "tsp", "coordinates": coordinates, "distance": distance}
-    )
-    with np.testing.assert_raises_regex(ValueError, "classical_behavior"):
-        classical.solve(
-            1,
-            edge_field=np.zeros(
-                (classical.metadata["edge_count"], shape[1]), dtype=np.float32
-            ),
-        )
-
-
 def test_typed_field_changes_greedy_construction() -> None:
     coordinates, distance = euclidean_problem(24, 105)
     demand = np.r_[0.0, np.full(23, 0.02, dtype=np.float32)]
@@ -622,7 +588,6 @@ def test_typed_field_changes_greedy_construction() -> None:
                 "demand": demand,
                 "capacity": 1.0,
             },
-            search_config={"classical_behavior": False},
             n_rollouts=1,
         )
         solver.seed(1001)
@@ -677,7 +642,6 @@ def test_additive_field_guides_zero_pressure_edge() -> None:
                 "demand": demand,
                 "capacity": 1.0,
             },
-            search_config={"classical_behavior": False},
             n_rollouts=1,
         )
 
@@ -737,7 +701,6 @@ def test_signed_objective_residual_guides_multi_constraint_objective() -> None:
     def make_solver() -> prism_decoder.Decoder:
         solver = make_decoder(
             problem,
-            search_config={"classical_behavior": False},
             n_rollouts=1,
             beta=2.0,
         )
@@ -801,7 +764,6 @@ def test_native_policy_is_invariant_to_positive_objective_rescaling() -> None:
                 "coordinates": coordinates,
                 "distance": distance * factor,
             },
-            search_config={"classical_behavior": False},
             n_rollouts=5,
             beta=2.5,
         )
@@ -877,7 +839,6 @@ def test_srr_aggregate_comparison_uses_the_same_edge_energy() -> None:
     def make_solver() -> prism_decoder.Decoder:
         solver = make_decoder(
             problem,
-            search_config={"classical_behavior": False},
             n_rollouts=1,
         )
         solver.seed(7001)
@@ -943,7 +904,6 @@ def test_lookahead_risk_labels_and_avoids_time_window_dead_end() -> None:
         solver = make_decoder(
             problem,
             search_config={
-                "classical_behavior": False,
                 "feasibility_lookahead_depth": 1,
             },
             n_rollouts=1,

@@ -359,7 +359,7 @@ The fields-off decoder is the sole paired comparison baseline.
 Run the end-to-end size-100 feasibility and resource-parity gates:
 
 ```bash
-uv run python tests/urs_one_each.py --iterations 2 --guidance classical
+uv run python tests/urs_one_each.py --iterations 2
 uv run python tests/urs_one_each.py --iterations 2 --guidance field
 uv run python tests/urs_screening_parity.py
 uv run python tests/urs_one_each.py --rollouts 1 --threads 1 --iterations 2 \
@@ -386,6 +386,26 @@ field. Dynamic field refinement is enabled by default. For a focused subset, use
 frozen field for the full solve. The report and optional CSV record the data
 split, mean objective, field improvement, oracle gap, runtime, field mode, and
 neural evaluation count for every variant.
+
+TSPTW is available as an explicit external, held-out probe without changing the
+default 110-variant evaluation:
+
+```bash
+PYTHONPATH=src uv run --no-sync python test.py \
+  --checkpoint pretrained/best.pt --variants tsptw
+```
+
+This defaults to the first eight hard, size-100 instances and paired LKH costs
+from `baselines/CaR-constraint/data/TSPTW`. Select another CaR dataset with
+`--tsptw-size` and `--tsptw-hardness`, or use fresh instances from CaR's own
+generator with `--tsptw-source generator`. Generated instances have no oracle
+reference, so they are compared only against the paired fields-off decoder. For
+hard instances, both decoders start from the same feasible tour embedded by
+CaR's generator; the LKH tour is reference-only. Custom saved hard datasets must
+pass their generation seed through `--tsptw-dataset-seed` (CaR defaults to
+2025). CaR's easy and medium generators do not retain a guaranteed witness
+tour, so those modes use the evaluator's ordinary field construction and may
+serve as a stricter construction-feasibility diagnostic.
 
 ## Large-scale inference
 
