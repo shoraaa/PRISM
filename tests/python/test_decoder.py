@@ -1130,6 +1130,138 @@ def test_runtime_battery_resource_enforces_reset_and_exports_dynamic_rows() -> N
     assert labels["violation"][-1] > 0.0
 
 
+def _typed_charging_event_problem(*, customer_deadline: float = 100.0) -> dict:
+    coordinates = np.array(
+        [[0.0, 0.0], [1.0, 0.0], [2.0, 0.0], [2.0, 0.0]],
+        dtype=np.float32,
+    )
+    distance = np.linalg.norm(
+        coordinates[:, None] - coordinates[None, :], axis=-1
+    ).astype(np.float32)
+    return {
+        "name": "typed_charging_events",
+        "coordinates": coordinates,
+        "distance": distance,
+        "constraints": ["visit_all", "time_windows"],
+        "depot_count": 1,
+        "multi_route": True,
+        "open_route": False,
+        "node_visit_policy": [
+            "depot",
+            "optional_repeatable",
+            "required_once",
+            "required_once",
+        ],
+        "tw_start": np.zeros(4, dtype=np.float32),
+        "tw_end": np.array(
+            [100.0, 100.0, customer_deadline, 100.0], dtype=np.float32
+        ),
+        "node_attributes": {
+            "charging_station": np.array([0.0, 1.0, 0.0, 0.0], dtype=np.float32)
+        },
+        "resources": [
+            {
+                "name": "battery",
+                "operator": "affine_accumulator",
+                "initial": 2.0,
+                "scale": 2.0,
+                "increment": {
+                    "edge_attribute": "distance",
+                    "coefficient": -1.0,
+                },
+                "bounds": [{"lower": 0.0, "check": "transition"}],
+            }
+        ],
+        "node_events": [
+            {
+                "name": "full_recharge",
+                "trigger": {"node_attribute": "charging_station"},
+                "guards": [{"resource": "battery", "lower": 0.0}],
+                "effects": [
+                    {
+                        "operation": "add",
+                        "resource": "route_time",
+                        "expression": {
+                            "constant": 2.0,
+                            "terms": [
+                                {"resource": "battery", "coefficient": -1.0}
+                            ],
+                        },
+                    },
+                    {
+                        "operation": "assign",
+                        "resource": "battery",
+                        "expression": 2.0,
+                    },
+                ],
+            }
+        ],
+    }
+
+
+def test_typed_node_events_allow_repeatable_support_visits() -> None:
+    solver = make_decoder(_typed_charging_event_problem(), n_rollouts=1)
+    expanded = np.array([0, 1, 2, 1, 3, 1, 0], dtype=np.int32)
+    no_charging = np.array([0, 2, 3, 0], dtype=np.int32)
+
+    assert not solver.evaluate(no_charging)["feasible"]
+    solution = solver.evaluate(expanded)
+    assert solution["feasible"], solution["error"]
+    resources = solver.evaluate_resources(expanded)
+    assert resources["structurally_valid"]
+    assert resources["violation"][-1] == pytest.approx(0.0)
+    assert solver.metadata["customer_count"] == 2
+    assert solver.metadata["required_count"] == 2
+    assert solver.metadata["node_visit_policy"][1] == "optional_repeatable"
+    assert solver.metadata["node_events"] == [
+        {
+            "name": "full_recharge",
+            "trigger_nodes": [1],
+            "guard_count": 1,
+            "effect_count": 2,
+        }
+    ]
+    station_edge = np.flatnonzero(
+        (solver.edge_index[0] == 2) & (solver.edge_index[1] == 1)
+    )[0]
+    assert solver.resource_events[station_edge, 1] == pytest.approx(1.0)
+    assert solver.resource_events[station_edge, -1] == pytest.approx(1.0)
+    assert solver.mask(np.array([0, 1, 2], dtype=np.int32))[1] == 1
+    constructed = solver.sample_greedy()
+    assert constructed["feasible"], constructed["error"]
+    assert constructed["route"].tolist().count(1) >= 2
+
+    single_route_problem = _typed_charging_event_problem()
+    single_route_problem["multi_route"] = False
+    single_route_solver = make_decoder(single_route_problem, n_rollouts=1)
+    assert single_route_solver.evaluate(expanded)["feasible"]
+    single_constructed = single_route_solver.sample_greedy()
+    assert single_constructed["feasible"], single_constructed["error"]
+    assert single_constructed["route"][-1] == 0
+
+
+def test_typed_route_time_effect_participates_in_time_windows() -> None:
+    # Travel reaches customer 2 at t=2, but the station's state-dependent
+    # recharge takes one additional unit, so its t=2.5 deadline is violated.
+    solver = make_decoder(
+        _typed_charging_event_problem(customer_deadline=2.5), n_rollouts=1
+    )
+    route = np.array([0, 1, 2, 1, 3, 1, 0], dtype=np.int32)
+
+    assert not solver.evaluate(route)["feasible"]
+    resources = solver.evaluate_resources(route)
+    assert resources["structurally_valid"]
+    assert resources["violation"][1] > 0.0
+
+
+def test_typed_node_event_rejects_unknown_resource_reference() -> None:
+    problem = _typed_charging_event_problem()
+    problem["node_events"][0]["guards"][0]["resource"] = "missing"
+
+    with pytest.raises(ValueError, match="unknown resource"):
+        make_decoder(problem, n_rollouts=1)
+
+
 def test_dynaco_policy_refines_through_runtime_resource_schema() -> None:
     rng = np.random.default_rng(71)
     coordinates = rng.random((25, 2), dtype=np.float32)

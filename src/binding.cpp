@@ -356,6 +356,147 @@ std::vector<ResourceSpec> parse_resource_algebra(const py::dict &data,
   return result;
 }
 
+std::vector<prism::VisitPolicy> parse_visit_policy(const py::dict &data,
+                                                   int32_t node_count,
+                                                   int32_t depot_count) {
+  std::vector<prism::VisitPolicy> result(node_count,
+                                        prism::VisitPolicy::REQUIRED_ONCE);
+  for (int32_t node = 0; node < depot_count; ++node)
+    result[node] = prism::VisitPolicy::DEPOT;
+  if (!data.contains("node_visit_policy"))
+    return result;
+  const std::vector<std::string> names =
+      data["node_visit_policy"].cast<std::vector<std::string>>();
+  if (static_cast<int32_t>(names.size()) != node_count)
+    throw std::invalid_argument(
+        "node_visit_policy must contain node_count values");
+  for (int32_t node = 0; node < node_count; ++node) {
+    const std::string &name = names[node];
+    result[node] =
+        name == "depot"
+            ? prism::VisitPolicy::DEPOT
+            : name == "required_once"
+                  ? prism::VisitPolicy::REQUIRED_ONCE
+                  : name == "optional_once"
+                        ? prism::VisitPolicy::OPTIONAL_ONCE
+                        : name == "optional_repeatable"
+                              ? prism::VisitPolicy::OPTIONAL_REPEATABLE
+                              : throw std::invalid_argument(
+                                    "unknown node visit policy: " + name);
+  }
+  return result;
+}
+
+prism::EventExpression parse_event_expression(const py::dict &problem,
+                                               py::handle value,
+                                               const char *field) {
+  prism::EventExpression result;
+  if (py::isinstance<py::float_>(value) || py::isinstance<py::int_>(value)) {
+    result.constant = py::cast<float>(value);
+    return result;
+  }
+  if (!py::isinstance<py::dict>(value))
+    throw std::invalid_argument(std::string(field) +
+                                " must be a scalar or affine expression");
+  const py::dict expression = py::reinterpret_borrow<py::dict>(value);
+  if (expression.contains("constant"))
+    result.constant =
+        algebra_scalar(problem, expression["constant"], "event.constant");
+  if (expression.contains("resource")) {
+    result.terms.push_back(
+        {expression["resource"].cast<std::string>(),
+         value_or<float>(expression, "coefficient", 1.0f)});
+  }
+  if (expression.contains("terms")) {
+    for (py::handle item : expression["terms"].cast<py::list>()) {
+      const py::dict term = py::reinterpret_borrow<py::dict>(item);
+      if (!term.contains("resource"))
+        throw std::invalid_argument("event expression term requires resource");
+      result.terms.push_back(
+          {term["resource"].cast<std::string>(),
+           value_or<float>(term, "coefficient", 1.0f)});
+    }
+  }
+  return result;
+}
+
+std::vector<prism::NodeEventSpec> parse_node_events(const py::dict &data,
+                                                    int32_t node_count) {
+  std::vector<prism::NodeEventSpec> result;
+  if (!data.contains("node_events"))
+    return result;
+  for (py::handle item : data["node_events"].cast<py::list>()) {
+    const py::dict row = py::reinterpret_borrow<py::dict>(item);
+    prism::NodeEventSpec event;
+    event.name = value_or<std::string>(row, "name", "node_event");
+    event.trigger_nodes.assign(node_count, 0);
+    if (!row.contains("trigger"))
+      throw std::invalid_argument("node event requires trigger");
+    const py::dict trigger = row["trigger"].cast<py::dict>();
+    if (trigger.contains("node_attribute")) {
+      const std::vector<float> flags = algebra_node_attribute(
+          data, trigger["node_attribute"].cast<std::string>(), node_count);
+      for (int32_t node = 0; node < node_count; ++node)
+        event.trigger_nodes[node] = flags[node] > 0.5f ? 1 : 0;
+    }
+    if (trigger.contains("nodes")) {
+      for (int32_t node : trigger["nodes"].cast<std::vector<int32_t>>()) {
+        if (node < 0 || node >= node_count)
+          throw std::invalid_argument("node event trigger is out of range");
+        event.trigger_nodes[node] = 1;
+      }
+    }
+    if (std::none_of(event.trigger_nodes.begin(), event.trigger_nodes.end(),
+                     [](uint8_t flag) { return flag != 0; }))
+      throw std::invalid_argument("node event trigger selects no nodes");
+    if (row.contains("guards")) {
+      for (py::handle guard_item : row["guards"].cast<py::list>()) {
+        const py::dict guard = py::reinterpret_borrow<py::dict>(guard_item);
+        if (!guard.contains("resource"))
+          throw std::invalid_argument("node event guard requires resource");
+        prism::NodeEventGuardSpec parsed;
+        parsed.resource = guard["resource"].cast<std::string>();
+        if (guard.contains("lower"))
+          parsed.lower = algebra_scalar(data, guard["lower"], "event.lower");
+        if (guard.contains("upper"))
+          parsed.upper = algebra_scalar(data, guard["upper"], "event.upper");
+        event.guards.push_back(std::move(parsed));
+      }
+    }
+    if (!row.contains("effects"))
+      throw std::invalid_argument("node event requires effects");
+    for (py::handle effect_item : row["effects"].cast<py::list>()) {
+      const py::dict effect = py::reinterpret_borrow<py::dict>(effect_item);
+      const std::string operation =
+          value_or<std::string>(effect, "operation", "add");
+      prism::NodeEventEffectSpec parsed;
+      parsed.op = operation == "add"
+                      ? prism::EventEffectOperator::ADD
+                      : operation == "assign"
+                            ? prism::EventEffectOperator::ASSIGN
+                            : throw std::invalid_argument(
+                                  "unknown node event operation: " + operation);
+      if (effect.contains("resource"))
+        parsed.target = effect["resource"].cast<std::string>();
+      else if (effect.contains("target"))
+        parsed.target = effect["target"].cast<std::string>();
+      else
+        throw std::invalid_argument("node event effect requires resource");
+      if (effect.contains("expression"))
+        parsed.expression = parse_event_expression(
+            data, effect["expression"], "event.expression");
+      else if (effect.contains("value"))
+        parsed.expression =
+            parse_event_expression(data, effect["value"], "event.value");
+      else
+        throw std::invalid_argument("node event effect requires expression");
+      event.effects.push_back(std::move(parsed));
+    }
+    result.push_back(std::move(event));
+  }
+  return result;
+}
+
 void set_pickup_delivery_relations(Problem &problem, const py::dict &data) {
   problem.delivery_of_pickup.assign(problem.node_count, -1);
   problem.pickup_of_delivery.assign(problem.node_count, -1);
@@ -436,8 +577,11 @@ Problem parse_problem(const py::dict &data) {
                                    std::numeric_limits<float>::infinity());
   problem.service_time =
       optional_vector(schema, "service_time", problem.node_count, 0.0f);
+  problem.visit_policy = parse_visit_policy(
+      schema, problem.node_count, problem.depot_count);
   set_pickup_delivery_relations(problem, schema);
   problem.resources = parse_resource_algebra(schema, problem.node_count);
+  problem.node_events = parse_node_events(schema, problem.node_count);
   return problem;
 }
 
@@ -952,7 +1096,41 @@ public:
     result["name"] = problem.name;
     result["node_count"] = problem.node_count;
     result["customer_count"] = problem.customer_count();
+    result["required_count"] = problem.required_count();
     result["depot_count"] = problem.depot_count;
+    py::list visit_policy;
+    for (prism::VisitPolicy policy : problem.visit_policy) {
+      switch (policy) {
+      case prism::VisitPolicy::DEPOT:
+        visit_policy.append("depot");
+        break;
+      case prism::VisitPolicy::REQUIRED_ONCE:
+        visit_policy.append("required_once");
+        break;
+      case prism::VisitPolicy::OPTIONAL_ONCE:
+        visit_policy.append("optional_once");
+        break;
+      case prism::VisitPolicy::OPTIONAL_REPEATABLE:
+        visit_policy.append("optional_repeatable");
+        break;
+      }
+    }
+    result["node_visit_policy"] = std::move(visit_policy);
+    py::list event_rows;
+    for (const prism::NodeEventSpec &event : problem.node_events) {
+      py::dict row;
+      row["name"] = event.name;
+      py::list nodes;
+      for (int32_t node = 0; node < problem.node_count; ++node) {
+        if (event.trigger_nodes[node])
+          nodes.append(node);
+      }
+      row["trigger_nodes"] = std::move(nodes);
+      row["guard_count"] = event.guards.size();
+      row["effect_count"] = event.effects.size();
+      event_rows.append(std::move(row));
+    }
+    result["node_events"] = std::move(event_rows);
     result["constraints"] = prism::constraint_names(problem.constraints);
     py::list kernel_rows;
     for (const prism::ConstraintKernelSpec *kernel :

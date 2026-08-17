@@ -47,6 +47,47 @@ enum class ResourceOperator : uint8_t {
 enum class ResourceDirection : uint8_t { FORWARD, BACKWARD, BIDIRECTIONAL };
 enum class ResourceScope : uint8_t { ROUTE, TOUR, SOLUTION };
 enum class BoundCheck : uint8_t { TRANSITION, ROUTE_END, SOLUTION_END };
+enum class VisitPolicy : uint8_t {
+  DEPOT,
+  REQUIRED_ONCE,
+  OPTIONAL_ONCE,
+  OPTIONAL_REPEATABLE,
+};
+enum class EventEffectOperator : uint8_t { ADD, ASSIGN };
+
+// Declarative node-arrival event program. Expressions are affine in live
+// scalar resources; names are resolved to dense resource indices once the
+// decoder registry has been built. The reserved target `route_time` lets an
+// event contribute state-dependent duration to the compiled time-window
+// kernel without making charging (or breaks/reloads) a named special case.
+struct EventExpressionTerm {
+  std::string resource;
+  float coefficient = 0.0f;
+};
+
+struct EventExpression {
+  float constant = 0.0f;
+  std::vector<EventExpressionTerm> terms;
+};
+
+struct NodeEventGuardSpec {
+  std::string resource;
+  float lower = -std::numeric_limits<float>::infinity();
+  float upper = std::numeric_limits<float>::infinity();
+};
+
+struct NodeEventEffectSpec {
+  EventEffectOperator op = EventEffectOperator::ADD;
+  std::string target;
+  EventExpression expression;
+};
+
+struct NodeEventSpec {
+  std::string name;
+  std::vector<uint8_t> trigger_nodes;
+  std::vector<NodeEventGuardSpec> guards;
+  std::vector<NodeEventEffectSpec> effects;
+};
 
 // Runtime resource row. Named input references from the Python algebra schema
 // are resolved into dense arrays once in the binding, so the hot decoder path
@@ -182,11 +223,20 @@ struct Problem {
   // RoutingDecoder materializes declared constraint kernels and then appends
   // explicit resource rows using the same ResourceSpec/kernel contract.
   std::vector<ResourceSpec> resources;
+  // Defaults to DEPOT for depot indices and REQUIRED_ONCE elsewhere. Support
+  // facilities can instead be OPTIONAL_ONCE or OPTIONAL_REPEATABLE.
+  std::vector<VisitPolicy> visit_policy;
+  std::vector<NodeEventSpec> node_events;
 
   bool has(Constraint constraint) const;
   bool has_capability(ConstraintCapability capability) const;
   float dist(int32_t from, int32_t to) const;
   int32_t customer_count() const;
+  int32_t required_count() const;
+  bool is_service_node(int32_t node) const;
+  bool is_required_node(int32_t node) const;
+  bool is_repeatable_node(int32_t node) const;
+  bool has_repeatable_nodes() const;
   void validate() const;
 };
 
@@ -439,6 +489,8 @@ private:
     int32_t route_depot = -1;
     int32_t start_node = -1;
     int32_t visited_customers = 0;
+    int32_t visited_required = 0;
+    int32_t route_service_visits = 0;
     int32_t open_pickups = 0;
     int32_t unvisited_linehauls = 0;
     int32_t unvisited_backhauls = 0;
@@ -460,6 +512,32 @@ private:
   std::vector<ResourceSpec> resources_;
   std::vector<int32_t> active_resource_indices_;
   std::vector<int32_t> scalar_resource_indices_;
+  struct CompiledEventExpressionTerm {
+    int32_t resource = -1;
+    float coefficient = 0.0f;
+  };
+  struct CompiledEventExpression {
+    float constant = 0.0f;
+    std::vector<CompiledEventExpressionTerm> terms;
+  };
+  struct CompiledNodeEventGuard {
+    int32_t resource = -1;
+    float lower = -std::numeric_limits<float>::infinity();
+    float upper = std::numeric_limits<float>::infinity();
+  };
+  struct CompiledNodeEventEffect {
+    EventEffectOperator op = EventEffectOperator::ADD;
+    // -1 is the reserved built-in route_time target.
+    int32_t target = -1;
+    CompiledEventExpression expression;
+  };
+  struct CompiledNodeEvent {
+    std::string name;
+    std::vector<uint8_t> trigger_nodes;
+    std::vector<CompiledNodeEventGuard> guards;
+    std::vector<CompiledNodeEventEffect> effects;
+  };
+  std::vector<CompiledNodeEvent> node_events_;
   std::array<int32_t, FIELD_CHANNEL_COUNT> field_resource_index_{};
   CandidateConfig candidate_config_;
   SearchConfig search_config_;
@@ -514,13 +592,21 @@ private:
   int32_t field_resource_index(FieldChannel channel) const;
   const ResourceSpec &resource(int32_t index) const;
   void build_resource_registry();
+  void build_node_events();
+  bool node_event_uses_resource(int32_t node, int32_t resource) const;
   void build_constraint_kernel_set();
   void build_resource_descriptors();
   float resource_state_feature(const State &state, int32_t resource) const;
   bool resource_transition_feasible(const State &state, int32_t next,
                                     int32_t resource,
                                     float *next_value = nullptr,
-                                    bool force_route_end = false) const;
+                                    bool force_route_end = false,
+                                    float event_time = 0.0f) const;
+  bool scalar_transition(int32_t current, int32_t next,
+                         const std::vector<float> &before,
+                         std::vector<float> &after, bool force_route_end,
+                         float *event_time, std::string *error,
+                         std::vector<float> *max_violation = nullptr) const;
   bool resource_terminal_feasible(const State &state, int32_t resource) const;
   void validate_guidance(const float *edge_field,
                          const float *edge_additive,

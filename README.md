@@ -113,6 +113,52 @@ problem["resources"] = [{
 }]
 ```
 
+Nodes may independently declare whether they are required service nodes or
+support facilities. The default remains `depot` for depot indices and
+`required_once` for every other node. An electric instance can make a charging
+station repeatable and attach a compositional arrival event:
+
+```python
+problem["node_visit_policy"] = [
+    "depot", "optional_repeatable", "required_once", "required_once"
+]
+problem["node_events"] = [{
+    "name": "full_recharge",
+    "trigger": {"node_attribute": "charger"},
+    "guards": [{"resource": "battery", "lower": 0.0}],
+    "effects": [
+        {
+            "operation": "add",
+            "resource": "route_time",
+            # Precomputed capacity/rate - battery/rate.
+            "expression": {
+                "constant": battery_capacity / recharge_rate,
+                "terms": [{
+                    "resource": "battery",
+                    "coefficient": -1.0 / recharge_rate,
+                }],
+            },
+        },
+        {
+            "operation": "assign",
+            "resource": "battery",
+            "expression": battery_capacity,
+        },
+    ],
+}]
+```
+
+On every arrival, native execution first applies edge/node increments and checks
+their transition bounds, then evaluates event guards and sequential affine
+effects. `route_time` is a reserved effect target whose added duration is fed
+into the compiled time-window kernel; all other effect targets and expression
+terms name scalar affine resources. Thus an infeasible battery arrival cannot
+be repaired retroactively by a recharge event. Exact evaluation and
+construction accept repeated support-node occurrences. The current perturbation
+and SRR caches remain service-node-unique, so refinement preserves an expanded
+repeatable-support route instead of relocating its support occurrences; a
+support-path oracle is the intended owner of that later optimization layer.
+
 The binding resolves named arrays once, and native `extend + bound` replay then
 drives construction masks, incumbent validation, resource labels, pressure
 features, and live state. Each row also produces a 32-dimensional descriptor

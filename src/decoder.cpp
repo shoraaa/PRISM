@@ -378,7 +378,40 @@ float Problem::dist(int32_t from, int32_t to) const {
   return distance[static_cast<size_t>(from) * node_count + to];
 }
 
-int32_t Problem::customer_count() const { return node_count - depot_count; }
+int32_t Problem::customer_count() const {
+  return static_cast<int32_t>(std::count_if(
+      visit_policy.begin(), visit_policy.end(), [](VisitPolicy policy) {
+        return policy == VisitPolicy::REQUIRED_ONCE ||
+               policy == VisitPolicy::OPTIONAL_ONCE;
+      }));
+}
+
+int32_t Problem::required_count() const {
+  return static_cast<int32_t>(std::count(visit_policy.begin(),
+                                         visit_policy.end(),
+                                         VisitPolicy::REQUIRED_ONCE));
+}
+
+bool Problem::is_service_node(int32_t node) const {
+  return node >= 0 && node < node_count &&
+         (visit_policy[node] == VisitPolicy::REQUIRED_ONCE ||
+          visit_policy[node] == VisitPolicy::OPTIONAL_ONCE);
+}
+
+bool Problem::is_required_node(int32_t node) const {
+  return node >= 0 && node < node_count &&
+         visit_policy[node] == VisitPolicy::REQUIRED_ONCE;
+}
+
+bool Problem::is_repeatable_node(int32_t node) const {
+  return node >= 0 && node < node_count &&
+         visit_policy[node] == VisitPolicy::OPTIONAL_REPEATABLE;
+}
+
+bool Problem::has_repeatable_nodes() const {
+  return std::find(visit_policy.begin(), visit_policy.end(),
+                   VisitPolicy::OPTIONAL_REPEATABLE) != visit_policy.end();
+}
 
 void Problem::validate() const {
   if (name.empty()) {
@@ -433,6 +466,18 @@ void Problem::validate() const {
   require_node_vector(tw_start, "tw_start");
   require_node_vector(tw_end, "tw_end");
   require_node_vector(service_time, "service_time");
+
+  if (visit_policy.size() != n)
+    throw std::invalid_argument(
+        "node_visit_policy must contain node_count values");
+  for (int32_t node = 0; node < node_count; ++node) {
+    if (node < depot_count && visit_policy[node] != VisitPolicy::DEPOT)
+      throw std::invalid_argument("depot nodes must use depot visit policy");
+    if (node >= depot_count && visit_policy[node] == VisitPolicy::DEPOT)
+      throw std::invalid_argument("non-depot nodes cannot use depot visit policy");
+  }
+  if (customer_count() == 0)
+    throw std::invalid_argument("a problem must contain at least one service node");
 
   if (delivery_of_pickup.size() != n || pickup_of_delivery.size() != n) {
     throw std::invalid_argument(
@@ -496,6 +541,28 @@ void Problem::validate() const {
     for (float value : resource.node_values) {
       if (!std::isfinite(value))
         throw std::invalid_argument("resource node values must be finite");
+    }
+  }
+  for (const NodeEventSpec &event : node_events) {
+    if (event.name.empty())
+      throw std::invalid_argument("node event name must not be empty");
+    if (event.trigger_nodes.size() != n)
+      throw std::invalid_argument(
+          "node event trigger must contain node_count flags");
+    if (event.effects.empty())
+      throw std::invalid_argument("node event must contain at least one effect");
+    for (const NodeEventGuardSpec &guard : event.guards) {
+      if (guard.resource.empty() || std::isnan(guard.lower) ||
+          std::isnan(guard.upper) || guard.lower > guard.upper)
+        throw std::invalid_argument("invalid node event guard");
+    }
+    for (const NodeEventEffectSpec &effect : event.effects) {
+      if (effect.target.empty() || !std::isfinite(effect.expression.constant))
+        throw std::invalid_argument("invalid node event effect");
+      for (const EventExpressionTerm &term : effect.expression.terms) {
+        if (term.resource.empty() || !std::isfinite(term.coefficient))
+          throw std::invalid_argument("invalid node event expression term");
+      }
     }
   }
   for (int32_t node = 0; node < node_count; ++node) {
@@ -658,6 +725,7 @@ RoutingDecoder::RoutingDecoder(Problem problem, CandidateConfig candidate_config
     }
   }
   build_resource_registry();
+  build_node_events();
   build_resource_descriptors();
   build_candidate_graph({});
 }
@@ -720,6 +788,74 @@ void RoutingDecoder::build_resource_registry() {
         scalar_resource_indices_.push_back(index);
     }
   }
+}
+
+void RoutingDecoder::build_node_events() {
+  node_events_.clear();
+  const auto resolve_scalar = [&](const std::string &name) {
+    const auto found = std::find_if(
+        resources_.begin(), resources_.end(), [&](const ResourceSpec &spec) {
+          return spec.name == name;
+        });
+    if (found == resources_.end())
+      throw std::invalid_argument("node event references unknown resource: " +
+                                  name);
+    const int32_t index = static_cast<int32_t>(found - resources_.begin());
+    if (found->op != ResourceOperator::AFFINE_ACCUMULATOR)
+      throw std::invalid_argument(
+          "node events currently require scalar affine resources: " + name);
+    return index;
+  };
+  for (const NodeEventSpec &source : problem_.node_events) {
+    CompiledNodeEvent event;
+    event.name = source.name;
+    event.trigger_nodes = source.trigger_nodes;
+    for (const NodeEventGuardSpec &guard : source.guards) {
+      event.guards.push_back(
+          {resolve_scalar(guard.resource), guard.lower, guard.upper});
+    }
+    for (const NodeEventEffectSpec &effect : source.effects) {
+      CompiledNodeEventEffect compiled;
+      compiled.op = effect.op;
+      if (effect.target == "route_time") {
+        if (effect.op != EventEffectOperator::ADD)
+          throw std::invalid_argument(
+              "route_time node-event effects must use add");
+        compiled.target = -1;
+      } else {
+        compiled.target = resolve_scalar(effect.target);
+      }
+      compiled.expression.constant = effect.expression.constant;
+      for (const EventExpressionTerm &term : effect.expression.terms) {
+        compiled.expression.terms.push_back(
+            {resolve_scalar(term.resource), term.coefficient});
+      }
+      event.effects.push_back(std::move(compiled));
+    }
+    node_events_.push_back(std::move(event));
+  }
+}
+
+bool RoutingDecoder::node_event_uses_resource(int32_t node,
+                                              int32_t resource_index) const {
+  for (const CompiledNodeEvent &event : node_events_) {
+    if (!event.trigger_nodes[node])
+      continue;
+    for (const CompiledNodeEventGuard &guard : event.guards)
+      if (guard.resource == resource_index)
+        return true;
+    for (const CompiledNodeEventEffect &effect : event.effects) {
+      if (effect.target < 0 &&
+          resource_index == field_resource_index(FieldChannel::TIME_WINDOW))
+        return true;
+      if (effect.target == resource_index)
+        return true;
+      for (const CompiledEventExpressionTerm &term : effect.expression.terms)
+        if (term.resource == resource_index)
+          return true;
+    }
+  }
+  return false;
 }
 
 int32_t RoutingDecoder::field_resource_index(FieldChannel channel) const {
@@ -809,10 +945,15 @@ void RoutingDecoder::build_resource_descriptors() {
     const size_t count = spec.edge_values.size() + spec.node_values.size() +
                          (spec.edge_uses_distance ? 1 : 0);
     descriptor[30] = squash(count ? magnitude / count / spec.scale : 0.0);
-    const double events =
-        std::count(spec.reset_nodes.begin(), spec.reset_nodes.end(), uint8_t{1});
+    int32_t events = 0;
+    for (int32_t node = 0; node < problem_.node_count; ++node) {
+      const bool legacy =
+          !spec.reset_nodes.empty() && spec.reset_nodes[node];
+      events += legacy || node_event_uses_resource(node, index) ? 1 : 0;
+    }
     descriptor[31] = problem_.node_count > 0
-                         ? static_cast<float>(events / problem_.node_count)
+                         ? static_cast<float>(events) /
+                               static_cast<float>(problem_.node_count)
                          : 0.0f;
   }
 }
@@ -1106,7 +1247,7 @@ float RoutingDecoder::candidate_resource_relevance(
                     std::max(runtime_resource_scale(resource_index), EPS);
   const bool resets = (to < problem_.depot_count && spec.reset_at_depot) ||
                       (!spec.reset_nodes.empty() && spec.reset_nodes[to]);
-  if (resets)
+  if (resets || node_event_uses_resource(to, resource_index))
     relevance = std::max(relevance, 1.0f);
   return relevance;
 }
@@ -1589,7 +1730,8 @@ void RoutingDecoder::build_candidate_graph(const std::vector<int32_t> &incumbent
             (to < problem_.depot_count && spec.reset_at_depot) ||
             (!spec.reset_nodes.empty() && spec.reset_nodes[to]);
         resource_events_[static_cast<size_t>(edge) * resource_count() +
-                         channel] = reset ? 1.0f : 0.0f;
+                         channel] =
+            reset || node_event_uses_resource(to, channel) ? 1.0f : 0.0f;
       }
       if (edge_field != nullptr && preserved &&
           static_cast<size_t>(old_edge + 1) * resource_count() <=
@@ -1882,6 +2024,8 @@ RoutingDecoder::State RoutingDecoder::initial_state(int32_t start_node) const {
   state.visited.assign(problem_.node_count, 0);
   for (int32_t node = problem_.depot_count; node < problem_.node_count;
        ++node) {
+    if (!problem_.is_service_node(node))
+      continue;
     state.unvisited_linehauls +=
         problem_.demand[node] > FEASIBILITY_EPS ? 1 : 0;
     state.unvisited_backhauls +=
@@ -1899,13 +2043,18 @@ RoutingDecoder::State RoutingDecoder::initial_state(int32_t start_node) const {
     if (start_node < 0 || start_node >= problem_.node_count) {
       throw std::invalid_argument("invalid start node");
     }
-    state.visited[start_node] = 1;
-    state.visited_customers = 1;
-    state.unvisited_linehauls -=
-        problem_.demand[start_node] > FEASIBILITY_EPS ? 1 : 0;
-    state.unvisited_backhauls -=
-        problem_.demand[start_node] < -FEASIBILITY_EPS ? 1 : 0;
-    state.collected_prize = problem_.prize[start_node];
+    if (!problem_.is_repeatable_node(start_node))
+      state.visited[start_node] = 1;
+    if (problem_.is_service_node(start_node)) {
+      state.visited_customers = 1;
+      state.visited_required = problem_.is_required_node(start_node) ? 1 : 0;
+      state.route_service_visits = 1;
+      state.unvisited_linehauls -=
+          problem_.demand[start_node] > FEASIBILITY_EPS ? 1 : 0;
+      state.unvisited_backhauls -=
+          problem_.demand[start_node] < -FEASIBILITY_EPS ? 1 : 0;
+      state.collected_prize = problem_.prize[start_node];
+    }
   } else {
     if (start_node < 0 || start_node >= problem_.depot_count) {
       throw std::invalid_argument("a depot problem must start at a depot");
@@ -1921,7 +2070,8 @@ bool RoutingDecoder::resource_transition_feasible(const State &state,
                                                    int32_t next,
                                                    int32_t resource_index,
                                                    float *next_value,
-                                                   bool force_route_end) const {
+                                                   bool force_route_end,
+                                                   float event_time) const {
   const ResourceSpec &spec = resource(resource_index);
   if (!spec.active)
     return true;
@@ -1937,7 +2087,7 @@ bool RoutingDecoder::resource_transition_feasible(const State &state,
                problem_.capacity + FEASIBILITY_EPS;
   case ResourceOperator::TIME_WINDOW: {
     if (force_route_end)
-      return state.current_time + travel <=
+      return state.current_time + travel + event_time <=
              problem_.tw_end[next] + FEASIBILITY_EPS;
     if (!customer)
       return true;
@@ -1946,7 +2096,7 @@ bool RoutingDecoder::resource_transition_feasible(const State &state,
     if (arrival > problem_.tw_end[next] + FEASIBILITY_EPS)
       return false;
     return problem_.open_route ||
-           arrival + problem_.service_time[next] +
+           arrival + event_time + problem_.service_time[next] +
                    problem_.dist(next, state.route_depot) <=
                problem_.tw_end[state.route_depot] + FEASIBILITY_EPS;
   }
@@ -2006,6 +2156,121 @@ bool RoutingDecoder::resource_transition_feasible(const State &state,
   return feasible;
 }
 
+bool RoutingDecoder::scalar_transition(
+    int32_t current, int32_t next, const std::vector<float> &before,
+    std::vector<float> &after, bool force_route_end, float *event_time,
+    std::string *error, std::vector<float> *max_violation) const {
+  after = before;
+  float added_time = 0.0f;
+  const bool depot = next < problem_.depot_count;
+  const auto record_bound = [&](int32_t index, float value) {
+    const ResourceSpec &spec = resource(index);
+    float violation = 0.0f;
+    if (std::isfinite(spec.lower))
+      violation = std::max(violation, spec.lower - value);
+    if (std::isfinite(spec.upper))
+      violation = std::max(violation, value - spec.upper);
+    if (max_violation != nullptr)
+      (*max_violation)[index] =
+          std::max((*max_violation)[index], violation);
+    if (violation > FEASIBILITY_EPS && error != nullptr)
+      *error = "resource bound failed: " + spec.name;
+    return violation <= FEASIBILITY_EPS;
+  };
+
+  bool feasible = true;
+  for (int32_t index : scalar_resource_indices_) {
+    const ResourceSpec &spec = resource(index);
+    float value = after[index];
+    if (spec.edge_uses_distance)
+      value += spec.edge_coefficient * problem_.dist(current, next);
+    if (!spec.edge_values.empty())
+      value += spec.edge_coefficient *
+               spec.edge_values[static_cast<size_t>(current) *
+                                    problem_.node_count +
+                                next];
+    if (!spec.node_values.empty())
+      value += spec.node_coefficient * spec.node_values[next];
+    after[index] = value;
+    const bool check = spec.bound_check == BoundCheck::TRANSITION ||
+                       ((depot || force_route_end) &&
+                        spec.bound_check == BoundCheck::ROUTE_END);
+    if (check && !record_bound(index, value))
+      feasible = false;
+  }
+
+  for (const CompiledNodeEvent &event : node_events_) {
+    if (!event.trigger_nodes[next])
+      continue;
+    bool guards_pass = true;
+    for (const CompiledNodeEventGuard &guard : event.guards) {
+      const float value = after[guard.resource];
+      float violation = 0.0f;
+      if (std::isfinite(guard.lower))
+        violation = std::max(violation, guard.lower - value);
+      if (std::isfinite(guard.upper))
+        violation = std::max(violation, value - guard.upper);
+      if (max_violation != nullptr)
+        (*max_violation)[guard.resource] =
+            std::max((*max_violation)[guard.resource], violation);
+      if (violation > FEASIBILITY_EPS) {
+        guards_pass = false;
+        feasible = false;
+        if (error != nullptr)
+          *error = "node event guard failed: " + event.name;
+      }
+    }
+    if (!guards_pass)
+      continue;
+    for (const CompiledNodeEventEffect &effect : event.effects) {
+      double expression = effect.expression.constant;
+      for (const CompiledEventExpressionTerm &term : effect.expression.terms)
+        expression += term.coefficient * after[term.resource];
+      if (!std::isfinite(expression)) {
+        if (error != nullptr)
+          *error = "node event produced a non-finite value: " + event.name;
+        feasible = false;
+        continue;
+      }
+      if (effect.target < 0) {
+        added_time += static_cast<float>(expression);
+        if (added_time < -FEASIBILITY_EPS || !std::isfinite(added_time)) {
+          if (error != nullptr)
+            *error = "node event produced invalid route_time: " + event.name;
+          feasible = false;
+        }
+        continue;
+      }
+      float &target = after[effect.target];
+      target = effect.op == EventEffectOperator::ADD
+                   ? target + static_cast<float>(expression)
+                   : static_cast<float>(expression);
+      if (!std::isfinite(target)) {
+        if (error != nullptr)
+          *error = "node event produced a non-finite resource: " + event.name;
+        feasible = false;
+        continue;
+      }
+      if (resource(effect.target).bound_check == BoundCheck::TRANSITION &&
+          !record_bound(effect.target, target))
+        feasible = false;
+    }
+  }
+
+  for (int32_t index : scalar_resource_indices_) {
+    const ResourceSpec &spec = resource(index);
+    const bool event_reset =
+        !spec.reset_nodes.empty() && spec.reset_nodes[next];
+    if ((depot && spec.reset_at_depot) || event_reset)
+      after[index] = spec.reset_value;
+    else if (depot && spec.scope == ResourceScope::ROUTE)
+      after[index] = spec.initial;
+  }
+  if (event_time != nullptr)
+    *event_time = std::max(added_time, 0.0f);
+  return feasible;
+}
+
 bool RoutingDecoder::resource_terminal_feasible(const State &state,
                                                  int32_t resource_index) const {
   const ResourceSpec &spec = resource(resource_index);
@@ -2041,10 +2306,18 @@ bool RoutingDecoder::legal_node(const State &state, int32_t node) const {
   if (node < 0 || node >= problem_.node_count)
     return false;
   if (node >= depots) {
-    if (state.visited[node])
+    if (node == state.current ||
+        (!problem_.is_repeatable_node(node) && state.visited[node]))
+      return false;
+    std::vector<float> scalar_after;
+    float event_time = 0.0f;
+    if (!scalar_transition(state.current, node, state.resource_state,
+                           scalar_after, false, &event_time, nullptr))
       return false;
     for (int32_t index : active_resource_indices_) {
-      if (!resource_transition_feasible(state, node, index))
+      if (resource(index).op != ResourceOperator::AFFINE_ACCUMULATOR &&
+          !resource_transition_feasible(state, node, index, nullptr, false,
+                                        event_time))
         return false;
     }
     return true;
@@ -2053,11 +2326,24 @@ bool RoutingDecoder::legal_node(const State &state, int32_t node) const {
   if (depots == 0 || state.at_depot)
     return false;
 
-  bool depot_allowed = problem_.multi_route || !problem_.has(VISIT_ALL);
+  const bool support_close =
+      problem_.has_repeatable_nodes() && !problem_.open_route &&
+      state.visited_required == problem_.required_count();
+  bool depot_allowed = state.route_service_visits > 0 &&
+                       (problem_.multi_route || !problem_.has(VISIT_ALL) ||
+                        support_close);
+  std::vector<float> scalar_after;
+  float event_time = 0.0f;
+  if (depot_allowed &&
+      !scalar_transition(state.current, node, state.resource_state,
+                         scalar_after, false, &event_time, nullptr))
+    depot_allowed = false;
   for (int32_t index : active_resource_indices_) {
     if (!depot_allowed)
       break;
-    if (!resource_transition_feasible(state, node, index))
+    if (resource(index).op != ResourceOperator::AFFINE_ACCUMULATOR &&
+        !resource_transition_feasible(state, node, index, nullptr, false,
+                                      event_time))
       depot_allowed = false;
   }
   return depot_allowed;
@@ -2077,8 +2363,15 @@ bool RoutingDecoder::transition(State &state, int32_t next,
     return false;
   }
   if (!legal_node(state, next)) {
+    std::vector<float> scalar_after;
+    float event_time = 0.0f;
+    if (!scalar_transition(state.current, next, state.resource_state,
+                           scalar_after, false, &event_time, &error))
+      return false;
     for (int32_t index : active_resource_indices_) {
-      if (!resource_transition_feasible(state, next, index)) {
+      if (resource(index).op != ResourceOperator::AFFINE_ACCUMULATOR &&
+          !resource_transition_feasible(state, next, index, nullptr, false,
+                                        event_time)) {
         error = "resource transition failed: " + resource(index).name;
         return false;
       }
@@ -2090,11 +2383,11 @@ bool RoutingDecoder::transition(State &state, int32_t next,
   if (find_edge(state.current, next) < 0) {
     ++state.off_graph_edges;
   }
-  for (int32_t index : scalar_resource_indices_) {
-    float value = state.resource_state[index];
-    (void)resource_transition_feasible(state, next, index, &value);
-    state.resource_state[index] = value;
-  }
+  std::vector<float> scalar_after;
+  float event_time = 0.0f;
+  (void)scalar_transition(state.current, next, state.resource_state,
+                          scalar_after, false, &event_time, nullptr);
+  state.resource_state = std::move(scalar_after);
 
   if (next < problem_.depot_count) {
     if (!problem_.open_route) {
@@ -2105,6 +2398,7 @@ bool RoutingDecoder::transition(State &state, int32_t next,
     state.route_depot = next;
     state.at_depot = true;
     state.route_has_backhaul = false;
+    state.route_service_visits = 0;
     state.route_distance = 0.0f;
     state.current_time = 0.0f;
     state.load = depot_reload(state);
@@ -2116,7 +2410,7 @@ bool RoutingDecoder::transition(State &state, int32_t next,
   state.route_distance += edge;
   state.current_time =
       std::max(state.current_time + edge, problem_.tw_start[next]) +
-      problem_.service_time[next];
+      event_time + problem_.service_time[next];
   state.load -= problem_.demand[next];
   if (problem_.demand[next] < -FEASIBILITY_EPS) {
     state.route_has_backhaul = true;
@@ -2129,13 +2423,18 @@ bool RoutingDecoder::transition(State &state, int32_t next,
   }
   state.current = next;
   state.at_depot = false;
-  state.visited[next] = 1;
-  state.unvisited_linehauls -=
-      problem_.demand[next] > FEASIBILITY_EPS ? 1 : 0;
-  state.unvisited_backhauls -=
-      problem_.demand[next] < -FEASIBILITY_EPS ? 1 : 0;
-  ++state.visited_customers;
-  state.collected_prize += problem_.prize[next];
+  if (!problem_.is_repeatable_node(next))
+    state.visited[next] = 1;
+  if (problem_.is_service_node(next)) {
+    state.unvisited_linehauls -=
+        problem_.demand[next] > FEASIBILITY_EPS ? 1 : 0;
+    state.unvisited_backhauls -=
+        problem_.demand[next] < -FEASIBILITY_EPS ? 1 : 0;
+    ++state.visited_customers;
+    state.visited_required += problem_.is_required_node(next) ? 1 : 0;
+    ++state.route_service_visits;
+    state.collected_prize += problem_.prize[next];
+  }
   state.route.push_back(next);
   return true;
 }
@@ -2173,6 +2472,8 @@ bool RoutingDecoder::feasible_after_lookahead_transition(
   const int32_t current = state.current;
   const int32_t route_depot = state.route_depot;
   const int32_t visited_customers = state.visited_customers;
+  const int32_t visited_required = state.visited_required;
+  const int32_t route_service_visits = state.route_service_visits;
   const int32_t open_pickups = state.open_pickups;
   const int32_t unvisited_linehauls = state.unvisited_linehauls;
   const int32_t unvisited_backhauls = state.unvisited_backhauls;
@@ -2195,6 +2496,8 @@ bool RoutingDecoder::feasible_after_lookahead_transition(
   state.current = current;
   state.route_depot = route_depot;
   state.visited_customers = visited_customers;
+  state.visited_required = visited_required;
+  state.route_service_visits = route_service_visits;
   state.open_pickups = open_pickups;
   state.unvisited_linehauls = unvisited_linehauls;
   state.unvisited_backhauls = unvisited_backhauls;
@@ -2220,13 +2523,16 @@ float RoutingDecoder::feasibility_risk_label(State &state,
 
 bool RoutingDecoder::complete(const State &state) const {
   if (problem_.depot_count == 0) {
-    return state.visited_customers == problem_.customer_count();
+    return state.visited_required == problem_.required_count();
   }
   if (problem_.has(VISIT_ALL)) {
-    if (state.visited_customers != problem_.customer_count()) {
+    if (state.visited_required != problem_.required_count()) {
       return false;
     }
-    return problem_.multi_route ? state.at_depot : true;
+    return problem_.multi_route ||
+                   (problem_.has_repeatable_nodes() && !problem_.open_route)
+               ? state.at_depot
+               : true;
   }
   return state.route.size() > 1 && state.at_depot;
 }
@@ -2241,15 +2547,25 @@ Solution RoutingDecoder::finish(State state) const {
   if (!problem_.open_route && !state.at_depot) {
     const int32_t end =
         problem_.depot_count == 0 ? state.start_node : state.route_depot;
+    std::vector<float> scalar_after;
+    float event_time = 0.0f;
+    std::string scalar_error;
+    if (!scalar_transition(state.current, end, state.resource_state,
+                           scalar_after, true, &event_time, &scalar_error)) {
+      solution.error = "closing " + scalar_error;
+      return solution;
+    }
     for (int32_t index : active_resource_indices_) {
-      float value = state.resource_state[index];
-      if (!resource_transition_feasible(state, end, index, &value, true)) {
+      if (resource(index).op == ResourceOperator::AFFINE_ACCUMULATOR)
+        continue;
+      if (!resource_transition_feasible(state, end, index, nullptr, true,
+                                        event_time)) {
         solution.error = "closing resource bound failed: " +
                          resource(index).name;
         return solution;
       }
-      state.resource_state[index] = value;
     }
+    state.resource_state = std::move(scalar_after);
   }
   for (int32_t index : active_resource_indices_) {
     if (!resource_terminal_feasible(state, index)) {
@@ -2272,7 +2588,7 @@ Solution RoutingDecoder::finish(State state) const {
 
   for (int32_t node = problem_.depot_count; node < problem_.node_count;
        ++node) {
-    if (!state.visited[node]) {
+    if (problem_.is_service_node(node) && !state.visited[node]) {
       solution.missed_penalty += problem_.penalty[node];
     }
   }
@@ -2592,7 +2908,8 @@ Solution RoutingDecoder::scope_restricted_refine(
     const float *coupler_weights, const float *coupler_bias,
     const float *objective_residual, const float *edge_risk, float risk_penalty,
     RolloutTrace *trace, std::mt19937_64 &rng) const {
-  if (!search_config_.use_srr || !solution.feasible) {
+  if (!search_config_.use_srr || !solution.feasible ||
+      problem_.has_repeatable_nodes()) {
     return solution;
   }
   const auto position_of = [](const std::vector<int32_t> &route,
@@ -5697,6 +6014,12 @@ Solution RoutingDecoder::perturb(uint64_t rollout_seed, const float *edge_field,
                      coupler_weights, coupler_bias, objective_residual, edge_risk,
                      risk_penalty, trace, greedy);
   }
+  // The current perturbation and SRR caches intentionally use one position per
+  // service-node id. Expanded routes may contain several occurrences of a
+  // repeatable support facility, so preserve the exact incumbent until the
+  // support-path oracle owns those occurrences.
+  if (problem_.has_repeatable_nodes())
+    return source;
   std::mt19937_64 rng(rollout_seed);
   Solution raw = source;
   std::vector<uint8_t> used(problem_.node_count, 0);
@@ -6150,6 +6473,8 @@ Solution RoutingDecoder::evaluate(const std::vector<int32_t> &route) const {
   int32_t route_depot = problem_.depot_count > 0 ? current : -1;
   const int32_t start_node = current;
   int32_t visited_customers = 0;
+  int32_t visited_required = 0;
+  int32_t route_service_visits = 0;
   int32_t open_pickups = 0;
   int32_t remaining_positive = 0;
   int32_t remaining_negative = 0;
@@ -6166,6 +6491,8 @@ Solution RoutingDecoder::evaluate(const std::vector<int32_t> &route) const {
 
   for (int32_t node = problem_.depot_count; node < problem_.node_count;
        ++node) {
+    if (!problem_.is_service_node(node))
+      continue;
     total_penalty += problem_.penalty[node];
     if (problem_.demand[node] > FEASIBILITY_EPS)
       ++remaining_positive;
@@ -6179,23 +6506,32 @@ Solution RoutingDecoder::evaluate(const std::vector<int32_t> &route) const {
   };
   const auto is_complete = [&]() {
     if (problem_.depot_count == 0)
-      return visited_customers == problem_.customer_count();
+      return visited_required == problem_.required_count();
     if (problem_.has(VISIT_ALL)) {
-      return visited_customers == problem_.customer_count() &&
-             (!problem_.multi_route || at_depot);
+      if (visited_required != problem_.required_count())
+        return false;
+      return problem_.multi_route ||
+                     (problem_.has_repeatable_nodes() && !problem_.open_route)
+                 ? at_depot
+                 : true;
     }
     return visited_customers > 0 && at_depot;
   };
 
   if (problem_.depot_count == 0) {
-    visited[current] = 1;
-    visited_customers = 1;
-    collected_prize = problem_.prize[current];
-    served_penalty = problem_.penalty[current];
-    if (problem_.demand[current] > FEASIBILITY_EPS)
-      --remaining_positive;
-    else if (problem_.demand[current] < -FEASIBILITY_EPS)
-      --remaining_negative;
+    if (!problem_.is_repeatable_node(current))
+      visited[current] = 1;
+    if (problem_.is_service_node(current)) {
+      visited_customers = 1;
+      visited_required = problem_.is_required_node(current) ? 1 : 0;
+      route_service_visits = 1;
+      collected_prize = problem_.prize[current];
+      served_penalty = problem_.penalty[current];
+      if (problem_.demand[current] > FEASIBILITY_EPS)
+        --remaining_positive;
+      else if (problem_.demand[current] < -FEASIBILITY_EPS)
+        --remaining_negative;
+    }
   } else {
     load = reload();
   }
@@ -6206,40 +6542,14 @@ Solution RoutingDecoder::evaluate(const std::vector<int32_t> &route) const {
     for (int32_t resource_index : scalar_resource_indices_)
       scalar_state[resource_index] = resource(resource_index).initial;
   }
-  int32_t resource_current = current;
   const auto extend_resource_kernels = [&](int32_t next,
-                                           bool force_route_end) {
-    const bool depot = next < problem_.depot_count;
-    for (int32_t resource_index : scalar_resource_indices_) {
-      const ResourceSpec &spec = resource(resource_index);
-      float value = scalar_state[resource_index];
-      const bool event_reset =
-          !spec.reset_nodes.empty() && spec.reset_nodes[next];
-      if (spec.edge_uses_distance)
-        value +=
-            spec.edge_coefficient * problem_.dist(resource_current, next);
-      if (!spec.edge_values.empty())
-        value += spec.edge_coefficient *
-                 spec.edge_values[static_cast<size_t>(resource_current) *
-                                      problem_.node_count +
-                                  next];
-      if (!spec.node_values.empty())
-        value += spec.node_coefficient * spec.node_values[next];
-      const bool check = spec.bound_check == BoundCheck::TRANSITION ||
-                         ((depot || force_route_end) &&
-                          spec.bound_check == BoundCheck::ROUTE_END);
-      if (check && (value < spec.lower - FEASIBILITY_EPS ||
-                    value > spec.upper + FEASIBILITY_EPS)) {
-        failed.error = "resource bound failed: " + spec.name;
-        return false;
-      }
-      if ((depot && spec.reset_at_depot) || event_reset)
-        value = spec.reset_value;
-      else if (depot && spec.scope == ResourceScope::ROUTE)
-        value = spec.initial;
-      scalar_state[resource_index] = value;
-    }
-    resource_current = next;
+                                           bool force_route_end,
+                                           float &event_time) {
+    std::vector<float> after;
+    if (!scalar_transition(current, next, scalar_state, after,
+                           force_route_end, &event_time, &failed.error))
+      return false;
+    scalar_state = std::move(after);
     return true;
   };
 
@@ -6255,13 +6565,18 @@ Solution RoutingDecoder::evaluate(const std::vector<int32_t> &route) const {
     }
     if (find_edge(current, next) < 0)
       ++off_graph_edges;
-    if (!extend_resource_kernels(next, false))
+    float event_time = 0.0f;
+    if (!extend_resource_kernels(next, false, event_time))
       return failed;
 
     if (next < problem_.depot_count) {
+      const bool support_close =
+          problem_.has_repeatable_nodes() && !problem_.open_route &&
+          visited_required == problem_.required_count();
       bool depot_allowed = problem_.depot_count > 0 && !at_depot &&
+                           route_service_visits > 0 &&
                            (problem_.multi_route ||
-                            !problem_.has(VISIT_ALL));
+                            !problem_.has(VISIT_ALL) || support_close);
       if (problem_.has(PICKUP_DELIVERY) && open_pickups != 0)
         depot_allowed = false;
       if (problem_.has(PRIZE_QUOTA) &&
@@ -6280,13 +6595,15 @@ Solution RoutingDecoder::evaluate(const std::vector<int32_t> &route) const {
       route_depot = next;
       at_depot = true;
       route_has_backhaul = false;
+      route_service_visits = 0;
       route_distance = 0.0f;
       current_time = 0.0f;
       load = reload();
       continue;
     }
 
-    if (visited[next]) {
+    if (next == current ||
+        (!problem_.is_repeatable_node(next) && visited[next])) {
       failed.error = "route contains an infeasible transition to node " +
                      std::to_string(next);
       return failed;
@@ -6336,7 +6653,7 @@ Solution RoutingDecoder::evaluate(const std::vector<int32_t> &route) const {
     if (problem_.has(TIME_WINDOWS) &&
         (arrival > problem_.tw_end[next] + FEASIBILITY_EPS ||
          (!problem_.open_route &&
-          arrival + problem_.service_time[next] +
+          arrival + event_time + problem_.service_time[next] +
                   problem_.dist(next, route_depot) >
               problem_.tw_end[route_depot] + FEASIBILITY_EPS))) {
       failed.error = "route contains an infeasible transition to node " +
@@ -6346,7 +6663,7 @@ Solution RoutingDecoder::evaluate(const std::vector<int32_t> &route) const {
 
     distance += edge;
     route_distance = next_route_distance;
-    current_time = arrival + problem_.service_time[next];
+    current_time = arrival + event_time + problem_.service_time[next];
     load = next_load;
     route_has_backhaul |= problem_.demand[next] < -FEASIBILITY_EPS;
     if (problem_.delivery_of_pickup[next] >= 0)
@@ -6355,14 +6672,19 @@ Solution RoutingDecoder::evaluate(const std::vector<int32_t> &route) const {
       --open_pickups;
     current = next;
     at_depot = false;
-    visited[next] = 1;
-    ++visited_customers;
-    collected_prize += problem_.prize[next];
-    served_penalty += problem_.penalty[next];
-    if (problem_.demand[next] > FEASIBILITY_EPS)
-      --remaining_positive;
-    else if (problem_.demand[next] < -FEASIBILITY_EPS)
-      --remaining_negative;
+    if (!problem_.is_repeatable_node(next))
+      visited[next] = 1;
+    if (problem_.is_service_node(next)) {
+      ++visited_customers;
+      visited_required += problem_.is_required_node(next) ? 1 : 0;
+      ++route_service_visits;
+      collected_prize += problem_.prize[next];
+      served_penalty += problem_.penalty[next];
+      if (problem_.demand[next] > FEASIBILITY_EPS)
+        --remaining_positive;
+      else if (problem_.demand[next] < -FEASIBILITY_EPS)
+        --remaining_negative;
+    }
   }
 
   if (!is_complete()) {
@@ -6376,7 +6698,8 @@ Solution RoutingDecoder::evaluate(const std::vector<int32_t> &route) const {
   if (problem_.has(VISIT_ALL) && !problem_.multi_route && !at_depot &&
       !problem_.open_route) {
     const int32_t end = problem_.depot_count == 0 ? start_node : route_depot;
-    if (!extend_resource_kernels(end, true))
+    float event_time = 0.0f;
+    if (!extend_resource_kernels(end, true, event_time))
       return failed;
     distance += problem_.dist(current, end);
     if (find_edge(current, end) < 0)
@@ -6445,7 +6768,8 @@ ResourceEvaluation RoutingDecoder::evaluate_resources(
   int32_t pair_count = 0;
   int32_t precedence_violations = 0;
   int32_t backhaul_violations = 0;
-  int32_t visited_customers = 0;
+  int32_t visited_required = 0;
+  int32_t route_service_visits = 0;
   const auto initial_load = [&](size_t begin) {
     bool has_linehaul = false;
     bool has_backhaul = false;
@@ -6479,9 +6803,35 @@ ResourceEvaluation RoutingDecoder::evaluate_resources(
     pair_count += problem_.delivery_of_pickup[node] >= 0 ? 1 : 0;
   }
   if (problem_.depot_count == 0) {
-    visited[current] = 1;
-    ++visited_customers;
-    collected_prize += problem_.prize[current];
+    if (!problem_.is_repeatable_node(current))
+      visited[current] = 1;
+    if (problem_.is_service_node(current)) {
+      visited_required += problem_.is_required_node(current) ? 1 : 0;
+      route_service_visits = 1;
+      collected_prize += problem_.prize[current];
+    }
+  }
+
+  // Execute the same scalar/event program used by construction and exact
+  // evaluation once up front so compiled time-window metrics include dynamic
+  // node-event durations such as charging or mandatory breaks.
+  std::vector<float> event_scalar_state(resource_count(), 0.0f);
+  for (int32_t resource_index : scalar_resource_indices_)
+    event_scalar_state[resource_index] = resource(resource_index).initial;
+  std::vector<float> scalar_raw_violation(resource_count(), 0.0f);
+  std::vector<float> event_time(route.size(), 0.0f);
+  int32_t event_current = route.front();
+  for (size_t index = 1; index < route.size(); ++index) {
+    const int32_t next = route[index];
+    if (next < 0 || next >= problem_.node_count)
+      continue;
+    std::vector<float> after;
+    std::string ignored_error;
+    (void)scalar_transition(event_current, next, event_scalar_state, after,
+                            false, &event_time[index], &ignored_error,
+                            &scalar_raw_violation);
+    event_scalar_state = std::move(after);
+    event_current = next;
   }
 
   const auto close_route = [&]() {
@@ -6521,7 +6871,7 @@ ResourceEvaluation RoutingDecoder::evaluate_resources(
       return result;
     }
     if (next < problem_.depot_count) {
-      if (problem_.depot_count == 0 || at_depot) {
+      if (problem_.depot_count == 0 || at_depot || route_service_visits == 0) {
         result.error = "route contains an invalid depot transition";
         return result;
       }
@@ -6532,13 +6882,15 @@ ResourceEvaluation RoutingDecoder::evaluate_resources(
       route_depot = next;
       at_depot = true;
       route_has_backhaul = false;
+      route_service_visits = 0;
       route_distance = 0.0f;
       route_time = 0.0f;
       load = initial_load(index + 1);
       open_pickups = 0;
       continue;
     }
-    if (visited[next]) {
+    if (next == current ||
+        (!problem_.is_repeatable_node(next) && visited[next])) {
       result.error = "route visits a customer more than once";
       return result;
     }
@@ -6552,7 +6904,7 @@ ResourceEvaluation RoutingDecoder::evaluate_resources(
       min_time_slack = std::min(
           min_time_slack, std::max(problem_.tw_end[next] - arrival, 0.0f));
     }
-    route_time = arrival + problem_.service_time[next];
+    route_time = arrival + event_time[index] + problem_.service_time[next];
 
     const float demand = problem_.demand[next];
     load -= demand;
@@ -6578,9 +6930,13 @@ ResourceEvaluation RoutingDecoder::evaluate_resources(
       --open_pickups;
     max_open_pickups = std::max(max_open_pickups, open_pickups);
 
-    visited[next] = 1;
-    ++visited_customers;
-    collected_prize += problem_.prize[next];
+    if (!problem_.is_repeatable_node(next))
+      visited[next] = 1;
+    if (problem_.is_service_node(next)) {
+      visited_required += problem_.is_required_node(next) ? 1 : 0;
+      ++route_service_visits;
+      collected_prize += problem_.prize[next];
+    }
     current = next;
     at_depot = false;
   }
@@ -6590,7 +6946,7 @@ ResourceEvaluation RoutingDecoder::evaluate_resources(
   if (open_pickups > 0)
     precedence_violations += open_pickups;
   if (problem_.has(VISIT_ALL) &&
-      visited_customers != problem_.customer_count()) {
+      visited_required != problem_.required_count()) {
     result.error = "route omits required customers";
     return result;
   }
@@ -6640,13 +6996,7 @@ ResourceEvaluation RoutingDecoder::evaluate_resources(
       result.binding[channel] = 1.0f;
     }
   }
-  std::vector<float> scalar_state;
-  if (!scalar_resource_indices_.empty()) {
-    scalar_state.assign(resource_count(), 0.0f);
-    for (int32_t resource_index : scalar_resource_indices_)
-      scalar_state[resource_index] = resource(resource_index).initial;
-  }
-  int32_t resource_current = route.front();
+  std::vector<float> scalar_state = event_scalar_state;
   const auto record_scalar = [&](int32_t resource_index, float value,
                                  bool check_bound) {
     const ResourceSpec &spec = resource(resource_index);
@@ -6673,46 +7023,26 @@ ResourceEvaluation RoutingDecoder::evaluate_resources(
         std::max(result.binding[resource_index],
                  std::clamp(binding, 0.0f, 1.0f));
   };
-  const auto extend_scalar_kernels = [&](int32_t next, bool force_route_end) {
-    const bool depot = next < problem_.depot_count;
-    for (int32_t resource_index : scalar_resource_indices_) {
-      const ResourceSpec &spec = resource(resource_index);
-      float value = scalar_state[resource_index];
-      const bool event_reset =
-          !spec.reset_nodes.empty() && spec.reset_nodes[next];
-      if (spec.edge_uses_distance)
-        value +=
-            spec.edge_coefficient * problem_.dist(resource_current, next);
-      if (!spec.edge_values.empty())
-        value += spec.edge_coefficient *
-                 spec.edge_values[static_cast<size_t>(resource_current) *
-                                      problem_.node_count +
-                                  next];
-      if (!spec.node_values.empty())
-        value += spec.node_coefficient * spec.node_values[next];
-      const bool check = spec.bound_check == BoundCheck::TRANSITION ||
-                         ((depot || force_route_end) &&
-                          spec.bound_check == BoundCheck::ROUTE_END);
-      record_scalar(resource_index, value, check);
-      if ((depot && spec.reset_at_depot) || event_reset)
-        value = spec.reset_value;
-      else if (depot && spec.scope == ResourceScope::ROUTE)
-        value = spec.initial;
-      scalar_state[resource_index] = value;
-    }
-    resource_current = next;
-  };
-  for (size_t route_index = 1; route_index < route.size(); ++route_index) {
-    extend_scalar_kernels(route[route_index], false);
-  }
   if (problem_.has(VISIT_ALL) && !problem_.multi_route && !at_depot &&
       !problem_.open_route) {
     const int32_t end = problem_.depot_count == 0 ? route.front() : route_depot;
-    extend_scalar_kernels(end, true);
+    std::vector<float> after;
+    float ignored_time = 0.0f;
+    std::string ignored_error;
+    (void)scalar_transition(event_current, end, scalar_state, after, true,
+                            &ignored_time, &ignored_error,
+                            &scalar_raw_violation);
+    scalar_state = std::move(after);
   }
   for (int32_t resource_index : scalar_resource_indices_) {
+    result.violation[resource_index] = std::max(
+        result.violation[resource_index],
+        scalar_raw_violation[resource_index] /
+            std::max(runtime_resource_scale(resource_index), EPS));
     if (resource(resource_index).bound_check == BoundCheck::SOLUTION_END)
       record_scalar(resource_index, scalar_state[resource_index], true);
+    else
+      record_scalar(resource_index, scalar_state[resource_index], false);
     if (result.violation[resource_index] > FEASIBILITY_EPS)
       result.binding[resource_index] = 1.0f;
   }
