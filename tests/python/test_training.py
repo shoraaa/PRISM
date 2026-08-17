@@ -1,4 +1,5 @@
 import copy
+import math
 import random
 import sys
 from argparse import Namespace
@@ -10,7 +11,12 @@ import torch
 
 import prism_decoder
 from net import ConstraintFieldNet, build_decoder_data
-from problem_data import TRAIN_VARIANTS, VariantCurriculum, problem_schema
+from problem_data import (
+    TRAIN_VARIANTS,
+    VariantCurriculum,
+    generated_problem,
+    problem_schema,
+)
 from train import (
     OptionOutcome,
     OptionStep,
@@ -26,6 +32,7 @@ from train import (
     _objective_residual_loss,
     _random_guidance,
     _feasibility_loss,
+    _guidance_numpy,
     _load_optimizer_state_compat,
     _positive_class_weight,
     _rollout_class_weights,
@@ -40,6 +47,7 @@ from train import (
     parse_args,
     ppo_update,
     replay_decision_logp_from_cpp_batch_trace,
+    replay_srr_decision_logp_from_cpp_batch_trace,
     setup_decoder,
     validation,
 )
@@ -658,6 +666,7 @@ def test_inference_is_deterministic() -> None:
     assert np.array_equal(first[1]["route"], second[1]["route"])
     assert first[1]["objective"] == second[1]["objective"]
     assert first[2]["net_evals"] >= 2.0
+    assert math.isfinite(first[2]["construction_objective"])
     assert first[2]["emissions"] == first[2]["net_evals"]
     assert second[2]["emissions"] == second[2]["net_evals"]
 
@@ -702,6 +711,7 @@ def test_zero_neutral_model_reproduces_plain_objective_search() -> None:
         result = infer_instance(None, problem, args, baseline=baseline)
         assert result[1]["feasible"]
         assert result[2]["net_evals"] == 0.0
+        assert math.isfinite(result[2]["construction_objective"])
 
 
 def test_distance_guidance_replaces_objective_energy_with_distance() -> None:
@@ -1007,6 +1017,8 @@ def test_validation_size_defaults_to_eight_instances(monkeypatch) -> None:
     assert args.epochs == 100
     assert args.pretrain_epochs == 0
     assert args.option_max_steps == 4
+    assert args.min_changed_edges == 8
+    assert args.max_perturb_attempts == 64
     assert args.smdp_gamma == pytest.approx(0.99)
     assert args.infeasible_penalty == pytest.approx(10.0)
     assert args.feasibility_risk_penalty == pytest.approx(1.0)
@@ -1015,8 +1027,230 @@ def test_validation_size_defaults_to_eight_instances(monkeypatch) -> None:
     assert args.aux_rl_scale == pytest.approx(0.0)
     assert args.objective_residual_enabled is True
     assert args.objective_residual_l2 == pytest.approx(0.1)
+    assert args.srr_loss_weight == pytest.approx(0.0)
+    assert args.srr_policy_horizon == 64
+    assert args.srr_policy_beta == pytest.approx(2.0)
     assert args.val_ema_decay == pytest.approx(0.0)
     assert args.lr_schedule == "constant"
+
+
+def test_perturbation_cli_is_forwarded_to_decoder(monkeypatch) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "train.py",
+            "--min-changed-edges",
+            "5",
+            "--max-perturb-attempts",
+            "23",
+        ],
+    )
+    args = parse_args()
+    coordinates = np.zeros((4, 2), dtype=np.float32)
+    distance = np.ones((4, 4), dtype=np.float32)
+    np.fill_diagonal(distance, 0.0)
+    decoder = _new_decoder(
+        problem_schema("tsp")
+        | {"name": "tsp", "coordinates": coordinates, "distance": distance},
+        args,
+        deterministic=True,
+    )
+
+    assert decoder.metadata["search"]["min_changed_edges"] == 5
+    assert decoder.metadata["search"]["max_perturb_attempts"] == 23
+
+
+def test_srr_policy_trace_replays_native_energy_and_logp() -> None:
+    rng = np.random.default_rng(811)
+    coordinates = rng.random((20, 2), dtype=np.float32)
+    problem = problem_schema("tsp") | {
+        "name": "tsp",
+        "coordinates": coordinates,
+        "distance": np.linalg.norm(
+            coordinates[:, None] - coordinates[None, :], axis=-1
+        ).astype(np.float32),
+    }
+    args = _args()
+    args.candidates = 16
+    args.min_changed_edges = 4
+    args.max_perturb_attempts = 32
+    args.srr_loss_weight = 1.0
+    args.srr_policy_beta = 2.0
+    args.srr_policy_horizon = 8
+    model = ConstraintFieldNet(depth=1, units=8)
+    decoder, _ = setup_decoder(problem, args, model=model, field_enabled=True)
+    graph = build_decoder_data(decoder, "cpu")
+    output = model(graph)
+
+    traced = decoder.sample_traced(
+        **_guidance_numpy(
+            output, graph, risk_penalty=args.feasibility_risk_penalty
+        )
+    )
+    trace = traced["trace"]
+    assert all(
+        int(solution["srr_moves"]) <= args.srr_policy_horizon
+        for solution in traced["solutions"]
+    )
+    logp, _, decisions, energy = (
+        replay_srr_decision_logp_from_cpp_batch_trace(
+            trace,
+            output,
+            model,
+            args.srr_policy_beta,
+            risk_penalty=args.feasibility_risk_penalty,
+        )
+    )
+
+    assert logp.numel() > 0
+    assert int(decisions.sum().item()) == logp.numel()
+    candidate_offsets = np.asarray(trace["srr_candidate_offsets"])
+    objective_delta = np.asarray(trace["srr_candidate_objective_delta"])
+    energy_delta = np.asarray(trace["srr_candidate_energy_delta"])
+    # STOP is the final zero-delta candidate in every unified action set.
+    stop_indices = candidate_offsets[1:] - 1
+    assert np.all(objective_delta[stop_indices] == 0.0)
+    assert np.all(energy_delta[stop_indices] == 0.0)
+    assert np.asarray(trace["srr_stop"]).shape == np.asarray(
+        trace["srr_chosen_indices"]
+    ).shape
+    non_stop = np.ones(objective_delta.shape, dtype=bool)
+    non_stop[stop_indices] = False
+    assert np.any(objective_delta[non_stop] < 0.0)
+    assert np.any(objective_delta[non_stop] > 0.0)
+    torch.testing.assert_close(
+        logp.detach(),
+        torch.as_tensor(trace["srr_log_probabilities"]),
+        atol=2e-5,
+        rtol=2e-5,
+    )
+    torch.testing.assert_close(
+        energy.detach(),
+        torch.as_tensor(trace["srr_candidate_energy_delta"]),
+        atol=2e-5,
+        rtol=2e-5,
+    )
+    (-logp.mean()).backward()
+    assert model.objective_energy_residual_head[-1].weight.grad is not None
+
+    deterministic_decoder, _ = setup_decoder(
+        problem,
+        args,
+        deterministic=True,
+        model=model,
+        field_enabled=True,
+    )
+    assert deterministic_decoder.metadata["search"]["srr_policy_enabled"] is True
+    assert deterministic_decoder.metadata["search"]["srr_policy_beta"] == 0.0
+    deterministic_graph = build_decoder_data(deterministic_decoder, "cpu")
+    with torch.no_grad():
+        deterministic_output = model(deterministic_graph)
+    deterministic_result = deterministic_decoder.sample_greedy(
+        **_guidance_numpy(
+            deterministic_output,
+            deterministic_graph,
+            risk_penalty=args.feasibility_risk_penalty,
+        )
+    )
+    assert deterministic_result["feasible"]
+    assert int(deterministic_result["srr_moves"]) <= args.srr_policy_horizon
+
+
+def test_srr_loss_updates_policy_with_perturbation_ppo_disabled() -> None:
+    rng = np.random.default_rng(812)
+    coordinates = rng.random((24, 2), dtype=np.float32)
+    problem = problem_schema("cvrp") | {
+        "name": "cvrp",
+        "coordinates": coordinates,
+        "distance": np.linalg.norm(
+            coordinates[:, None] - coordinates[None, :], axis=-1
+        ).astype(np.float32),
+        "demand": np.r_[0.0, rng.uniform(0.01, 0.07, 23)].astype(np.float32),
+        "capacity": 0.5,
+    }
+    args = _args()
+    args.candidates = 20
+    args.min_changed_edges = 4
+    args.max_perturb_attempts = 32
+    args.pretrain_epochs = 0
+    args.ppo_epochs = 1
+    args.rl_weight = 0.0
+    args.srr_loss_weight = 1.0
+    args.srr_policy_beta = 2.0
+    args.temporal_credit_weight = 0.0
+    args.aux_rl_scale = 0.0
+    args.objective_residual_l2 = 0.0
+    args.entropy_weight = 0.0
+    model = ConstraintFieldNet(depth=1, units=8)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    rollout = collect_instance_rollout(model, problem, "cvrp", args)
+    traced_steps = [
+        step for step in rollout.steps if step.old_srr_logp.numel() > 0
+    ]
+    assert traced_steps
+    for step in rollout.steps:
+        step.rewards = torch.tensor([-1.0, 1.0])
+    before = [step.old_srr_logp.clone() for step in traced_steps]
+
+    metrics = ppo_update(model, optimizer, [rollout], args, epoch=0)
+
+    drift = []
+    with torch.no_grad():
+        for step, old_logp in zip(traced_steps, before):
+            output = model(step.graph)
+            new_logp, _, _, _ = replay_srr_decision_logp_from_cpp_batch_trace(
+                step.trace,
+                output,
+                model,
+                args.srr_policy_beta,
+                risk_penalty=step.risk_penalty,
+            )
+            drift.append(float((new_logp - old_logp).abs().max()))
+    assert max(drift) > 0.0
+    assert metrics["srr_decisions"] > 0.0
+    assert metrics["rl_loss"] == pytest.approx(0.0)
+
+
+@pytest.mark.parametrize("variant", ["tsp", "cvrp", "vrptw", "op", "pctsp"])
+def test_unified_srr_policy_is_schema_generic(variant: str) -> None:
+    setup_seeds = 820 + sum(map(ord, variant))
+    random.seed(setup_seeds)
+    np.random.seed(setup_seeds)
+    torch.manual_seed(setup_seeds)
+    problem = generated_problem(variant, 20)
+    args = _args()
+    args.candidates = 16
+    args.srr_loss_weight = 1.0
+    args.srr_policy_beta = 2.0
+    args.srr_policy_horizon = 4
+    model = ConstraintFieldNet(depth=1, units=8)
+    decoder, _ = setup_decoder(problem, args, model=model, field_enabled=True)
+    graph = build_decoder_data(decoder, "cpu")
+    output = model(graph)
+    traced = decoder.sample_traced(
+        **_guidance_numpy(
+            output,
+            graph,
+            risk_penalty=args.feasibility_risk_penalty,
+        )
+    )
+    assert all(solution["feasible"] for solution in traced["solutions"])
+    assert all(
+        int(solution["srr_moves"]) <= args.srr_policy_horizon
+        for solution in traced["solutions"]
+    )
+    trace = traced["trace"]
+    assert len(trace["srr_candidate_constant_delta"]) == len(
+        trace["srr_candidate_energy_delta"]
+    )
+    replay_srr_decision_logp_from_cpp_batch_trace(
+        trace,
+        output,
+        model,
+        args.srr_policy_beta,
+        risk_penalty=args.feasibility_risk_penalty,
+    )
 
 
 def test_no_objective_residual_cli_zeros_and_freezes_objective_head(monkeypatch) -> None:

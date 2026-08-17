@@ -4,6 +4,7 @@ import importlib.util
 import pickle
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -29,6 +30,25 @@ def test_compare_defaults_to_eight_dynamic_instances() -> None:
     assert args.tsptw_hardness == "hard"
     assert args.tsptw_dataset_seed == 2025
     assert args.baselines == "constant"
+    assert args.shared_greedy_bootstrap is False
+    assert args.min_changed_edges == 8
+    assert args.max_perturb_attempts == 64
+
+
+def test_compare_perturbation_cli_overrides_defaults() -> None:
+    args = decoder_evaluation.parse_args(
+        [
+            "--checkpoint",
+            "model.pt",
+            "--min-changed-edges",
+            "6",
+            "--max-perturb-attempts",
+            "19",
+        ]
+    )
+
+    assert args.min_changed_edges == 6
+    assert args.max_perturb_attempts == 19
 
 
 def test_compare_baseline_selection() -> None:
@@ -83,6 +103,52 @@ def test_compare_baseline_selection() -> None:
     assert decoder_evaluation.selected_baselines(none.baselines) == ("none",)
 
 
+def test_shared_greedy_bootstrap_requires_one_live_native_baseline() -> None:
+    assert decoder_evaluation._shared_greedy_baseline(
+        True, ("constant",), None
+    ) == "constant"
+    assert decoder_evaluation._shared_greedy_baseline(
+        False, ("constant", "distance"), None
+    ) is None
+
+    for baselines in (("constant", "distance"), ("urs",), ("none",)):
+        with pytest.raises(ValueError):
+            decoder_evaluation._shared_greedy_baseline(
+                True, baselines, None
+            )
+    with pytest.raises(ValueError):
+        decoder_evaluation._shared_greedy_baseline(
+            True, ("constant",), Path("cached.csv")
+        )
+
+
+def test_shared_greedy_route_uses_selected_baseline_guidance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeDecoder:
+        def sample_greedy(self, **guidance):
+            assert guidance == {"mode": "distance"}
+            return {"feasible": True, "route": [0, 2, 1]}
+
+    decoder = FakeDecoder()
+    monkeypatch.setattr(
+        decoder_evaluation,
+        "_new_decoder",
+        lambda problem, args, deterministic: decoder,
+    )
+    monkeypatch.setattr(
+        decoder_evaluation,
+        "_distance_guidance",
+        lambda actual_decoder, problem: {"mode": "distance"},
+    )
+
+    route = decoder_evaluation._greedy_baseline_route(
+        {"name": "tsp"}, SimpleNamespace(seed=7), "distance"
+    )
+
+    assert route == [0, 2, 1]
+
+
 def test_neural_only_split_summary_omits_comparison_metrics() -> None:
     rows = [
         {
@@ -126,10 +192,38 @@ def test_cached_csv_supplies_available_baseline_rows(tmp_path: Path) -> None:
     assert baselines == ("distance",)
     assert rows[("tsp", "distance", 8)] == {
         "baseline_objective": 7.5,
+        "baseline_construction_objective": "",
         "direction": "minimize",
     }
     assert rows[("op", "distance", 8)]["direction"] == "maximize"
     assert all(key[0] != "cvrp" for key in rows)
+
+
+def test_cached_csv_preserves_construction_objective(tmp_path: Path) -> None:
+    cached_path = tmp_path / "cached.csv"
+    cached_path.write_text(
+        "variant,baseline,val_size,direction,baseline_construction_objective,"
+        "baseline_objective\n"
+        "tsp,distance,8,minimize,8.5,7.5\n"
+    )
+
+    rows, _ = decoder_evaluation.load_cached_baseline_rows(cached_path)
+
+    assert rows[("tsp", "distance", 8)][
+        "baseline_construction_objective"
+    ] == 8.5
+
+
+def test_formats_construction_before_final() -> None:
+    assert decoder_evaluation._format_construction_final(
+        12.5, 10.0, format_spec=".6g"
+    ) == "12.5/10"
+    assert decoder_evaluation._format_construction_final(
+        25.0, 0.0, format_spec=".3f", suffix="%"
+    ) == "25.000%/0.000%"
+    assert decoder_evaluation._format_construction_final(
+        "", 10.0, format_spec=".6g"
+    ) == "n/a/10"
 
 
 def test_urs_baseline_requires_identifier() -> None:

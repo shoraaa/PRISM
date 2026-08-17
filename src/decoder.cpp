@@ -5,9 +5,11 @@
 #include <array>
 #include <cmath>
 #include <deque>
+#include <iterator>
 #include <memory>
 #include <optional>
 #include <queue>
+#include <set>
 #include <stdexcept>
 
 #include <omp.h>
@@ -529,6 +531,16 @@ void SearchConfig::validate() const {
   }
   if (srr_exploration_budget < 0) {
     throw std::invalid_argument("srr_exploration_budget must be non-negative");
+  }
+  if (srr_policy_horizon < 0) {
+    throw std::invalid_argument("srr_policy_horizon must be non-negative");
+  }
+  if (srr_policy_enabled && srr_policy_horizon == 0) {
+    throw std::invalid_argument(
+        "srr_policy_horizon must be positive when the SRR policy is enabled");
+  }
+  if (!std::isfinite(srr_policy_beta) || srr_policy_beta < 0.0f) {
+    throw std::invalid_argument("srr_policy_beta must be finite and non-negative");
   }
 }
 
@@ -2579,7 +2591,7 @@ Solution RoutingDecoder::scope_restricted_refine(
     const float *multipliers,
     const float *coupler_weights, const float *coupler_bias,
     const float *objective_residual, const float *edge_risk, float risk_penalty,
-    RolloutTrace *trace) const {
+    RolloutTrace *trace, std::mt19937_64 &rng) const {
   if (!search_config_.use_srr || !solution.feasible) {
     return solution;
   }
@@ -4578,6 +4590,38 @@ Solution RoutingDecoder::scope_restricted_refine(
     std::vector<PlannedRoute> plans;
     std::optional<ResourceEvaluation> resources;
   };
+  struct SrrPolicyCandidate {
+    Solution solution;
+    AcceptedPlan plan;
+    StructuralMove structural;
+    double energy = 0.0;
+    double objective_delta = 0.0;
+    bool stop = false;
+  };
+
+  const bool srr_policy_active = search_config_.srr_policy_enabled;
+  const bool srr_policy_stochastic =
+      srr_policy_active && search_config_.srr_policy_beta > 0.0f;
+  const auto route_graph_edges = [&](const std::vector<int32_t> &route) {
+    std::vector<int32_t> edges;
+    edges.reserve(route.size() + 1);
+    for (size_t index = 1; index < route.size(); ++index) {
+      if (route[index - 1] < problem_.depot_count &&
+          route[index] < problem_.depot_count) {
+        continue;
+      }
+      const int32_t edge = find_edge(route[index - 1], route[index]);
+      if (edge >= 0)
+        edges.push_back(edge);
+    }
+    if (problem_.depot_count == 0 && !problem_.open_route && route.size() > 1) {
+      const int32_t edge = find_edge(route.back(), route.front());
+      if (edge >= 0)
+        edges.push_back(edge);
+    }
+    std::sort(edges.begin(), edges.end());
+    return edges;
+  };
 
   std::vector<int32_t> ranked_local_edges(edge_count());
   std::vector<double> ranking_energy(edge_count());
@@ -4612,8 +4656,11 @@ Solution RoutingDecoder::scope_restricted_refine(
   // that is returned so an uphill excursion never degrades the result. Disabled
   // (budget 0) unless a non-flat field is guiding the search.
   int32_t exploration_remaining = search_config_.srr_exploration_budget;
+  int32_t policy_remaining = search_config_.srr_policy_horizon;
   Solution champion = solution;
   while (!checklist.empty()) {
+    if (srr_policy_active && policy_remaining <= 0)
+      break;
     const int32_t anchor = checklist.front();
     checklist.pop_front();
     in_queue[anchor] = 0;
@@ -4637,11 +4684,46 @@ Solution RoutingDecoder::scope_restricted_refine(
     Solution best_explore_move;
     AcceptedPlan best_explore_plan;
     double best_explore_energy = std::numeric_limits<double>::infinity();
+    std::vector<SrrPolicyCandidate> policy_candidates;
+    std::set<std::vector<int32_t>> policy_routes;
+    bool policy_stop = false;
+    const auto append_policy_candidate = [&](SrrPolicyCandidate candidate) {
+      // Different operators can materialize the same route.  Treat the route
+      // as one action so operator multiplicity does not silently bias policy
+      // probabilities.
+      if (policy_routes.insert(candidate.solution.route).second)
+        policy_candidates.push_back(std::move(candidate));
+    };
+    const auto policy_route_guidance = [&](const std::vector<int32_t> &route) {
+      GuidanceValue value(resource_count());
+      const auto append = [&](int32_t from, int32_t to) {
+        if (from < problem_.depot_count && to < problem_.depot_count)
+          return;
+        value = add_guidance(value, edge_guidance(from, to));
+      };
+      for (size_t index = 1; index < route.size(); ++index)
+        append(route[index - 1], route[index]);
+      if (problem_.depot_count == 0 && !problem_.open_route && route.size() > 1)
+        append(route.back(), route.front());
+      return value;
+    };
     const auto consider = [&](const std::vector<int32_t> &trial,
                               StructuralMove structural) {
       ++full_evaluations;
-      const Solution candidate = evaluate(trial);
+      Solution candidate = evaluate(trial);
       record_screening(candidate);
+      if (!candidate.feasible)
+        return;
+      if (srr_policy_active) {
+        const GuidanceValue guided = policy_route_guidance(candidate.route);
+        append_policy_candidate(
+            {std::move(candidate), {}, structural,
+             guidance_energy(guided, anchor_state.data()),
+             (guided.objective - current_guidance.objective) /
+                 objective_energy_scale_,
+             false});
+        return;
+      }
       if (better(candidate, solution) && better(candidate, best_move)) {
         best_move = candidate;
         best_plan = {};
@@ -4805,10 +4887,10 @@ Solution RoutingDecoder::scope_restricted_refine(
               scored.distance, scored.collected_prize, scored.missed_penalty);
           const double planned_energy =
               guidance_energy(guided, anchor_state.data());
-          // The guided energy is anchor-specific rather than a global
-          // potential. Keep the global objective as the monotone acceptance
-          // gate and use energy to select among improving moves. A bounded
-          // exploration budget may admit energy-descending uphill escapes.
+          // The legacy path keeps monotone objective acceptance plus its
+          // optional bounded exploration.  The unified policy instead sees
+          // every exactly feasible candidate before knowing whether it is an
+          // improving move or an escape.
           const bool improving_gate =
               better(scored, solution) &&
               planned_energy < best_guided_energy - 1.0e-12;
@@ -4817,7 +4899,7 @@ Solution RoutingDecoder::scope_restricted_refine(
               planned_energy <
                   current_anchor_energy - search_config_.srr_exploration_margin &&
               planned_energy < best_explore_energy;
-          if (!improving_gate && !explore_gate)
+          if (!srr_policy_active && !improving_gate && !explore_gate)
             return;
           std::vector<int32_t> trial;
           if (!materialize(trial))
@@ -4865,26 +4947,35 @@ Solution RoutingDecoder::scope_restricted_refine(
           }
           if (!candidate.feasible)
             return;
-          if (better(candidate, solution) &&
-              planned_energy < best_guided_energy - 1.0e-12) {
-            best_move = std::move(candidate);
-            best_guided_energy = planned_energy;
-            best_plan.valid = true;
-            best_plan.plans = plans;
-            best_plan.resources = planned_resource;
-            best_structural = {};
+          if (srr_policy_active) {
+            append_policy_candidate(
+                {std::move(candidate), {true, plans, planned_resource}, {},
+                 planned_energy,
+                 (guided.objective - current_guidance.objective) /
+                     objective_energy_scale_,
+                 false});
+          } else if (better(candidate, solution)) {
+            if (planned_energy < best_guided_energy - 1.0e-12) {
+              best_move = std::move(candidate);
+              best_guided_energy = planned_energy;
+              best_plan.valid = true;
+              best_plan.plans = plans;
+              best_plan.resources = planned_resource;
+              best_structural = {};
+            }
           } else if (exploration_remaining > 0 &&
                      planned_energy < current_anchor_energy -
-                                          search_config_.srr_exploration_margin &&
-                     planned_energy < best_explore_energy) {
+                                          search_config_.srr_exploration_margin) {
             // No strictly-improving move at this anchor: record the field's
             // most-preferred feasible move (lowest guided energy) as a bounded
             // uphill escape from the local optimum.
-            best_explore_move = std::move(candidate);
-            best_explore_energy = planned_energy;
-            best_explore_plan.valid = true;
-            best_explore_plan.plans = plans;
-            best_explore_plan.resources = planned_resource;
+            if (planned_energy < best_explore_energy) {
+              best_explore_move = std::move(candidate);
+              best_explore_energy = planned_energy;
+              best_explore_plan.valid = true;
+              best_explore_plan.plans = plans;
+              best_explore_plan.resources = planned_resource;
+            }
           }
         };
     const auto new_plan = [&](int32_t route) {
@@ -5367,13 +5458,143 @@ Solution RoutingDecoder::scope_restricted_refine(
           consider_relocate_pair_plan(candidate_node, anchor);
         }
       }
-    // Prefer a strictly-improving move; otherwise, if the field found a bounded
-    // guided-energy-descending escape, commit that and spend one unit of budget.
-    const bool commit_improving = best_move.feasible;
-    const bool commit_explore = !commit_improving && exploration_remaining > 0 &&
+    const auto select_policy_candidate =
+        [&](std::vector<SrrPolicyCandidate> &candidates) {
+          if (candidates.empty())
+            return;
+          std::vector<double> log_weights(candidates.size());
+          double maximum = -std::numeric_limits<double>::infinity();
+          for (size_t index = 0; index < candidates.size(); ++index) {
+            log_weights[index] =
+                -search_config_.srr_policy_beta * candidates[index].energy;
+            maximum = std::max(maximum, log_weights[index]);
+          }
+          std::vector<double> weights(candidates.size());
+          double total = 0.0;
+          for (size_t index = 0; index < candidates.size(); ++index) {
+            weights[index] = std::exp(log_weights[index] - maximum);
+            total += weights[index];
+          }
+          size_t chosen = candidates.size() - 1;
+          if (srr_policy_stochastic && candidates.size() > 1) {
+            std::discrete_distribution<size_t> choose(weights.begin(),
+                                                       weights.end());
+            chosen = choose(rng);
+          } else {
+            // STOP is appended last and wins exact ties.  Deterministic policy
+            // evaluation therefore commits only a strictly lower-energy move.
+            for (size_t index = 0; index + 1 < candidates.size(); ++index) {
+              if (candidates[index].energy <
+                  candidates[chosen].energy - 1.0e-12) {
+                chosen = index;
+              }
+            }
+          }
+
+          if (trace != nullptr && srr_policy_stochastic &&
+              candidates.size() > 1) {
+            const std::vector<int32_t> current_edges =
+                route_graph_edges(solution.route);
+            const double objective_weight = coupled_multiplier(
+                objective_multiplier(), multipliers, coupler_weights,
+                coupler_bias, anchor_state.data());
+            for (const SrrPolicyCandidate &candidate : candidates) {
+              const std::vector<int32_t> candidate_edges =
+                  route_graph_edges(candidate.solution.route);
+              std::vector<int32_t> added;
+              std::vector<int32_t> removed;
+              std::set_difference(candidate_edges.begin(), candidate_edges.end(),
+                                  current_edges.begin(), current_edges.end(),
+                                  std::back_inserter(added));
+              std::set_difference(current_edges.begin(), current_edges.end(),
+                                  candidate_edges.begin(), candidate_edges.end(),
+                                  std::back_inserter(removed));
+              double replay_delta = objective_weight * candidate.objective_delta;
+              const auto append_term = [&](int32_t edge, int8_t sign) {
+                trace->srr_edges.push_back(edge);
+                trace->srr_edge_signs.push_back(sign);
+                double term = objective_weight *
+                              (objective_residual == nullptr
+                                   ? 0.0
+                                   : objective_residual[edge]);
+                term += risk_penalty *
+                        (edge_risk == nullptr ? 0.0 : edge_risk[edge]);
+                for (int32_t channel = 0; channel < resource_count(); ++channel) {
+                  if (!resource(channel).active)
+                    continue;
+                  const size_t field_index =
+                      static_cast<size_t>(edge) * resource_count() + channel;
+                  const double field =
+                      edge_field == nullptr ? 0.0 : edge_field[field_index];
+                  const double additive =
+                      edge_additive == nullptr ? 0.0
+                                               : edge_additive[field_index];
+                  term += coupled_multiplier(
+                              channel, multipliers, coupler_weights,
+                              coupler_bias, anchor_state.data()) *
+                          (field + additive);
+                }
+                replay_delta += static_cast<double>(sign) * term;
+              };
+              for (int32_t edge : added)
+                append_term(edge, 1);
+              for (int32_t edge : removed)
+                append_term(edge, -1);
+              const double native_delta =
+                  candidate.energy - current_anchor_energy;
+              // Candidate-graph outputs cannot represent newly introduced
+              // off-graph edges.  Preserve their exact native fallback energy
+              // as a constant replay term; represented changed edges remain
+              // differentiable in Python.
+              const double constant_delta = native_delta - replay_delta;
+              trace->srr_edge_offsets.push_back(
+                  static_cast<int32_t>(trace->srr_edges.size()));
+              trace->srr_candidate_objective_delta.push_back(
+                  static_cast<float>(candidate.objective_delta));
+              trace->srr_candidate_energy_delta.push_back(
+                  static_cast<float>(native_delta));
+              trace->srr_candidate_constant_delta.push_back(
+                  static_cast<float>(constant_delta));
+            }
+            trace->srr_candidate_offsets.push_back(
+                static_cast<int32_t>(
+                    trace->srr_candidate_objective_delta.size()));
+            trace->srr_chosen_indices.push_back(static_cast<int32_t>(chosen));
+            trace->srr_log_probabilities.push_back(static_cast<float>(
+                log_weights[chosen] - maximum - std::log(total)));
+            trace->srr_live_state.insert(trace->srr_live_state.end(),
+                                         anchor_state.begin(),
+                                         anchor_state.end());
+            trace->srr_stop.push_back(candidates[chosen].stop ? 1 : 0);
+          }
+
+          SrrPolicyCandidate selected = std::move(candidates[chosen]);
+          policy_stop = selected.stop;
+          if (!policy_stop) {
+            best_move = std::move(selected.solution);
+            best_plan = std::move(selected.plan);
+            best_structural = selected.structural;
+            best_guided_energy = selected.energy;
+          }
+        };
+    if (srr_policy_active) {
+      // A zero-delta STOP/no-op belongs to every action set.  Improvement and
+      // escape are not separate phases: both compete directly with STOP under
+      // the same learned energy and receive the same policy-gradient loss.
+      policy_candidates.push_back(
+          {solution, {}, {}, current_anchor_energy, 0.0, true});
+      select_policy_candidate(policy_candidates);
+    }
+
+    const bool commit_policy =
+        srr_policy_active && !policy_stop && best_move.feasible;
+    const bool commit_improving = !srr_policy_active && best_move.feasible;
+    const bool commit_explore = !srr_policy_active && !commit_improving &&
+                                exploration_remaining > 0 &&
                                 best_explore_plan.valid;
-    if (commit_improving || commit_explore) {
-      AcceptedPlan &commit_plan = commit_improving ? best_plan : best_explore_plan;
+    if (commit_policy || commit_improving || commit_explore) {
+      AcceptedPlan &selected_plan =
+          commit_explore ? best_explore_plan : best_plan;
       std::vector<int32_t> old_route;
       if (commit_explore) {
         solution = std::move(best_explore_move);
@@ -5382,13 +5603,13 @@ Solution RoutingDecoder::scope_restricted_refine(
         if (!best_plan.valid && !best_structural.valid())
           old_route = solution.route;
         solution = std::move(best_move);
+        if (commit_policy)
+          --policy_remaining;
       }
       ++moves;
       std::vector<int32_t> touched;
-      // An exploration move is always a planned move (only consider_plans records
-      // the escape slot), so it takes the incremental planned-route path.
-      if (commit_explore || best_plan.valid) {
-        if (!replace_planned_routes(commit_plan.plans, touched, rebuilt_nodes)) {
+      if (commit_explore || selected_plan.valid) {
+        if (!replace_planned_routes(selected_plan.plans, touched, rebuilt_nodes)) {
           throw std::runtime_error(
               "accepted planned SRR move could not update its route cache");
         }
@@ -5410,8 +5631,8 @@ Solution RoutingDecoder::scope_restricted_refine(
       }
       if (trace != nullptr &&
           trace->screened_edges.size() < MAX_SCREENING_LABELS) {
-        current_resource = commit_plan.resources.has_value()
-                               ? *commit_plan.resources
+        current_resource = selected_plan.resources.has_value()
+                               ? *selected_plan.resources
                                : evaluate_resources(solution.route);
       }
       for (int32_t node : touched) {
@@ -5634,7 +5855,8 @@ Solution RoutingDecoder::perturb(uint64_t rollout_seed, const float *edge_field,
   Solution refined =
       scope_restricted_refine(raw, initial_scope, edge_field, edge_additive,
                               multipliers, coupler_weights, coupler_bias,
-                              objective_residual, edge_risk, risk_penalty, trace);
+                              objective_residual, edge_risk, risk_penalty, trace,
+                              rng);
   refined.raw_objective = raw.raw_objective;
   refined.changed_edges = raw.changed_edges;
   return refined;
@@ -5674,6 +5896,10 @@ std::vector<Solution> RoutingDecoder::sample(const float *edge_field,
     trace->starts.reserve(n_rollouts_ + 1);
     trace->starts.push_back(0);
     trace->valid_offsets.push_back(0);
+    trace->srr_starts.reserve(n_rollouts_ + 1);
+    trace->srr_starts.push_back(0);
+    trace->srr_candidate_offsets.push_back(0);
+    trace->srr_edge_offsets.push_back(0);
     for (RolloutTrace &rollout : rollout_traces) {
       trace->current_nodes.insert(trace->current_nodes.end(),
                                   rollout.current_nodes.begin(),
@@ -5709,6 +5935,45 @@ std::vector<Solution> RoutingDecoder::sample(const float *edge_field,
           trace->screened_resource_delta.end(),
           rollout.screened_resource_delta.begin(),
           rollout.screened_resource_delta.end());
+      const int32_t srr_candidate_base = static_cast<int32_t>(
+          trace->srr_candidate_objective_delta.size());
+      const int32_t srr_edge_base =
+          static_cast<int32_t>(trace->srr_edges.size());
+      for (size_t index = 1; index < rollout.srr_candidate_offsets.size(); ++index)
+        trace->srr_candidate_offsets.push_back(
+            srr_candidate_base + rollout.srr_candidate_offsets[index]);
+      for (size_t index = 1; index < rollout.srr_edge_offsets.size(); ++index)
+        trace->srr_edge_offsets.push_back(
+            srr_edge_base + rollout.srr_edge_offsets[index]);
+      trace->srr_edges.insert(trace->srr_edges.end(), rollout.srr_edges.begin(),
+                              rollout.srr_edges.end());
+      trace->srr_edge_signs.insert(trace->srr_edge_signs.end(),
+                                   rollout.srr_edge_signs.begin(),
+                                   rollout.srr_edge_signs.end());
+      trace->srr_candidate_objective_delta.insert(
+          trace->srr_candidate_objective_delta.end(),
+          rollout.srr_candidate_objective_delta.begin(),
+          rollout.srr_candidate_objective_delta.end());
+      trace->srr_candidate_energy_delta.insert(
+          trace->srr_candidate_energy_delta.end(),
+          rollout.srr_candidate_energy_delta.begin(),
+          rollout.srr_candidate_energy_delta.end());
+      trace->srr_candidate_constant_delta.insert(
+          trace->srr_candidate_constant_delta.end(),
+          rollout.srr_candidate_constant_delta.begin(),
+          rollout.srr_candidate_constant_delta.end());
+      trace->srr_chosen_indices.insert(trace->srr_chosen_indices.end(),
+                                       rollout.srr_chosen_indices.begin(),
+                                       rollout.srr_chosen_indices.end());
+      trace->srr_log_probabilities.insert(
+          trace->srr_log_probabilities.end(),
+          rollout.srr_log_probabilities.begin(),
+          rollout.srr_log_probabilities.end());
+      trace->srr_live_state.insert(trace->srr_live_state.end(),
+                                   rollout.srr_live_state.begin(),
+                                   rollout.srr_live_state.end());
+      trace->srr_stop.insert(trace->srr_stop.end(), rollout.srr_stop.begin(),
+                             rollout.srr_stop.end());
       trace->screening_fast_evaluations += rollout.screening_fast_evaluations;
       trace->screening_fallback_evaluations +=
           rollout.screening_fallback_evaluations;
@@ -5720,6 +5985,8 @@ std::vector<Solution> RoutingDecoder::sample(const float *edge_field,
       }
       trace->starts.push_back(
           static_cast<int32_t>(trace->current_nodes.size()));
+      trace->srr_starts.push_back(
+          static_cast<int32_t>(trace->srr_chosen_indices.size()));
     }
   }
   return solutions;

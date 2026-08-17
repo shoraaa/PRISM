@@ -224,6 +224,15 @@ struct SearchConfig {
   // A candidate qualifies for exploration only if it lowers the anchor guided
   // energy by more than this margin, so numerical ties never trigger a kick.
   float srr_exploration_margin = 1.0e-6f;
+  // Unified feasible-move-plus-STOP SRR policy. Positive beta samples from
+  // softmax(-beta * guided_energy) and emits replayable action traces; beta
+  // zero selects greedily with STOP winning ties for deterministic inference.
+  bool srr_policy_enabled = false;
+  // Maximum accepted moves made by the unified SRR policy in one refinement
+  // invocation.  This is a generic finite horizon: improving and worsening
+  // moves consume the same budget, and the returned champion remains safe.
+  int32_t srr_policy_horizon = 64;
+  float srr_policy_beta = 0.0f;
 
   void validate() const;
 };
@@ -271,6 +280,21 @@ struct DecisionTrace {
   std::vector<float> feasibility_risk_labels;
   std::vector<int32_t> screened_edges;
   std::vector<float> screened_resource_delta;
+  // Nested unified SRR policy trace: rollout -> decisions -> candidates ->
+  // signed changed-edge terms.  Every decision includes STOP as a zero-delta
+  // candidate.
+  std::vector<int32_t> srr_starts;
+  std::vector<int32_t> srr_candidate_offsets;
+  std::vector<int32_t> srr_edge_offsets;
+  std::vector<int32_t> srr_edges;
+  std::vector<int8_t> srr_edge_signs;
+  std::vector<float> srr_candidate_objective_delta;
+  std::vector<float> srr_candidate_energy_delta;
+  std::vector<float> srr_candidate_constant_delta;
+  std::vector<int32_t> srr_chosen_indices;
+  std::vector<float> srr_log_probabilities;
+  std::vector<float> srr_live_state;
+  std::vector<uint8_t> srr_stop;
   int64_t screening_fast_evaluations = 0;
   int64_t screening_fallback_evaluations = 0;
   int64_t screening_verification_failures = 0;
@@ -384,6 +408,17 @@ private:
     std::vector<float> feasibility_risk_labels;
     std::vector<int32_t> screened_edges;
     std::vector<float> screened_resource_delta;
+    std::vector<int32_t> srr_candidate_offsets = {0};
+    std::vector<int32_t> srr_edge_offsets = {0};
+    std::vector<int32_t> srr_edges;
+    std::vector<int8_t> srr_edge_signs;
+    std::vector<float> srr_candidate_objective_delta;
+    std::vector<float> srr_candidate_energy_delta;
+    std::vector<float> srr_candidate_constant_delta;
+    std::vector<int32_t> srr_chosen_indices;
+    std::vector<float> srr_log_probabilities;
+    std::vector<float> srr_live_state;
+    std::vector<uint8_t> srr_stop;
     int64_t screening_fast_evaluations = 0;
     int64_t screening_fallback_evaluations = 0;
     int64_t screening_verification_failures = 0;
@@ -561,7 +596,7 @@ private:
                           const float *coupler_bias,
                           const float *objective_residual,
                           const float *edge_risk, float risk_penalty,
-                          RolloutTrace *trace) const;
+                          RolloutTrace *trace, std::mt19937_64 &rng) const;
   int32_t select_next(State &state, std::mt19937_64 &rng,
                       const float *edge_field,
                       const float *edge_additive,

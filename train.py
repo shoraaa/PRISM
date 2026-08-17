@@ -63,6 +63,9 @@ class OptionStep:
     binding_target: torch.Tensor
     duration: int
     decision_rollouts: Optional[torch.Tensor] = None
+    old_srr_logp: Optional[torch.Tensor] = None
+    srr_decision_rollouts: Optional[torch.Tensor] = None
+    srr_decisions: Optional[torch.Tensor] = None
     field_enabled: bool = True
     risk_penalty: float = 0.0
     search_progress: float = 0.0
@@ -336,6 +339,111 @@ def replay_logp_from_cpp_batch_trace(
     return logp_sum, decisions
 
 
+def replay_srr_decision_logp_from_cpp_batch_trace(
+    trace: dict,
+    output: dict,
+    model: ConstraintFieldNet,
+    beta: float,
+    field_enabled: bool = True,
+    risk_penalty: float = 0.0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Replay SRR move log-probabilities from signed changed-edge traces."""
+    device = output["residual"].device
+    starts = torch.as_tensor(trace["srr_starts"], device=device).long()
+    n_rollouts = max(int(starts.numel()) - 1, 0)
+    rollout_counts = starts[1:] - starts[:-1]
+    decision_rollouts = torch.repeat_interleave(
+        torch.arange(n_rollouts, device=device), rollout_counts
+    )
+    decisions = rollout_counts.to(torch.int32)
+    chosen = torch.as_tensor(trace["srr_chosen_indices"], device=device).long()
+    if chosen.numel() == 0:
+        empty = output["residual"].new_empty(0)
+        return empty, decision_rollouts, decisions, empty
+
+    candidate_offsets = torch.as_tensor(
+        trace["srr_candidate_offsets"], device=device
+    ).long()
+    edge_offsets = torch.as_tensor(trace["srr_edge_offsets"], device=device).long()
+    objective_delta = torch.as_tensor(
+        trace["srr_candidate_objective_delta"],
+        device=device,
+        dtype=output["residual"].dtype,
+    )
+    constant_delta = torch.as_tensor(
+        trace["srr_candidate_constant_delta"],
+        device=device,
+        dtype=output["residual"].dtype,
+    )
+    candidate_counts = candidate_offsets[1:] - candidate_offsets[:-1]
+    candidate_decision = torch.repeat_interleave(
+        torch.arange(chosen.numel(), device=device), candidate_counts
+    )
+    candidate_count = int(objective_delta.numel())
+    if candidate_decision.numel() != candidate_count:
+        raise RuntimeError("malformed SRR candidate offsets")
+
+    channels = output["active_channels"].shape[-1]
+    field_sum = output["residual"].new_zeros((candidate_count, channels))
+    objective_residual_sum = objective_delta.new_zeros(candidate_count)
+    risk_sum = objective_delta.new_zeros(candidate_count)
+    edge_counts = edge_offsets[1:] - edge_offsets[:-1]
+    if edge_counts.numel() != candidate_count:
+        raise RuntimeError("malformed SRR edge offsets")
+    if int(edge_counts.sum().item()) > 0:
+        edge_owner = torch.repeat_interleave(
+            torch.arange(candidate_count, device=device), edge_counts
+        )
+        edges = torch.as_tensor(trace["srr_edges"], device=device).long()
+        signs = torch.as_tensor(
+            trace["srr_edge_signs"], device=device,
+            dtype=output["residual"].dtype,
+        )
+        if edges.numel() != edge_owner.numel() or signs.numel() != edges.numel():
+            raise RuntimeError("malformed SRR signed-edge trace")
+        field_term = output["residual"][edges] + output["additive"][edges]
+        field_sum = field_sum.index_add(
+            0, edge_owner, field_term * signs.unsqueeze(1)
+        )
+        objective_residual_sum = objective_residual_sum.index_add(
+            0, edge_owner, output["objective_residual"][edges] * signs
+        )
+        risk_sum = risk_sum.index_add(
+            0, edge_owner, output["feasibility_risk"].detach()[edges] * signs
+        )
+
+    states = torch.as_tensor(
+        trace["srr_live_state"], device=device, dtype=output["residual"].dtype
+    )
+    multipliers = model.couple(output, states)
+    field_multiplier = multipliers[:, :channels]
+    objective_weight = multipliers[:, channels]
+    if not field_enabled:
+        field_sum = torch.zeros_like(field_sum)
+        objective_residual_sum = torch.zeros_like(objective_residual_sum)
+        field_multiplier = torch.zeros_like(field_multiplier)
+        objective_weight = torch.ones_like(objective_weight)
+    energy = objective_weight[candidate_decision] * (
+        objective_delta + objective_residual_sum
+    )
+    energy = energy + (
+        field_multiplier[candidate_decision] * field_sum
+    ).sum(dim=1)
+    energy = energy + float(risk_penalty) * risk_sum
+    energy = energy + constant_delta
+
+    logp = []
+    for decision in range(chosen.numel()):
+        begin = int(candidate_offsets[decision].item())
+        end = int(candidate_offsets[decision + 1].item())
+        selected = begin + int(chosen[decision].item())
+        if not begin <= selected < end:
+            raise RuntimeError("SRR chosen index is outside its candidate set")
+        logits = -float(beta) * energy[begin:end]
+        logp.append(logits[selected - begin] - torch.logsumexp(logits, dim=0))
+    return torch.stack(logp), decision_rollouts, decisions, energy
+
+
 def _guidance_numpy(
     output: dict,
     graph,
@@ -540,8 +648,13 @@ def _gain(incumbent: dict, candidate: dict, infeasible_penalty: float) -> float:
 
 def _new_decoder(
     problem: dict, args: argparse.Namespace, deterministic: bool = False,
-    use_srr: bool = True,
+    use_srr: bool = True, srr_policy: Optional[bool] = None,
 ):
+    if srr_policy is None:
+        srr_policy = bool(
+            getattr(args, "srr_policy_enabled", False)
+            or getattr(args, "srr_loss_weight", 0.0) > 0.0
+        )
     decoder = prism_decoder.Decoder(
         problem,
         candidate_config={
@@ -550,6 +663,10 @@ def _new_decoder(
         },
         search_config={
             "use_srr": use_srr,
+            "min_changed_edges": getattr(args, "min_changed_edges", 8),
+            "max_perturb_attempts": getattr(
+                args, "max_perturb_attempts", 64
+            ),
             "feasibility_lookahead_depth": getattr(
                 args, "feasibility_lookahead_depth", 2
             ),
@@ -557,6 +674,13 @@ def _new_decoder(
             # constant and remains active for learned or distance guidance.
             "srr_exploration_budget": getattr(
                 args, "srr_exploration_budget", 0
+            ),
+            "srr_policy_enabled": srr_policy,
+            "srr_policy_horizon": getattr(args, "srr_policy_horizon", 64),
+            "srr_policy_beta": (
+                getattr(args, "srr_policy_beta", 2.0)
+                if srr_policy and not deterministic
+                else 0.0
             ),
         },
         n_rollouts=args.n_rollouts,
@@ -574,7 +698,16 @@ def setup_decoder(
     field_enabled: bool = True,
     risk_penalty: float = 0.0,
 ):
-    decoder = _new_decoder(problem, args, deterministic=deterministic)
+    decoder = _new_decoder(
+        problem,
+        args,
+        deterministic=deterministic,
+        srr_policy=(
+            model is not None
+            and field_enabled
+            and getattr(args, "srr_loss_weight", 0.0) > 0.0
+        ),
+    )
     # Field-constructed bootstrap: once the field is live, build the initial
     # incumbent from the field itself so training and inference share the same
     # construction path (a no-grad bootstrap, kept out of the refinement policy
@@ -848,6 +981,47 @@ def collect_instance_rollout(
                 decisions = torch.zeros(
                     args.n_rollouts, dtype=torch.long, device=args.device
                 )
+            if field_enabled and getattr(args, "srr_loss_weight", 0.0) != 0.0:
+                with torch.no_grad():
+                    (
+                        old_srr_logp,
+                        srr_decision_rollouts,
+                        srr_decisions,
+                        old_srr_energy,
+                    ) = replay_srr_decision_logp_from_cpp_batch_trace(
+                        trace,
+                        old_output,
+                        model,
+                        args.srr_policy_beta,
+                        field_enabled=field_enabled,
+                        risk_penalty=risk_penalty,
+                    )
+                native_srr_logp = torch.as_tensor(
+                    trace["srr_log_probabilities"],
+                    device=args.device,
+                    dtype=old_srr_logp.dtype,
+                )
+                native_srr_energy = torch.as_tensor(
+                    trace["srr_candidate_energy_delta"],
+                    device=args.device,
+                    dtype=old_srr_energy.dtype,
+                )
+                if not torch.allclose(
+                    old_srr_logp, native_srr_logp, atol=2e-5, rtol=2e-5
+                ):
+                    raise RuntimeError("native and replayed SRR log-probs differ")
+                if not torch.allclose(
+                    old_srr_energy, native_srr_energy, atol=2e-5, rtol=2e-5
+                ):
+                    raise RuntimeError("native and replayed SRR energies differ")
+            else:
+                old_srr_logp = torch.empty(0, device=args.device)
+                srr_decision_rollouts = torch.empty(
+                    0, dtype=torch.long, device=args.device
+                )
+                srr_decisions = torch.zeros(
+                    args.n_rollouts, dtype=torch.long, device=args.device
+                )
             resource_delta = None
             if trace["screened_edges"].size == 0:
                 resource_delta = torch.as_tensor(
@@ -865,6 +1039,9 @@ def collect_instance_rollout(
                 binding_target=binding_target,
                 duration=0,
                 decision_rollouts=decision_rollouts.detach(),
+                old_srr_logp=old_srr_logp.detach(),
+                srr_decision_rollouts=srr_decision_rollouts.detach(),
+                srr_decisions=srr_decisions.detach(),
                 field_enabled=field_enabled,
                 risk_penalty=risk_penalty,
                 search_progress=option_progress,
@@ -1182,24 +1359,107 @@ def _disable_objective_residual(model: ConstraintFieldNet) -> None:
         parameter.requires_grad_(False)
 
 
+def _policy_rollout_advantages(
+    model: ConstraintFieldNet,
+    step: OptionStep,
+    args: argparse.Namespace,
+    temporal_enabled: bool,
+    temporal_credit_weight: float,
+    adv_scale: Optional[torch.Tensor],
+    temporal_adv_scale: Optional[torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build the shared rollout advantage used by perturbation and SRR PPO."""
+    rollout_reward = step.rewards
+    reward_std = rollout_reward.std(unbiased=False)
+    rollout_advantage = rollout_reward - rollout_reward.mean()
+    schema_scale_loss = rollout_advantage.sum() * 0.0
+    schema_scale_pred = schema_scale_loss
+    if not args.no_adv_norm:
+        base_scale = (
+            adv_scale
+            if adv_scale is not None
+            else rollout_advantage.std(unbiased=False) + 1e-8
+        )
+        if getattr(args, "schema_adv_scale", False) and step.schema is not None:
+            eps = rollout_advantage.new_tensor(1e-6)
+            pred_scale = model.reward_scale(
+                step.schema.to(rollout_advantage.device)
+            )
+            target_rel = (reward_std.detach() / base_scale).clamp(0.1, 10.0)
+            schema_scale_loss = F.smooth_l1_loss(
+                pred_scale.clamp_min(eps).log(), target_rel.log()
+            )
+            schema_scale_pred = pred_scale.detach()
+            scale = base_scale * pred_scale.detach().clamp(0.25, 4.0)
+        else:
+            scale = base_scale
+        rollout_advantage = rollout_advantage / scale
+    temporal_rollout_advantage = torch.zeros_like(rollout_advantage)
+    if temporal_enabled and step.transition_rollout is not None:
+        temporal_rollout_advantage = _winner_temporal_advantage(
+            rollout_advantage.numel(),
+            step.transition_rollout,
+            step.temporal_advantage,
+            (
+                float(temporal_adv_scale)
+                if temporal_adv_scale is not None
+                else 1.0
+            ),
+            rollout_advantage.device,
+        )
+        rollout_advantage = (
+            rollout_advantage
+            + temporal_credit_weight * temporal_rollout_advantage
+        )
+    return (
+        rollout_advantage,
+        temporal_rollout_advantage,
+        reward_std,
+        schema_scale_loss,
+        schema_scale_pred,
+    )
+
+
 def _step_loss(
     model: ConstraintFieldNet,
     step: OptionStep,
     output: dict,
     args: argparse.Namespace,
     rl_weight: float,
+    srr_loss_weight: float,
     auxiliary_scale: float,
     class_weights: Optional[dict[str, torch.Tensor]] = None,
     adv_scale: Optional[torch.Tensor] = None,
     temporal_adv_scale: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, dict[str, float | torch.Tensor]]:
     zero = output["residual"].sum() * 0.0
-    schema_scale_loss = zero
-    schema_scale_pred = zero
     temporal_credit_weight = float(
         getattr(args, "temporal_credit_weight", 0.0)
     )
-    temporal_enabled = rl_weight != 0.0 and temporal_credit_weight != 0.0
+    policy_enabled = rl_weight != 0.0 or srr_loss_weight != 0.0
+    temporal_enabled = policy_enabled and temporal_credit_weight != 0.0
+    if policy_enabled:
+        (
+            rollout_advantage,
+            temporal_rollout_advantage,
+            reward_std,
+            schema_scale_loss,
+            schema_scale_pred,
+        ) = _policy_rollout_advantages(
+            model,
+            step,
+            args,
+            temporal_enabled,
+            temporal_credit_weight,
+            adv_scale,
+            temporal_adv_scale,
+        )
+    else:
+        rollout_advantage = torch.zeros_like(step.rewards)
+        temporal_rollout_advantage = torch.zeros_like(step.rewards)
+        reward_std = zero
+        schema_scale_loss = zero
+        schema_scale_pred = zero
     if rl_weight != 0.0:
         logp, decision_rollouts, decisions = (
             replay_decision_logp_from_cpp_batch_trace(
@@ -1236,69 +1496,6 @@ def _step_loss(
     if rl_weight != 0.0 and logp.numel():
         log_ratio = logp - old_logp
         ratio = torch.exp(log_ratio)
-        rollout_reward = step.rewards.to(logp.device)
-        reward_std = rollout_reward.std(unbiased=False)
-        # POMO baseline: centre per option (all rollouts share one field, so the
-        # rollout mean is the correct control variate). _gain already divides by
-        # |incumbent objective|, so the centred reward is a scale-invariant
-        # fractional improvement -- per-option unit-std normalisation is thus
-        # redundant and, when a field's rollouts land near-identical costs, only
-        # amplifies RNG jitter into unit-scale spurious advantages. Normalise
-        # by the batch-pooled scale instead so options with genuine improvement
-        # variance dominate and near-degenerate options contribute little.
-        rollout_advantage = rollout_reward - rollout_reward.mean()
-        if not args.no_adv_norm:
-            base_scale = (
-                adv_scale
-                if adv_scale is not None
-                else rollout_advantage.std(unbiased=False) + 1e-8
-            )
-            if getattr(args, "schema_adv_scale", False) and step.schema is not None:
-                # g_phi(schema) is a per-schema RELATIVE multiplier on the
-                # batch-pooled scale, not an absolute dispersion predictor. The
-                # pooled scale supplies the stationary global magnitude; g_phi only
-                # corrects each schema's dispersion relative to the batch. It is
-                # initialised at 1.0, so scale == base_scale and enabling this is an
-                # exact no-op until fitted -- an absolute-dispersion head instead
-                # starts ~1/base_scale off and ramps the effective step size by
-                # orders of magnitude over training, which diverges. The divisor is
-                # detached (the policy cannot game it) and depends only on the
-                # schema, so degenerate low-variance options are not amplified.
-                eps = rollout_advantage.new_tensor(1e-6)
-                pred_scale = model.reward_scale(
-                    step.schema.to(rollout_advantage.device)
-                )
-                # Bound the target and the applied multiplier to a sane band: a
-                # degenerate near-zero-dispersion option must not drag g_phi toward
-                # zero and re-amplify advantages. The relative correction lives in
-                # [0.25, 4]x of the pooled scale; anything outside is a mis-fit, not
-                # signal, so the effective step size can never diverge.
-                target_rel = (reward_std.detach() / base_scale).clamp(0.1, 10.0)
-                schema_scale_loss = F.smooth_l1_loss(
-                    pred_scale.clamp_min(eps).log(), target_rel.log()
-                )
-                schema_scale_pred = pred_scale.detach()
-                scale = base_scale * pred_scale.detach().clamp(0.25, 4.0)
-            else:
-                scale = base_scale
-            rollout_advantage = rollout_advantage / scale
-        temporal_rollout_advantage = torch.zeros_like(rollout_advantage)
-        if temporal_enabled and step.transition_rollout is not None:
-            temporal_rollout_advantage = _winner_temporal_advantage(
-                rollout_advantage.numel(),
-                step.transition_rollout,
-                step.temporal_advantage,
-                (
-                    float(temporal_adv_scale)
-                    if temporal_adv_scale is not None
-                    else 1.0
-                ),
-                rollout_advantage.device,
-            )
-            rollout_advantage = (
-                rollout_advantage
-                + temporal_credit_weight * temporal_rollout_advantage
-            )
         advantage = rollout_advantage[decision_rollouts]
         temporal_advantage = temporal_rollout_advantage[decision_rollouts]
         # Each rollout contributes total weight one, independent of trace length.
@@ -1355,10 +1552,89 @@ def _step_loss(
         policy_signal = zero
         log_ratio_abs = zero
         rl_score_proxy = zero
-        reward_std = zero
+        if not policy_enabled:
+            reward_std = zero
         advantage_abs = zero
         temporal_policy_signal = zero
         temporal_advantage_abs = zero
+
+    srr_rl_loss = zero
+    srr_entropy = zero
+    srr_approx_kl = zero
+    srr_clip_frac = zero
+    srr_policy_signal = zero
+    srr_decision_mean = zero
+    srr_stop_fraction = zero
+    if srr_loss_weight != 0.0:
+        (
+            srr_logp,
+            srr_decision_rollouts,
+            srr_decisions,
+            _srr_energy,
+        ) = replay_srr_decision_logp_from_cpp_batch_trace(
+            step.trace,
+            output,
+            model,
+            args.srr_policy_beta,
+            field_enabled=step.field_enabled,
+            risk_penalty=step.risk_penalty,
+        )
+        old_srr_logp = (
+            step.old_srr_logp.to(srr_logp.device)
+            if step.old_srr_logp is not None
+            else srr_logp.new_empty(0)
+        )
+        if old_srr_logp.shape != srr_logp.shape:
+            raise RuntimeError("stored and replayed SRR log-probs are misaligned")
+        if (
+            step.srr_decision_rollouts is not None
+            and not torch.equal(
+                step.srr_decision_rollouts.to(srr_decision_rollouts.device),
+                srr_decision_rollouts,
+            )
+        ):
+            raise RuntimeError("stored and replayed SRR rollout maps differ")
+        if srr_logp.numel():
+            srr_log_ratio = srr_logp - old_srr_logp
+            srr_ratio = torch.exp(srr_log_ratio)
+            srr_advantage = rollout_advantage[srr_decision_rollouts]
+            srr_decision_weight = srr_decisions[
+                srr_decision_rollouts
+            ].float().reciprocal()
+            srr_normalizer = srr_decision_weight.sum().clamp_min(1.0)
+            srr_clipped_ratio = torch.clamp(
+                srr_ratio, 1 - args.ppo_clip, 1 + args.ppo_clip
+            )
+            srr_surrogate = torch.minimum(
+                srr_ratio * srr_advantage,
+                srr_clipped_ratio * srr_advantage,
+            )
+            srr_rl_loss = -(
+                srr_decision_weight * srr_surrogate
+            ).sum() / srr_normalizer
+            srr_entropy = -(
+                srr_decision_weight * srr_logp
+            ).sum() / srr_normalizer
+            srr_approx_kl = (
+                srr_decision_weight * 0.5 * srr_log_ratio.square()
+            ).sum() / srr_normalizer
+            srr_clipped = (
+                (srr_ratio > 1 + args.ppo_clip)
+                | (srr_ratio < 1 - args.ppo_clip)
+            ).float()
+            srr_clip_frac = (
+                srr_decision_weight * srr_clipped
+            ).sum() / srr_normalizer
+            srr_policy_signal = (
+                srr_decision_weight * srr_surrogate.abs()
+            ).sum() / srr_normalizer
+            srr_decision_mean = srr_decisions.float().mean()
+            srr_stop = torch.as_tensor(
+                step.trace["srr_stop"],
+                device=srr_logp.device,
+                dtype=srr_logp.dtype,
+            )
+            srr_stop_fraction = srr_stop.mean()
 
     quota_rl_loss = zero
     quota_ratio = zero
@@ -1421,6 +1697,7 @@ def _step_loss(
     )
     loss = (
         rl_weight * rl_loss
+        + srr_loss_weight * srr_rl_loss
         + rl_weight * temporal_credit_weight * quota_rl_loss
         + auxiliary_scale * auxiliary
         + float(getattr(args, "objective_residual_l2", 0.1)) * objective_residual_loss
@@ -1445,6 +1722,14 @@ def _step_loss(
             "ppo_surrogate_loss": rl_loss.detach(),
             "rl_score_proxy": rl_score_proxy.detach(),
             "policy_signal": policy_signal.detach(),
+            "srr_rl_loss": srr_rl_loss.detach(),
+            "srr_entropy": srr_entropy.detach(),
+            "srr_approx_kl": srr_approx_kl.detach(),
+            "srr_clip_frac": srr_clip_frac.detach(),
+            "srr_policy_signal": srr_policy_signal.detach(),
+            "srr_decisions": srr_decision_mean.detach(),
+            "srr_stop_fraction": srr_stop_fraction.detach(),
+            "srr_loss_weight": srr_loss_weight,
             "temporal_policy_signal": temporal_policy_signal.detach(),
             "quota_rl_loss": quota_rl_loss.detach(),
             "quota_ratio": quota_ratio.detach(),
@@ -1561,6 +1846,9 @@ def ppo_update(
     collector = MetricsCollector()
     pretraining = epoch < args.pretrain_epochs
     rl_weight = 0.0 if pretraining else args.rl_weight
+    srr_loss_weight = (
+        0.0 if pretraining else float(getattr(args, "srr_loss_weight", 0.0))
+    )
     auxiliary_scale = (
         args.pretrain_aux_scale if pretraining else args.aux_rl_scale
     )
@@ -1617,6 +1905,7 @@ def ppo_update(
                         output,
                         args,
                         rl_weight,
+                        srr_loss_weight,
                         auxiliary_scale,
                         class_weights,
                         adv_scale,
@@ -1657,6 +1946,7 @@ def ppo_update(
                         output,
                         args,
                         rl_weight,
+                        srr_loss_weight,
                         auxiliary_scale,
                         class_weights,
                         adv_scale,
@@ -2022,7 +2312,10 @@ def infer_instance(
                 improve_steps=args.neural_refine_steps,
                 device=args.device,
             )
-            return _canonical_cost(solution), solution, {"emissions": 0.0}
+            return _canonical_cost(solution), solution, {
+                "emissions": 0.0,
+                "construction_objective": float(incumbent["objective"]),
+            }
         # op/pctsp etc.: refiner has no operator yet -> fall through to SRR.
     decoder = _new_decoder(
         problem,
@@ -2063,6 +2356,7 @@ def infer_instance(
                 "provided bootstrap route is infeasible: "
                 + incumbent.get("error", "unknown route error")
             )
+    construction_objective = float(incumbent["objective"])
     decoder.set_incumbent(incumbent["route"])
 
     if model is not None:
@@ -2096,6 +2390,7 @@ def infer_instance(
                 "time_neural": 0.0,
                 "time_decoder": decoder_seconds,
                 "net_evals": 0.0,
+                "construction_objective": construction_objective,
             },
         )
 
@@ -2159,6 +2454,7 @@ def infer_instance(
             "time_neural": neural_seconds,
             "time_decoder": decoder_seconds,
             "net_evals": float(net_evals),
+            "construction_objective": construction_objective,
         },
     )
 
@@ -2768,6 +3064,24 @@ def parse_args() -> argparse.Namespace:
         help="post-bootstrap perturbation/SRR iterations (default: 16)",
     )
     parser.add_argument(
+        "--min-changed-edges",
+        type=int,
+        default=8,
+        help=(
+            "Minimum number of route edges each perturbation tries to change "
+            "before SRR refinement (default: 8)"
+        ),
+    )
+    parser.add_argument(
+        "--max-perturb-attempts",
+        type=int,
+        default=64,
+        help=(
+            "Maximum candidate-move attempts within each perturbation rollout "
+            "(default: 64)"
+        ),
+    )
+    parser.add_argument(
         "--static-field",
         action="store_true",
         help=(
@@ -2982,10 +3296,42 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help=(
             "Bounded number of objective-worsening but guided-energy-descending "
-            "moves the SRR descent may accept per invocation, letting the learned "
+            "moves the legacy SRR descent may accept per invocation. This is "
+            "ignored by the unified SRR policy, which uses --srr-policy-horizon. "
+            "The learned "
             "field steer uphill to escape local optima (champion tracking keeps "
             "the best solution). Constant energy has no gradient, so the budget "
             "is inert for that control. 0 disables (default)."
+        ),
+    )
+    parser.add_argument(
+        "--srr-loss-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Weight of direct PPO credit for the unified feasible-move-plus-STOP "
+            "SRR policy. 0 preserves the legacy deterministic SRR path and emits "
+            "no SRR policy trace (default)."
+        ),
+    )
+    parser.add_argument(
+        "--srr-policy-horizon",
+        type=int,
+        default=64,
+        help=(
+            "Maximum accepted moves per unified SRR policy invocation. "
+            "Improving and worsening moves consume the same generic finite "
+            "horizon (default: 64)."
+        ),
+    )
+    parser.add_argument(
+        "--srr-policy-beta",
+        type=float,
+        default=2.0,
+        help=(
+            "Inverse temperature for unified SRR move sampling when "
+            "--srr-loss-weight is positive (default: 2). Evaluation uses greedy "
+            "energy with STOP winning ties."
         ),
     )
     parser.add_argument("--no-adv-norm", action="store_true")
@@ -3093,6 +3439,16 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.n_rollouts < 1:
         parser.error("--n-rollouts must be positive")
+    if args.min_changed_edges < 1:
+        parser.error("--min-changed-edges must be positive")
+    if args.max_perturb_attempts < 1:
+        parser.error("--max-perturb-attempts must be positive")
+    if args.srr_loss_weight < 0.0:
+        parser.error("--srr-loss-weight must be non-negative")
+    if args.srr_policy_horizon <= 0:
+        parser.error("--srr-policy-horizon must be positive")
+    if args.srr_loss_weight > 0.0 and args.srr_policy_beta <= 0.0:
+        parser.error("--srr-policy-beta must be positive when SRR loss is enabled")
     if args.grad_accum_variants is None:
         legacy_rollout_batch = 4 * 32
         args.grad_accum_variants = max(

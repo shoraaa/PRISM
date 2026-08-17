@@ -39,7 +39,15 @@ from problem_data import (  # noqa: E402
     generate_evrp_data,
     load_saved_data,
 )
-from train import _canonical_cost, infer_instance, setup_seeds  # noqa: E402
+from train import (  # noqa: E402
+    _canonical_cost,
+    _constant_guidance,
+    _distance_guidance,
+    _new_decoder,
+    _random_guidance,
+    infer_instance,
+    setup_seeds,
+)
 from urs_one_each import solver_problem  # noqa: E402
 
 
@@ -70,6 +78,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--rollouts", type=int, default=32)
     parser.add_argument("--candidates", type=int, default=64)
     parser.add_argument(
+        "--min-changed-edges",
+        type=int,
+        default=8,
+        help=(
+            "Minimum number of route edges each perturbation tries to change "
+            "before SRR refinement (default: 8)"
+        ),
+    )
+    parser.add_argument(
+        "--max-perturb-attempts",
+        type=int,
+        default=64,
+        help=(
+            "Maximum candidate-move attempts within each perturbation rollout "
+            "(default: 64)"
+        ),
+    )
+    parser.add_argument(
         "--srr-exploration-budget",
         type=int,
         default=0,
@@ -77,6 +103,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "Energy-guided SRR exploration budget (bounded uphill escapes the "
             "guidance can take; inert for the constant-energy baseline). "
             "Must match the value used at training time. 0 disables (default)."
+        ),
+    )
+    parser.add_argument(
+        "--unified-srr-policy",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Enable the unified feasible-move-plus-STOP SRR policy. By default "
+            "this is recovered from the checkpoint training configuration."
+        ),
+    )
+    parser.add_argument(
+        "--srr-policy-horizon",
+        type=int,
+        default=None,
+        help=(
+            "Maximum accepted moves per unified SRR invocation. By default "
+            "this is recovered from the checkpoint, falling back to 64."
         ),
     )
     parser.add_argument(
@@ -178,6 +222,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--shared-greedy-bootstrap",
+        action="store_true",
+        help=(
+            "Construct one deterministic greedy route with the selected live "
+            "native baseline's guidance and install that exact route as the "
+            "bootstrap incumbent for both PRISM and the baseline. Requires "
+            "exactly one of: constant, distance, random."
+        ),
+    )
+    parser.add_argument(
         "--urs-baseline-id",
         "--urs-checkpoint",
         dest="urs_checkpoint",
@@ -229,7 +283,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=(
             "Reuse per-variant baseline objectives from a prior test.py CSV. "
             "Rows must match variant, baseline, and --val-size; missing rows "
-            "fall back to normal baseline evaluation."
+            "fall back to normal baseline evaluation. New CSVs also retain "
+            "baseline_construction_objective for construction/final logging."
         ),
     )
     parser.add_argument("--csv", type=Path)
@@ -243,6 +298,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         and args.cached is None
     ):
         parser.error("--baselines urs requires --urs-baseline-id")
+    if args.min_changed_edges < 1:
+        parser.error("--min-changed-edges must be positive")
+    if args.max_perturb_attempts < 1:
+        parser.error("--max-perturb-attempts must be positive")
     return args
 
 
@@ -254,6 +313,49 @@ def selected_baselines(value: str) -> tuple[str, ...]:
     if value not in BASELINE_NAMES:
         raise ValueError(f"unknown baseline: {value}")
     return (value,)
+
+
+def _shared_greedy_baseline(
+    enabled: bool,
+    baselines: tuple[str, ...],
+    cached: Path | None,
+) -> str | None:
+    if not enabled:
+        return None
+    if cached is not None:
+        raise ValueError(
+            "--shared-greedy-bootstrap cannot verify cached baseline starts"
+        )
+    if len(baselines) != 1 or baselines[0] not in NATIVE_BASELINE_NAMES:
+        raise ValueError(
+            "--shared-greedy-bootstrap requires exactly one live native "
+            "baseline: constant, distance, or random"
+        )
+    return baselines[0]
+
+
+def _greedy_baseline_route(
+    problem: dict,
+    decoder_args: argparse.Namespace,
+    baseline: str,
+) -> list[int]:
+    """Build the deterministic baseline route shared by both evaluator arms."""
+    decoder = _new_decoder(problem, decoder_args, deterministic=True)
+    if baseline == "constant":
+        guidance = _constant_guidance(decoder)
+    elif baseline == "distance":
+        guidance = _distance_guidance(decoder, problem)
+    elif baseline == "random":
+        guidance = _random_guidance(decoder, decoder_args.seed)
+    else:
+        raise ValueError(f"unknown native baseline: {baseline}")
+    incumbent = decoder.sample_greedy(**guidance)
+    if not incumbent["feasible"]:
+        raise RuntimeError(
+            f"{baseline} greedy bootstrap is infeasible: "
+            + incumbent.get("error", "unknown route error")
+        )
+    return [int(node) for node in incumbent["route"]]
 
 
 def load_cached_baseline_rows(
@@ -282,6 +384,9 @@ def load_cached_baseline_rows(
             variant = row["variant"].strip()
             baseline = row["baseline"].strip()
             objective_text = row["baseline_objective"].strip()
+            construction_text = (
+                row.get("baseline_construction_objective", "") or ""
+            ).strip()
             # Neural-only rows intentionally contain no reusable comparator.
             if baseline == "none" or not objective_text:
                 continue
@@ -292,12 +397,21 @@ def load_cached_baseline_rows(
             try:
                 val_size = int(row["val_size"])
                 objective = float(objective_text)
+                construction_objective: float | str = (
+                    float(construction_text) if construction_text else ""
+                )
             except ValueError as error:
                 raise ValueError(
                     f"invalid cached numeric value on line {line_number}"
                 ) from error
             direction = row["direction"].strip()
             if val_size < 1 or not math.isfinite(objective):
+                raise ValueError(
+                    f"invalid cached baseline value on line {line_number}"
+                )
+            if construction_objective != "" and not math.isfinite(
+                construction_objective
+            ):
                 raise ValueError(
                     f"invalid cached baseline value on line {line_number}"
                 )
@@ -313,6 +427,7 @@ def load_cached_baseline_rows(
                 )
             cached[key] = {
                 "baseline_objective": objective,
+                "baseline_construction_objective": construction_objective,
                 "direction": direction,
             }
             if baseline not in baseline_order:
@@ -617,6 +732,24 @@ def _gap_percent(direction: str, objective: float, reference: float) -> float:
     return (objective - reference) / denominator * 100.0
 
 
+def _format_construction_final(
+    construction: float | str,
+    final: float | str,
+    *,
+    format_spec: str,
+    suffix: str = "",
+) -> str:
+    """Format evaluator metrics in construction/final order."""
+    values = []
+    for value in (construction, final):
+        values.append(
+            "n/a"
+            if value == ""
+            else f"{format(float(value), format_spec)}{suffix}"
+        )
+    return "/".join(values)
+
+
 def _split_summary(
     split: str,
     variants: list[str],
@@ -735,6 +868,20 @@ def main() -> int:
     model = ConstraintFieldNet().to(args.device)
     load_constraint_field_state_dict(model, checkpoint["model_state_dict"])
     model.eval()
+    checkpoint_config = checkpoint.get("config", {})
+    if args.unified_srr_policy is None:
+        args.srr_policy_enabled = bool(
+            checkpoint_config.get("srr_policy_enabled", False)
+            or float(checkpoint_config.get("srr_loss_weight", 0.0)) > 0.0
+        )
+    else:
+        args.srr_policy_enabled = args.unified_srr_policy
+    if args.srr_policy_horizon is None:
+        args.srr_policy_horizon = int(
+            checkpoint_config.get("srr_policy_horizon", 64)
+        )
+    if args.srr_policy_horizon <= 0:
+        raise ValueError("--srr-policy-horizon must be positive")
 
     finder = DatasetFinder(args.dataset_dir)
     variants = selected_variants(args.variants)
@@ -762,6 +909,9 @@ def main() -> int:
     native_baselines = tuple(
         baseline for baseline in baselines
         if baseline in NATIVE_BASELINE_NAMES
+    )
+    shared_greedy_baseline = _shared_greedy_baseline(
+        args.shared_greedy_bootstrap, baselines, args.cached
     )
     include_urs = "urs" in baselines
     urs_cache = (
@@ -820,9 +970,13 @@ def main() -> int:
                     f"hardness={args.tsptw_hardness}",
                     "bootstrap="
                     + (
-                        "car_generator_witness"
-                        if "initial_route" in data
-                        else "field_construction"
+                        f"shared_greedy_{shared_greedy_baseline}"
+                        if shared_greedy_baseline is not None
+                        else (
+                            "car_generator_witness"
+                            if "initial_route" in data
+                            else "field_construction"
+                        )
                     ),
                     "reference=" + ("lkh" if has_reference else "none"),
                     flush=True,
@@ -853,8 +1007,12 @@ def main() -> int:
                     else None
                 )
             neural_objectives = []
+            neural_construction_objectives = []
             neural_costs = []
             baseline_objectives = {baseline: [] for baseline in baselines}
+            baseline_construction_objectives = {
+                baseline: [] for baseline in baselines
+            }
             baseline_costs = {baseline: [] for baseline in baselines}
             baseline_seconds = {baseline: 0.0 for baseline in baselines}
             neural_net_evals = []
@@ -876,6 +1034,8 @@ def main() -> int:
                     candidates=args.candidates,
                     n_rollouts=args.rollouts,
                     beta=2.0,
+                    min_changed_edges=args.min_changed_edges,
+                    max_perturb_attempts=args.max_perturb_attempts,
                     seed=args.seed + index * args.val_size + instance_index,
                     search_iterations=args.iterations,
                     feasibility_lookahead_depth=2,
@@ -884,7 +1044,20 @@ def main() -> int:
                     static_field=args.static_field,
                     candidate_mode=args.candidate_mode,
                     srr_exploration_budget=args.srr_exploration_budget,
+                    srr_policy_enabled=args.srr_policy_enabled,
+                    srr_policy_horizon=args.srr_policy_horizon,
                 )
+                if shared_greedy_baseline is not None:
+                    initial_route = _greedy_baseline_route(
+                        problem, decoder_args, shared_greedy_baseline
+                    )
+                    bootstrap_mode = (
+                        f"shared_greedy_{shared_greedy_baseline}"
+                    )
+                elif initial_route is not None:
+                    bootstrap_mode = "external"
+                else:
+                    bootstrap_mode = "method_specific"
 
                 neural_started = time.perf_counter()
                 _, neural, neural_metrics = infer_instance(
@@ -897,6 +1070,9 @@ def main() -> int:
                     )
                 direction = neural["direction"]
                 neural_objectives.append(float(neural["objective"]))
+                neural_construction_objectives.append(
+                    float(neural_metrics["construction_objective"])
+                )
                 neural_costs.append(_canonical_cost(neural))
                 neural_net_evals.append(neural_metrics["net_evals"])
                 neural_model_seconds += neural_metrics["time_neural"]
@@ -906,7 +1082,7 @@ def main() -> int:
                     if baseline_name in cached_for_variant:
                         continue
                     baseline_started = time.perf_counter()
-                    _, baseline_solution, _ = infer_instance(
+                    _, baseline_solution, baseline_metrics = infer_instance(
                         None,
                         problem,
                         decoder_args,
@@ -928,6 +1104,9 @@ def main() -> int:
                     baseline_objectives[baseline_name].append(
                         float(baseline_solution["objective"])
                     )
+                    baseline_construction_objectives[baseline_name].append(
+                        float(baseline_metrics["construction_objective"])
+                    )
                     baseline_costs[baseline_name].append(
                         _canonical_cost(baseline_solution)
                     )
@@ -940,6 +1119,13 @@ def main() -> int:
                     )
                 cached_objective = float(cached_row["baseline_objective"])
                 baseline_objectives[baseline_name] = [cached_objective]
+                cached_construction_objective = cached_row.get(
+                    "baseline_construction_objective", ""
+                )
+                if cached_construction_objective != "":
+                    baseline_construction_objectives[baseline_name] = [
+                        float(cached_construction_objective)
+                    ]
                 baseline_costs[baseline_name] = [
                     -cached_objective
                     if direction == "maximize"
@@ -968,6 +1154,9 @@ def main() -> int:
                     ]
 
             neural_objective = statistics.fmean(neural_objectives)
+            neural_construction_objective = statistics.fmean(
+                neural_construction_objectives
+            )
             neural_cost = statistics.fmean(neural_costs)
 
             # Paired PRISM-vs-URS comparison over the same instances (dataset
@@ -1011,21 +1200,44 @@ def main() -> int:
                 if has_reference
                 else ""
             )
+            neural_construction_gap: float | str = (
+                _gap_percent(
+                    direction, neural_construction_objective, reference
+                )
+                if has_reference
+                else ""
+            )
             result_reports = [
-                f"prism(objective={neural_objective:.6g},"
-                "gap="
-                + (f"{neural_gap:.3f}%" if neural_gap != "" else "n/a")
+                "prism(objective="
+                + _format_construction_final(
+                    neural_construction_objective,
+                    neural_objective,
+                    format_spec=".6g",
+                )
+                + ",gap="
+                + _format_construction_final(
+                    neural_construction_gap,
+                    neural_gap,
+                    format_spec=".3f",
+                    suffix="%",
+                )
                 + ")"
             ]
             for baseline_name in baselines:
                 baseline_objective: float | str = ""
+                baseline_construction_objective: float | str = ""
                 baseline_gap: float | str = ""
+                baseline_construction_gap: float | str = ""
                 outcome = ""
                 neural_improvement: float | str = ""
                 if baseline_name != "none":
                     baseline_objective = statistics.fmean(
                         baseline_objectives[baseline_name]
                     )
+                    if baseline_construction_objectives[baseline_name]:
+                        baseline_construction_objective = statistics.fmean(
+                            baseline_construction_objectives[baseline_name]
+                        )
                     baseline_cost = statistics.fmean(
                         baseline_costs[baseline_name]
                     )
@@ -1046,6 +1258,16 @@ def main() -> int:
                         if has_reference
                         else ""
                     )
+                    baseline_construction_gap = (
+                        _gap_percent(
+                            direction,
+                            baseline_construction_objective,
+                            reference,
+                        )
+                        if has_reference
+                        and baseline_construction_objective != ""
+                        else ""
+                    )
                     neural_improvement = -_gap_percent(
                         direction, neural_objective, baseline_objective
                     )
@@ -1061,12 +1283,25 @@ def main() -> int:
                         else "evaluated"
                     ),
                     "val_size": args.val_size,
+                    "bootstrap_mode": bootstrap_mode,
                     "field_mode": "static" if args.static_field else "dynamic",
                     "direction": direction,
                     "reference": reference if has_reference else "",
+                    "baseline_construction_objective": (
+                        baseline_construction_objective
+                    ),
                     "baseline_objective": baseline_objective,
+                    "neural_construction_objective": (
+                        neural_construction_objective
+                    ),
                     "neural_objective": neural_objective,
+                    "baseline_construction_gap_pct": (
+                        baseline_construction_gap
+                    ),
                     "baseline_gap_pct": baseline_gap,
+                    "neural_construction_gap_pct": (
+                        neural_construction_gap
+                    ),
                     "neural_gap_pct": (
                         _gap_percent(direction, neural_objective, reference)
                         if has_reference
@@ -1098,12 +1333,18 @@ def main() -> int:
                     )
                     result_reports.append(
                         f"{baseline_name}[{source}]"
-                        f"(objective={baseline_objective:.6g},"
-                        "gap="
-                        + (
-                            f"{baseline_gap:.3f}%"
-                            if baseline_gap != ""
-                            else "n/a"
+                        "(objective="
+                        + _format_construction_final(
+                            baseline_construction_objective,
+                            baseline_objective,
+                            format_spec=".6g",
+                        )
+                        + ",gap="
+                        + _format_construction_final(
+                            baseline_construction_gap,
+                            baseline_gap,
+                            format_spec=".3f",
+                            suffix="%",
                         )
                         + ")"
                     )
@@ -1111,6 +1352,7 @@ def main() -> int:
                 "TEST",
                 f"{index + 1}/{len(variants)}",
                 f"variant={name}",
+                f"bootstrap={bootstrap_mode}",
                 f"results=[{'; '.join(result_reports)}]",
                 flush=True,
             )
@@ -1163,6 +1405,12 @@ def main() -> int:
             f"checkpoint_epoch={checkpoint.get('epoch', 'unknown')}",
             f"baseline={baseline_name}",
             f"val_size={args.val_size}",
+            "bootstrap="
+            + (
+                f"shared_greedy_{shared_greedy_baseline}"
+                if shared_greedy_baseline is not None
+                else "method_specific_or_external"
+            ),
             f"field_mode={'static' if args.static_field else 'dynamic'}",
             f"variants={len(variants)}",
             f"passed={len(baseline_rows)}",

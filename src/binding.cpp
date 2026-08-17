@@ -486,6 +486,12 @@ SearchConfig parse_search_config(const py::dict &data) {
       data, "srr_exploration_budget", config.srr_exploration_budget);
   config.srr_exploration_margin = value_or<float>(
       data, "srr_exploration_margin", config.srr_exploration_margin);
+  config.srr_policy_enabled = value_or<bool>(
+      data, "srr_policy_enabled", config.srr_policy_enabled);
+  config.srr_policy_horizon = value_or<int32_t>(
+      data, "srr_policy_horizon", config.srr_policy_horizon);
+  config.srr_policy_beta =
+      value_or<float>(data, "srr_policy_beta", config.srr_policy_beta);
   return config;
 }
 
@@ -660,6 +666,40 @@ py::dict trace_to_dict(const DecisionTrace &trace, int32_t resource_count) {
       trace.screened_resource_delta,
       {static_cast<py::ssize_t>(trace.screened_edges.size()),
        prism::FIELD_CHANNEL_COUNT});
+  result["srr_starts"] = vector_copy<int32_t>(
+      trace.srr_starts, {static_cast<py::ssize_t>(trace.srr_starts.size())});
+  result["srr_candidate_offsets"] = vector_copy<int32_t>(
+      trace.srr_candidate_offsets,
+      {static_cast<py::ssize_t>(trace.srr_candidate_offsets.size())});
+  result["srr_edge_offsets"] = vector_copy<int32_t>(
+      trace.srr_edge_offsets,
+      {static_cast<py::ssize_t>(trace.srr_edge_offsets.size())});
+  result["srr_edges"] = vector_copy<int32_t>(
+      trace.srr_edges, {static_cast<py::ssize_t>(trace.srr_edges.size())});
+  result["srr_edge_signs"] = vector_copy<int8_t>(
+      trace.srr_edge_signs,
+      {static_cast<py::ssize_t>(trace.srr_edge_signs.size())});
+  result["srr_candidate_objective_delta"] = vector_copy<float>(
+      trace.srr_candidate_objective_delta,
+      {static_cast<py::ssize_t>(trace.srr_candidate_objective_delta.size())});
+  result["srr_candidate_energy_delta"] = vector_copy<float>(
+      trace.srr_candidate_energy_delta,
+      {static_cast<py::ssize_t>(trace.srr_candidate_energy_delta.size())});
+  result["srr_candidate_constant_delta"] = vector_copy<float>(
+      trace.srr_candidate_constant_delta,
+      {static_cast<py::ssize_t>(trace.srr_candidate_constant_delta.size())});
+  result["srr_chosen_indices"] = vector_copy<int32_t>(
+      trace.srr_chosen_indices,
+      {static_cast<py::ssize_t>(trace.srr_chosen_indices.size())});
+  result["srr_log_probabilities"] = vector_copy<float>(
+      trace.srr_log_probabilities,
+      {static_cast<py::ssize_t>(trace.srr_log_probabilities.size())});
+  result["srr_live_state"] = vector_copy<float>(
+      trace.srr_live_state,
+      {static_cast<py::ssize_t>(trace.srr_chosen_indices.size()), resource_count});
+  result["srr_stop"] = vector_copy<uint8_t>(
+      trace.srr_stop,
+      {static_cast<py::ssize_t>(trace.srr_stop.size())});
   result["screening_fast_evaluations"] = trace.screening_fast_evaluations;
   result["screening_fallback_evaluations"] =
       trace.screening_fallback_evaluations;
@@ -1017,6 +1057,9 @@ public:
         search.verify_incremental_srr;
     search_values["srr_exploration_budget"] = search.srr_exploration_budget;
     search_values["srr_exploration_margin"] = search.srr_exploration_margin;
+    search_values["srr_policy_enabled"] = search.srr_policy_enabled;
+    search_values["srr_policy_horizon"] = search.srr_policy_horizon;
+    search_values["srr_policy_beta"] = search.srr_policy_beta;
     result["search"] = search_values;
     return result;
   }
