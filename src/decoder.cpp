@@ -2579,7 +2579,7 @@ Solution RoutingDecoder::scope_restricted_refine(
     const float *multipliers,
     const float *coupler_weights, const float *coupler_bias,
     const float *objective_residual, const float *edge_risk, float risk_penalty,
-    RolloutTrace *trace) const {
+    RolloutTrace *trace, std::mt19937_64 &rng) const {
   if (!search_config_.use_srr || !solution.feasible) {
     return solution;
   }
@@ -4607,11 +4607,12 @@ Solution RoutingDecoder::scope_restricted_refine(
   int32_t incremental_rebuilds = 0;
   int32_t full_rebuilds = 0;
   int64_t rebuilt_nodes = 0;
-  // Field-gated exploration: bounded budget of objective-worsening but
-  // guided-energy-descending moves, and the champion (best objective ever seen)
-  // that is returned so an uphill excursion never degrades the result. Disabled
-  // (budget 0) unless a non-flat field is guiding the search.
+  // Bounded objective-worsening exploration and the champion (best objective
+  // ever seen) that is returned so an uphill excursion never degrades the
+  // result. Learned mode requires guided-energy descent; the explicit baseline
+  // control selects a feasible non-improving move by seeded random priority.
   int32_t exploration_remaining = search_config_.srr_exploration_budget;
+  std::uniform_real_distribution<double> random_escape_priority(0.0, 1.0);
   Solution champion = solution;
   while (!checklist.empty()) {
     const int32_t anchor = checklist.front();
@@ -4628,15 +4629,15 @@ Solution RoutingDecoder::scope_restricted_refine(
     const std::vector<float> anchor_state =
         incumbent_state_features(anchor);
     double best_guided_energy = std::numeric_limits<double>::infinity();
-    // Field-gated exploration slot for this anchor: the lowest guided-energy
-    // feasible move that strictly lowers the anchor energy (the field prefers
-    // it) even though it does not improve the objective. Committed only when no
-    // improving move exists and exploration budget remains.
+    // Exploration slot for this anchor: either the lowest guided-energy move
+    // that strictly lowers anchor energy or the random control's lowest-priority
+    // draw. It is committed only when no improving move exists and budget remains.
     const double current_anchor_energy =
         guidance_energy(current_guidance, anchor_state.data());
     Solution best_explore_move;
     AcceptedPlan best_explore_plan;
     double best_explore_energy = std::numeric_limits<double>::infinity();
+    double best_explore_priority = std::numeric_limits<double>::infinity();
     const auto consider = [&](const std::vector<int32_t> &trial,
                               StructuralMove structural) {
       ++full_evaluations;
@@ -4805,6 +4806,11 @@ Solution RoutingDecoder::scope_restricted_refine(
               scored.distance, scored.collected_prize, scored.missed_penalty);
           const double planned_energy =
               guidance_energy(guided, anchor_state.data());
+          const bool random_escape_enabled =
+              exploration_remaining > 0 && search_config_.random_escape;
+          const double planned_escape_priority = random_escape_enabled
+                                                     ? random_escape_priority(rng)
+                                                     : 0.0;
           // The guided energy is anchor-specific rather than a global
           // potential. Keep the global objective as the monotone acceptance
           // gate and use energy to select among improving moves. A bounded
@@ -4814,9 +4820,11 @@ Solution RoutingDecoder::scope_restricted_refine(
               planned_energy < best_guided_energy - 1.0e-12;
           const bool explore_gate =
               exploration_remaining > 0 &&
-              planned_energy <
-                  current_anchor_energy - search_config_.srr_exploration_margin &&
-              planned_energy < best_explore_energy;
+              (random_escape_enabled
+                   ? planned_escape_priority < best_explore_priority
+                   : planned_energy < current_anchor_energy -
+                                          search_config_.srr_exploration_margin &&
+                         planned_energy < best_explore_energy);
           if (!improving_gate && !explore_gate)
             return;
           std::vector<int32_t> trial;
@@ -4873,15 +4881,19 @@ Solution RoutingDecoder::scope_restricted_refine(
             best_plan.plans = plans;
             best_plan.resources = planned_resource;
             best_structural = {};
-          } else if (exploration_remaining > 0 &&
-                     planned_energy < current_anchor_energy -
+          } else if (
+              exploration_remaining > 0 && !better(candidate, solution) &&
+              (search_config_.random_escape
+                   ? planned_escape_priority < best_explore_priority
+                   : planned_energy < current_anchor_energy -
                                           search_config_.srr_exploration_margin &&
-                     planned_energy < best_explore_energy) {
-            // No strictly-improving move at this anchor: record the field's
-            // most-preferred feasible move (lowest guided energy) as a bounded
-            // uphill escape from the local optimum.
+                         planned_energy < best_explore_energy)) {
+            // No strictly-improving move at this anchor: record either the
+            // field's lowest-energy move or the random control's selected
+            // feasible move as a bounded uphill escape.
             best_explore_move = std::move(candidate);
             best_explore_energy = planned_energy;
+            best_explore_priority = planned_escape_priority;
             best_explore_plan.valid = true;
             best_explore_plan.plans = plans;
             best_explore_plan.resources = planned_resource;
@@ -5634,7 +5646,8 @@ Solution RoutingDecoder::perturb(uint64_t rollout_seed, const float *edge_field,
   Solution refined =
       scope_restricted_refine(raw, initial_scope, edge_field, edge_additive,
                               multipliers, coupler_weights, coupler_bias,
-                              objective_residual, edge_risk, risk_penalty, trace);
+                              objective_residual, edge_risk, risk_penalty, trace,
+                              rng);
   refined.raw_objective = raw.raw_objective;
   refined.changed_edges = raw.changed_edges;
   return refined;

@@ -131,8 +131,60 @@ def test_search_configuration_is_exposed() -> None:
         "verify_screening_resources": False,
         "verify_incremental_srr": False,
         "srr_exploration_budget": 0,
+        "random_escape": False,
         "srr_exploration_margin": pytest.approx(1.0e-6),
     }
+
+
+def test_random_escape_lets_flat_constant_guidance_spend_budget() -> None:
+    coordinates, distance = euclidean_problem(18, 1)
+    problem = {
+        "name": "tsp",
+        "coordinates": coordinates,
+        "distance": distance,
+    }
+    constant_multipliers = np.zeros(
+        prism_decoder.MULTIPLIER_COUNT, dtype=np.float32
+    )
+
+    incumbent_solver = make_decoder(
+        problem,
+        candidate_config={"max_candidates": 17},
+        search_config={"min_changed_edges": 4},
+        n_rollouts=4,
+        beta=2.0,
+    )
+    incumbent_solver.seed(9001)
+    bootstrap = incumbent_solver.sample_greedy(
+        multipliers=constant_multipliers
+    )
+    incumbent_solver.set_incumbent(bootstrap["route"])
+    incumbent = incumbent_solver.solve(
+        12, multipliers=constant_multipliers
+    )
+
+    def refine(random_escape: bool) -> dict:
+        solver = make_decoder(
+            problem,
+            candidate_config={"max_candidates": 17},
+            search_config={
+                "min_changed_edges": 4,
+                "srr_exploration_budget": 1,
+                "random_escape": random_escape,
+            },
+            n_rollouts=1,
+            beta=2.0,
+        )
+        solver.seed(23)
+        solver.set_incumbent(incumbent["route"])
+        return solver.solve(1, multipliers=constant_multipliers)
+
+    disabled = refine(False)
+    enabled = refine(True)
+
+    assert disabled["srr_moves"] == 0
+    assert enabled["srr_moves"] > 0
+    assert enabled["objective"] <= incumbent["objective"] + 1.0e-6
 
 
 def test_all_110_benchmark_schemas_are_explicit_and_normalizable() -> None:

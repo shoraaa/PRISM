@@ -19,6 +19,7 @@ from train import (
     _best_feasible_solution,
     _disable_objective_residual,
     _distance_guidance,
+    _inference_decoder_args,
     _neutral_guidance,
     _new_decoder,
     _dual_loss,
@@ -107,6 +108,46 @@ def test_setup_decoder_installs_a_neutral_greedy_incumbent() -> None:
     assert decoder.best_solution["route"].size > 0
     graph = build_decoder_data(decoder)
     assert torch.count_nonzero(graph.x[:, 12]) > 0
+
+
+def test_new_decoder_propagates_min_changed_edges(monkeypatch) -> None:
+    observed = {}
+
+    class FakeDecoder:
+        def __init__(self, _problem, **kwargs):
+            observed.update(kwargs)
+
+        def seed(self, _seed):
+            pass
+
+    monkeypatch.setattr("train.prism_decoder.Decoder", FakeDecoder)
+    args = _args()
+    args.min_changed_edges = 5
+    args.random_escape = True
+
+    _new_decoder({"name": "tsp"}, args, deterministic=True)
+
+    assert observed["search_config"]["min_changed_edges"] == 5
+    assert observed["search_config"]["random_escape"] is True
+
+
+def test_native_baseline_escape_budget_is_opt_in() -> None:
+    args = _args()
+    args.srr_exploration_budget = 4
+    args.random_escape = False
+
+    disabled = _inference_decoder_args(args, None)
+    assert disabled.srr_exploration_budget == 0
+    assert disabled.random_escape is False
+
+    args.random_escape = True
+    enabled = _inference_decoder_args(args, None)
+    assert enabled.srr_exploration_budget == 4
+    assert enabled.random_escape is True
+
+    learned = _inference_decoder_args(args, object())
+    assert learned.srr_exploration_budget == 4
+    assert learned.random_escape is False
 
 
 @pytest.mark.parametrize("smallvram", [False, True])
@@ -1017,6 +1058,26 @@ def test_validation_size_defaults_to_eight_instances(monkeypatch) -> None:
     assert args.objective_residual_l2 == pytest.approx(0.1)
     assert args.val_ema_decay == pytest.approx(0.0)
     assert args.lr_schedule == "constant"
+    assert args.min_changed_edges == 8
+
+
+def test_training_min_changed_edges_cli_override(monkeypatch) -> None:
+    monkeypatch.setattr(
+        sys, "argv", ["train.py", "--min-changed-edges", "5"]
+    )
+
+    args = parse_args()
+
+    assert args.min_changed_edges == 5
+
+
+def test_training_rejects_nonpositive_min_changed_edges(monkeypatch) -> None:
+    monkeypatch.setattr(
+        sys, "argv", ["train.py", "--min-changed-edges", "0"]
+    )
+
+    with pytest.raises(SystemExit):
+        parse_args()
 
 
 def test_no_objective_residual_cli_zeros_and_freezes_objective_head(monkeypatch) -> None:

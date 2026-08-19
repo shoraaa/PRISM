@@ -217,10 +217,15 @@ struct SearchConfig {
   // reverting to strict monotone descent. It lets the learned field steer the
   // search uphill (in objective) to escape local optima, while the champion
   // (best objective seen) and solve()'s best_solution_ guarantee we never
-  // return worse. Constant energy has no gradient, so
-  // no exploration move ever qualifies -- the baseline is strictly unaffected.
+  // return worse. Constant energy has no gradient, so no guided exploration
+  // move qualifies unless the explicit random_escape control below is enabled.
   // 0 disables the phase (default), preserving the pure monotone hill-climb.
   int32_t srr_exploration_budget = 0;
+  // Select objective-nonimproving exploration moves by seeded random priority
+  // instead of requiring a decrease in guided energy. This is an explicit
+  // baseline control: it lets flat constant guidance use the same bounded
+  // budget without changing construction or improving-move ranking.
+  bool random_escape = false;
   // A candidate qualifies for exploration only if it lowers the anchor guided
   // energy by more than this margin, so numerical ties never trigger a kick.
   float srr_exploration_margin = 1.0e-6f;
@@ -561,7 +566,7 @@ private:
                           const float *coupler_bias,
                           const float *objective_residual,
                           const float *edge_risk, float risk_penalty,
-                          RolloutTrace *trace) const;
+                          RolloutTrace *trace, std::mt19937_64 &rng) const;
   int32_t select_next(State &state, std::mt19937_64 &rng,
                       const float *edge_field,
                       const float *edge_additive,

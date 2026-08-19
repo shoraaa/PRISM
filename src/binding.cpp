@@ -484,6 +484,8 @@ SearchConfig parse_search_config(const py::dict &data) {
       data, "verify_incremental_srr", config.verify_incremental_srr);
   config.srr_exploration_budget = value_or<int32_t>(
       data, "srr_exploration_budget", config.srr_exploration_budget);
+  config.random_escape =
+      value_or<bool>(data, "random_escape", config.random_escape);
   config.srr_exploration_margin = value_or<float>(
       data, "srr_exploration_margin", config.srr_exploration_margin);
   return config;
@@ -1016,6 +1018,7 @@ public:
     search_values["verify_incremental_srr"] =
         search.verify_incremental_srr;
     search_values["srr_exploration_budget"] = search.srr_exploration_budget;
+    search_values["random_escape"] = search.random_escape;
     search_values["srr_exploration_margin"] = search.srr_exploration_margin;
     result["search"] = search_values;
     return result;

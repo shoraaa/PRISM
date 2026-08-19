@@ -550,11 +550,13 @@ def _new_decoder(
         },
         search_config={
             "use_srr": use_srr,
+            "min_changed_edges": getattr(args, "min_changed_edges", 8),
+            "random_escape": getattr(args, "random_escape", False),
             "feasibility_lookahead_depth": getattr(
                 args, "feasibility_lookahead_depth", 2
             ),
-            # Energy-guided exploration is inert when candidate energy is
-            # constant and remains active for learned or distance guidance.
+            # Guided exploration is inert for constant energy unless the
+            # explicit seeded-random baseline escape control is enabled.
             "srr_exploration_budget": getattr(
                 args, "srr_exploration_budget", 0
             ),
@@ -566,6 +568,22 @@ def _new_decoder(
         args.seed if deterministic else args.seed + random.randrange(1 << 30)
     )
     return decoder
+
+
+def _inference_decoder_args(
+    args: argparse.Namespace, model: Optional[ConstraintFieldNet]
+) -> argparse.Namespace:
+    """Isolate learned exploration from the opt-in random baseline control."""
+    decoder_args = copy.copy(args)
+    if model is None:
+        decoder_args.random_escape = bool(
+            getattr(args, "random_escape", False)
+        )
+        if not decoder_args.random_escape:
+            decoder_args.srr_exploration_budget = 0
+    else:
+        decoder_args.random_escape = False
+    return decoder_args
 
 
 def setup_decoder(
@@ -2002,12 +2020,13 @@ def infer_instance(
         raise ValueError("search_iterations must be positive")
     if model is None and baseline not in {"constant", "distance", "random"}:
         raise ValueError(f"unknown inference baseline: {baseline}")
+    decoder_args = _inference_decoder_args(args, model)
     # Neural-refinement deployment: REPLACE hand-designed SRR. Build the decoder
     # with SRR off (C++ only constructs) and refine with the trained refiner.
     if getattr(args, "neural_refine", False) and refiner is not None:
         if _refiner_supported(problem):
             srr_decoder = _new_decoder(
-                problem, args, deterministic=True, use_srr=False
+                problem, decoder_args, deterministic=True, use_srr=False
             )
             # construct the incumbent (SRR off) from the neutral bootstrap, the
             # same start the SRR path uses; refinement is then purely neural.
@@ -2026,7 +2045,7 @@ def infer_instance(
         # op/pctsp etc.: refiner has no operator yet -> fall through to SRR.
     decoder = _new_decoder(
         problem,
-        args,
+        decoder_args,
         deterministic=True,
     )
     # Construction and refinement use the same selected guidance mode.
@@ -2768,6 +2787,15 @@ def parse_args() -> argparse.Namespace:
         help="post-bootstrap perturbation/SRR iterations (default: 16)",
     )
     parser.add_argument(
+        "--min-changed-edges",
+        type=int,
+        default=8,
+        help=(
+            "Minimum number of route edges each perturbation tries to change "
+            "before SRR refinement (default: 8)"
+        ),
+    )
+    parser.add_argument(
         "--static-field",
         action="store_true",
         help=(
@@ -3093,6 +3121,8 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.n_rollouts < 1:
         parser.error("--n-rollouts must be positive")
+    if args.min_changed_edges < 1:
+        parser.error("--min-changed-edges must be positive")
     if args.grad_accum_variants is None:
         legacy_rollout_batch = 4 * 32
         args.grad_accum_variants = max(

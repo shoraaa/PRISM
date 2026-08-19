@@ -29,6 +29,38 @@ def test_compare_defaults_to_eight_dynamic_instances() -> None:
     assert args.tsptw_hardness == "hard"
     assert args.tsptw_dataset_seed == 2025
     assert args.baselines == "constant"
+    assert args.min_changed_edges == 8
+    assert args.random_escape is False
+
+
+def test_compare_min_changed_edges_cli_override() -> None:
+    args = decoder_evaluation.parse_args(
+        ["--checkpoint", "model.pt", "--min-changed-edges", "6"]
+    )
+
+    assert args.min_changed_edges == 6
+
+
+def test_compare_rejects_nonpositive_min_changed_edges() -> None:
+    with pytest.raises(SystemExit):
+        decoder_evaluation.parse_args(
+            ["--checkpoint", "model.pt", "--min-changed-edges", "0"]
+        )
+
+
+def test_compare_random_escape_is_explicitly_enabled() -> None:
+    args = decoder_evaluation.parse_args(
+        [
+            "--checkpoint",
+            "model.pt",
+            "--srr-exploration-budget",
+            "4",
+            "--random-escape",
+        ]
+    )
+
+    assert args.srr_exploration_budget == 4
+    assert args.random_escape is True
 
 
 def test_compare_baseline_selection() -> None:

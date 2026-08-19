@@ -70,13 +70,31 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--rollouts", type=int, default=32)
     parser.add_argument("--candidates", type=int, default=64)
     parser.add_argument(
+        "--min-changed-edges",
+        type=int,
+        default=8,
+        help=(
+            "Minimum number of route edges each perturbation tries to change "
+            "before SRR refinement (default: 8)"
+        ),
+    )
+    parser.add_argument(
         "--srr-exploration-budget",
         type=int,
         default=0,
         help=(
-            "Energy-guided SRR exploration budget (bounded uphill escapes the "
-            "guidance can take; inert for the constant-energy baseline). "
-            "Must match the value used at training time. 0 disables (default)."
+            "Bounded uphill SRR exploration budget for PRISM. Native baselines "
+            "receive zero unless --random-escape is enabled. Must match the "
+            "value used at training time. 0 disables (default)."
+        ),
+    )
+    parser.add_argument(
+        "--random-escape",
+        action="store_true",
+        help=(
+            "Allow native constant, distance, and random baselines to spend "
+            "--srr-exploration-budget on seeded-random non-improving SRR "
+            "moves. Without this flag, every native baseline uses budget 0."
         ),
     )
     parser.add_argument(
@@ -235,6 +253,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--csv", type=Path)
     parser.add_argument("--dataset-dir", type=Path, default=DEFAULT_DATASET_DIR)
     args = parser.parse_args(argv)
+    if args.min_changed_edges < 1:
+        parser.error("--min-changed-edges must be positive")
     if args.baselines is None:
         args.baselines = "cached" if args.cached is not None else "constant"
     if (
@@ -883,6 +903,8 @@ def main() -> int:
                     device=args.device,
                     static_field=args.static_field,
                     candidate_mode=args.candidate_mode,
+                    min_changed_edges=args.min_changed_edges,
+                    random_escape=args.random_escape,
                     srr_exploration_budget=args.srr_exploration_budget,
                 )
 
@@ -1060,6 +1082,20 @@ def main() -> int:
                         if baseline_name in cached_for_variant
                         else "evaluated"
                     ),
+                    "random_escape": (
+                        args.random_escape
+                        if baseline_name in NATIVE_BASELINE_NAMES
+                        else False
+                    ),
+                    "prism_srr_exploration_budget": (
+                        args.srr_exploration_budget
+                    ),
+                    "baseline_srr_exploration_budget": (
+                        args.srr_exploration_budget
+                        if args.random_escape
+                        and baseline_name in NATIVE_BASELINE_NAMES
+                        else 0
+                    ),
                     "val_size": args.val_size,
                     "field_mode": "static" if args.static_field else "dynamic",
                     "direction": direction,
@@ -1164,6 +1200,20 @@ def main() -> int:
             f"baseline={baseline_name}",
             f"val_size={args.val_size}",
             f"field_mode={'static' if args.static_field else 'dynamic'}",
+            "baseline_escape="
+            + (
+                "random"
+                if args.random_escape and baseline_name in NATIVE_BASELINE_NAMES
+                else "disabled"
+            ),
+            f"prism_srr_exploration_budget={args.srr_exploration_budget}",
+            "baseline_srr_exploration_budget="
+            + str(
+                args.srr_exploration_budget
+                if args.random_escape
+                and baseline_name in NATIVE_BASELINE_NAMES
+                else 0
+            ),
             f"variants={len(variants)}",
             f"passed={len(baseline_rows)}",
             f"failed={len(baseline_failures)}",
