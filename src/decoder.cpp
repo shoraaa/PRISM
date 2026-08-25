@@ -2024,6 +2024,50 @@ float RoutingDecoder::depot_reload(const State &state) const {
   return state.unvisited_backhauls > 0 ? 0.0f : problem_.capacity;
 }
 
+bool RoutingDecoder::construction_return_reachable(const State &state,
+                                                   int32_t next) const {
+  // Construction-only stranding guard for depot-resetting consumables (battery,
+  // fuel, ...). The per-transition bound only certifies that `next` is reachable
+  // on arrival, not that any onward move remains -- so greedy construction can
+  // drive to a far customer and then reach neither the depot nor another
+  // customer. Because every customer is feasible as a depot singleton, requiring
+  // the depot to stay reachable after the move keeps a feasible completion
+  // available (return, reset, serve the rest) and never blocks legitimate
+  // progress: the current node was itself entered under this guard, so its own
+  // depot leg is still affordable and the depot fallback is always present.
+  if (next < problem_.depot_count)
+    return true;
+  for (int32_t index : active_resource_indices_) {
+    const ResourceSpec &spec = resource(index);
+    if (spec.op != ResourceOperator::AFFINE_ACCUMULATOR || !spec.reset_at_depot)
+      continue;
+    const bool consumes = spec.edge_uses_distance || !spec.edge_values.empty();
+    if (!consumes || !std::isfinite(spec.lower))
+      continue;
+    // Post-arrival (post-reset) resource value at `next`.
+    float value = state.resource_state[index];
+    if (!resource_transition_feasible(state, next, index, &value))
+      return false;
+    // Cheapest depot return leg keeps the guard least restrictive under
+    // multiple depots; a reset node (charger) departs at reset_value.
+    float best_slack = -std::numeric_limits<float>::infinity();
+    for (int32_t depot = 0; depot < problem_.depot_count; ++depot) {
+      float leg = value;
+      if (spec.edge_uses_distance)
+        leg += spec.edge_coefficient * problem_.dist(next, depot);
+      if (!spec.edge_values.empty())
+        leg += spec.edge_coefficient *
+               spec.edge_values[static_cast<size_t>(next) *
+                                    problem_.node_count +
+                                depot];
+      best_slack = std::max(best_slack, leg - spec.lower);
+    }
+    if (best_slack < -FEASIBILITY_EPS)
+      return false;
+  }
+  return true;
+}
+
 bool RoutingDecoder::legal_node(const State &state, int32_t node) const {
   const int32_t depots = problem_.depot_count;
   if (node < 0 || node >= problem_.node_count)
@@ -2035,7 +2079,7 @@ bool RoutingDecoder::legal_node(const State &state, int32_t node) const {
       if (!resource_transition_feasible(state, node, index))
         return false;
     }
-    return true;
+    return construction_return_reachable(state, node);
   }
 
   if (depots == 0 || state.at_depot)

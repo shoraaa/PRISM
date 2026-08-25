@@ -492,6 +492,7 @@ private:
                                     float *next_value = nullptr,
                                     bool force_route_end = false) const;
   bool resource_terminal_feasible(const State &state, int32_t resource) const;
+  bool construction_return_reachable(const State &state, int32_t next) const;
   void validate_guidance(const float *edge_field,
                          const float *edge_additive,
                          const float *multipliers,

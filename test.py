@@ -37,6 +37,7 @@ from problem_data import (  # noqa: E402
     DatasetFinder,
     TRAIN_VARIANTS,
     generate_evrp_data,
+    generate_evrptw_data,
     load_saved_data,
 )
 from train import _canonical_cost, infer_instance, setup_seeds  # noqa: E402
@@ -437,9 +438,11 @@ def run_urs_variant(
 
 
 # Variants with no saved dataset: instances are generated on the fly. "evrp" is
-# the zero-shot unseen-resource probe (battery via the resource algebra) and is
-# never in the 110 benchmarks, so it must be requested explicitly.
-GENERATED_VARIANTS = ("evrp",)
+# the zero-shot unseen-resource probe (battery via the resource algebra) and
+# "evrptw" composes that battery with the trained capacity + time-window
+# channels; neither is in the 110 benchmarks, so both must be requested
+# explicitly.
+GENERATED_VARIANTS = ("evrp", "evrptw")
 OPTIONAL_VARIANTS = GENERATED_VARIANTS + ("tsptw",)
 CAR_ROOT = ROOT / "baselines" / "CaR-constraint"
 
@@ -805,7 +808,12 @@ def main() -> int:
                 # reference oracle yet, so score PRISM's learned field only
                 # against the selected native controls on the same generated
                 # instances (feasibility is guaranteed by the exact decoder).
-                data = generate_evrp_data(
+                generator = (
+                    generate_evrptw_data
+                    if name == "evrptw"
+                    else generate_evrp_data
+                )
+                data = generator(
                     args.evrp_size, args.val_size, seed=args.seed
                 )
                 reference = None

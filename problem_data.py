@@ -200,7 +200,7 @@ def problem_schema(name: str) -> dict:
     # EVRP = capacitated VRP whose battery resource enters through the resource
     # algebra (see decoder_problem), never as a CONSTRAINT_VOCAB entry -- this is
     # the zero-shot unseen-resource probe, so the schema stays a plain CVRP.
-    is_evrp = name == "evrp"
+    is_evrp = name.startswith("evrp")
     has_capacity = "cvrp" in name or is_evrp
     is_vrp = has_capacity or name == "vrptw"
     constraints = []
@@ -283,7 +283,7 @@ def decoder_problem(name: str, data: dict) -> dict:
         problem["tour_limit"] = 4.0
     elif name == "aop":
         problem["tour_limit"] = 1.0
-    if name == "evrp":
+    if name.startswith("evrp"):
         # Battery declared purely through the resource algebra: an edge-consumed,
         # depot/charger-replenished accumulator bounded at zero. No neural
         # parameter is battery-specific; the frozen model must interpret it from
@@ -542,6 +542,68 @@ def generate_evrp_data(
         "demand": demand,
         "charger": charger,
         "battery_range": battery_range,
+    }
+
+
+def generate_evrptw_data(
+    size: int,
+    count: int,
+    seed: int = 0x45565257,
+    capacity: int = 50,
+    charger_fraction: float = 0.15,
+) -> dict[str, torch.Tensor]:
+    """Generate Electric VRPTW instances in the neutral batched tensor schema.
+
+    EVRPTW composes the EVRP battery (the zero-shot resource declared through the
+    algebra in ``decoder_problem``) with the two trained channels capacity and
+    time_windows -- an unseen *composition* probe rather than an unseen resource.
+    Windows follow the vrptw generator (``horizon = 3.2``, ``service = 0.2``) so
+    every customer stays individually serviceable as a depot singleton on time,
+    while ``battery_range = 2.1 * max_i dist(depot, i)`` keeps that same singleton
+    battery-feasible -- the two guarantees compose, so a feasible complete
+    solution always exists.
+    """
+    if size < 1:
+        raise ValueError("evrptw requires at least one customer")
+    if count < 1:
+        raise ValueError("evrptw count must be positive")
+    state = torch.random.get_rng_state()
+    torch.manual_seed(seed)
+    try:
+        node_count = size + 1
+        xy = torch.rand(count, node_count, 2)
+        demand = torch.randint(1, 10, (count, node_count)).float() / float(capacity)
+        demand[:, 0] = 0.0
+        charger = torch.zeros(count, node_count)
+        k = max(1, int(size * charger_fraction))
+        for row in range(count):
+            picked = torch.randperm(size)[:k] + 1
+            charger[row, picked] = 1.0
+        radius = torch.linalg.vector_norm(xy - xy[:, :1, :], dim=-1)
+        battery_range = 2.1 * radius.max(dim=1).values
+        travel = radius[:, 1:]
+        service = torch.full((count, size), 0.2)
+        horizon = 3.2
+        earliest = travel
+        latest = horizon - travel - service
+        center = earliest + (latest - earliest) * torch.rand(count, size)
+        half_width = 0.1 + (horizon / 3 - 0.1) * torch.rand(count, size)
+        start = torch.clamp(center - half_width, min=0.0)
+        end = torch.minimum(center + half_width, latest)
+        depot_col = torch.zeros(count, 1)
+        tw_start = torch.cat((depot_col, start), dim=1)
+        tw_end = torch.cat((torch.full((count, 1), horizon), end), dim=1)
+        service_time = torch.cat((depot_col, service), dim=1)
+    finally:
+        torch.random.set_rng_state(state)
+    return {
+        "xy": xy,
+        "demand": demand,
+        "charger": charger,
+        "battery_range": battery_range,
+        "tw_start": tw_start,
+        "tw_end": tw_end,
+        "service_time": service_time,
     }
 
 
