@@ -391,12 +391,58 @@ class ConstraintFieldNet(nn.Module):
         agg_fn="mean",
         grad_checkpointing=False,
         gate_multipliers_by_binding=True,
+        couple_resource_tokens=True,
+        linear_objective_residual_head=False,
+        unconditioned_objective_residual_head=False,
+        couple_state_multipliers=True,
     ):
         super().__init__()
+        # Objective-residual head parameterization. Default: a coefficient-
+        # conditioned MLP (hidden layer mixes edge state with the declared
+        # coefficients). Ablation (True): a single linear layer over
+        # [edge_state, coeffs], so the coefficient contribution enters only
+        # linearly -- the claim under test is that a purely linear coeff term
+        # collapses into a per-row constant the downstream row-centering
+        # removes, leaving the residual unable to specialize per objective.
+        self.linear_objective_residual_head = linear_objective_residual_head
+        # Unconditioned-head ablation (True): build the objective-energy residual
+        # head over the edge state ALONE, dropping the declared coefficient vector
+        # from its input. The head keeps the same depth/width as the default MLP so
+        # the ablation isolates the *conditioning* (not capacity): one shared signed
+        # logit must serve every objective. The claim under test is that this
+        # unconditioned head suffers cross-objective negative transfer (e.g. a
+        # distance correction fighting a prize correction) that coefficient
+        # conditioning resolves. Mutually exclusive with the linear-head ablation.
+        self.unconditioned_objective_residual_head = (
+            unconditioned_objective_residual_head
+        )
+        if (
+            linear_objective_residual_head
+            and unconditioned_objective_residual_head
+        ):
+            raise ValueError(
+                "linear_objective_residual_head and "
+                "unconditioned_objective_residual_head are mutually exclusive"
+            )
+        # State-coupler ablation. When False, the per-decision live-state
+        # modulation of the resource multipliers is disabled: forward emits zero
+        # coupler weights/bias so both the Python couple() and the C++ decoder
+        # leave each multiplier at its per-refresh GNN value (2*sigmoid(0)==1).
+        # This isolates "live-state-modulated intensity" -- static per-refresh
+        # lambda_r vs. per-decision lambda_r. The coupler heads stay registered
+        # (unused, at their init) so the parameter layout is unchanged.
+        self.couple_state_multipliers = couple_state_multipliers
         # Gate resource multipliers by the binding classifier so inactive/slack
         # resources begin damped. The signed edge field still receives policy
         # gradients through this gate; the ungated path remains an ablation.
         self.gate_multipliers_by_binding = gate_multipliers_by_binding
+        # Resource-token attention couples the per-resource tokens so each
+        # channel's learned intensity depends on the full active constraint
+        # composition. Setting this False removes that cross-resource coupling
+        # (the compositional-attention ablation); tokens then depend only on
+        # their own descriptor. The attention parameters stay registered either
+        # way so checkpoints remain layout-compatible across the ablation.
+        self.couple_resource_tokens = couple_resource_tokens
         self.emb_net = EmbNet(
             depth=depth,
             feats=NODE_FEATURE_COUNT,
@@ -458,11 +504,21 @@ class ConstraintFieldNet(nn.Module):
         # objectives still specialize via their coefficients -- avoiding the
         # negative transfer of a single unconditioned logit and the cold
         # per-type columns of a one-hot head.
-        self.objective_energy_residual_head = nn.Sequential(
-            nn.Linear(units + OBJECTIVE_COEFF_DIM, units),
-            nn.SiLU(),
-            nn.Linear(units, 1),
+        residual_head_input = (
+            units
+            if self.unconditioned_objective_residual_head
+            else units + OBJECTIVE_COEFF_DIM
         )
+        if self.linear_objective_residual_head:
+            self.objective_energy_residual_head = nn.Linear(
+                residual_head_input, 1
+            )
+        else:
+            self.objective_energy_residual_head = nn.Sequential(
+                nn.Linear(residual_head_input, units),
+                nn.SiLU(),
+                nn.Linear(units, 1),
+            )
         # Schema-conditioned advantage scale g_phi(schema): a detached, learned
         # RELATIVE multiplier on the batch-pooled advantage scale. It reads the
         # same algebra descriptor the field consumes (constraint multi-hot + route
@@ -493,11 +549,16 @@ class ConstraintFieldNet(nn.Module):
         # conditioning) layer receives gradient from step 0. Bias stays zero so a
         # row-constant output remains neutral after row-centering; the residual
         # starts small and is bounded by row-center + tanh + --objective-residual-l2.
+        final_residual_layer = (
+            self.objective_energy_residual_head
+            if isinstance(self.objective_energy_residual_head, nn.Linear)
+            else self.objective_energy_residual_head[-1]
+        )
         nn.init.normal_(
-            self.objective_energy_residual_head[-1].weight,
+            final_residual_layer.weight,
             std=OBJECTIVE_RESIDUAL_HEAD_INIT_STD,
         )
-        nn.init.zeros_(self.objective_energy_residual_head[-1].bias)
+        nn.init.zeros_(final_residual_layer.bias)
         nn.init.zeros_(self.feasibility_head.weight)
         # A fresh model must reproduce the plain-objective (E = c(e)) neutral
         # search -- the initial policy from which the field is learned, not the
@@ -719,15 +780,22 @@ class ConstraintFieldNet(nn.Module):
         )
         _require_unit_interval("resource_descriptors", descriptor)
         tokens = self.resource_encoder(descriptor)
-        padding_mask = ~active.bool()
-        no_resources = ~active.bool().any(dim=1)
-        if no_resources.any():
-            padding_mask = padding_mask.clone()
-            padding_mask[no_resources, 0] = False
-        coupled_tokens, _ = self.resource_attention(
-            tokens, tokens, tokens, key_padding_mask=padding_mask
-        )
-        tokens = tokens + coupled_tokens
+        # Cross-resource coupling. The --no-couple-resource-tokens ablation
+        # skips this residual so every token is an independent per-resource
+        # encoding of its own descriptor, isolating the contribution of
+        # compositional attention. The attention parameters remain in the state
+        # dict (unused, at their init) so a coupled and an ablated checkpoint
+        # share an identical parameter layout.
+        if self.couple_resource_tokens:
+            padding_mask = ~active.bool()
+            no_resources = ~active.bool().any(dim=1)
+            if no_resources.any():
+                padding_mask = padding_mask.clone()
+                padding_mask[no_resources, 0] = False
+            coupled_tokens, _ = self.resource_attention(
+                tokens, tokens, tokens, key_padding_mask=padding_mask
+            )
+            tokens = tokens + coupled_tokens
 
         projected_edges = self.edge_projection(edge_embedding)
         # The residual GNN can have large eval-time activations after many
@@ -749,8 +817,17 @@ class ConstraintFieldNet(nn.Module):
             if batched
             else objective_coeffs[0].expand(edge_count, -1)
         )
+        # Unconditioned-head ablation: drop the coefficient vector so a single
+        # shared logit serves every objective (isolating the value of
+        # coefficient conditioning). Otherwise condition on the declared coeffs.
+        if self.unconditioned_objective_residual_head:
+            residual_head_input = objective_edge_state
+        else:
+            residual_head_input = torch.cat(
+                (objective_edge_state, edge_objective_coeffs), dim=-1
+            )
         raw_objective_residual = self.objective_energy_residual_head(
-            torch.cat((objective_edge_state, edge_objective_coeffs), dim=-1)
+            residual_head_input
         ).squeeze(-1)
         # Only differences within an outgoing candidate row affect policy.
         # Center before bounding so a row-constant head output is exactly
@@ -839,6 +916,12 @@ class ConstraintFieldNet(nn.Module):
             * active.unsqueeze(1)
         )
         coupler_bias = self.coupler_bias_head(state).squeeze(-1) * active
+        # State-coupler ablation: emit no live-state modulation so every resource
+        # multiplier stays at its per-refresh GNN value in both the Python
+        # couple() (2*sigmoid(0)==1) and the exported C++ decoder.
+        if not self.couple_state_multipliers:
+            coupler_weights = torch.zeros_like(coupler_weights)
+            coupler_bias = torch.zeros_like(coupler_bias)
         # Append the always-on objective slot required by the native guidance
         # schema. Keep it exactly one, with zero live-state coupling, for every
         # problem (including constrained ones). A graph-level scalar only

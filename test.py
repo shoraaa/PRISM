@@ -755,7 +755,29 @@ def main() -> int:
         raise RuntimeError(
             f"checkpoint schema does not match {MODEL_SCHEMA}"
         )
-    model = ConstraintFieldNet().to(args.device)
+    # Reconstruct architecture-shaping flags from the training config so an
+    # ablated checkpoint evaluates with the same architecture it was trained
+    # under. The attention parameters are always present in the state dict, so a
+    # missing flag would silently evaluate an ablated model *with* coupling.
+    train_config = checkpoint.get("config", {})
+    model = ConstraintFieldNet(
+        couple_resource_tokens=train_config.get(
+            "couple_resource_tokens", True
+        ),
+        # These reshape the objective-residual head, so the state dict will not
+        # load unless the architecture is rebuilt exactly as trained.
+        linear_objective_residual_head=train_config.get(
+            "linear_objective_residual_head", False
+        ),
+        unconditioned_objective_residual_head=train_config.get(
+            "unconditioned_objective_residual_head", False
+        ),
+        # Forward-time only (coupler params always present), but a missing flag
+        # would silently evaluate a static-coupler ablation *with* live coupling.
+        couple_state_multipliers=train_config.get(
+            "couple_state_multipliers", True
+        ),
+    ).to(args.device)
     load_constraint_field_state_dict(model, checkpoint["model_state_dict"])
     model.eval()
 

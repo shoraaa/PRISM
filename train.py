@@ -2962,6 +2962,55 @@ def parse_args() -> argparse.Namespace:
             " available as an ablation)."
         ),
     )
+    parser.add_argument(
+        "--couple-resource-tokens",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Couple the per-resource tokens with resource-token attention so"
+            " each constraint's learned intensity depends on the full active"
+            " composition (default). --no-couple-resource-tokens is the"
+            " compositional-attention ablation: tokens become an independent"
+            " per-resource encoding with no cross-resource coupling."
+        ),
+    )
+    parser.add_argument(
+        "--couple-state-multipliers",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Modulate each resource multiplier by the live search state at every"
+            " decision (default). --no-couple-state-multipliers is the"
+            " static-intensity ablation: multipliers are frozen to their"
+            " per-refresh GNN value, isolating live-state-modulated intensity"
+            " (static vs. per-decision lambda_r)."
+        ),
+    )
+    parser.add_argument(
+        "--linear-objective-residual-head",
+        action="store_true",
+        help=(
+            "Design-choice ablation for the signed objective-energy residual:"
+            " replace the coefficient-conditioned MLP with a single linear head"
+            " over [edge_state, coeffs]. Tests the claim that a purely linear"
+            " coefficient term collapses into a per-row constant that downstream"
+            " row-centering deletes, leaving the residual unable to specialize"
+            " per objective. Mutually exclusive with"
+            " --unconditioned-objective-residual-head."
+        ),
+    )
+    parser.add_argument(
+        "--unconditioned-objective-residual-head",
+        action="store_true",
+        help=(
+            "Design-choice ablation for the signed objective-energy residual:"
+            " drop the declared coefficient vector from the head input so one"
+            " shared MLP logit serves every objective. Tests whether the"
+            " unconditioned shared head suffers cross-objective negative transfer"
+            " that coefficient conditioning resolves. Mutually exclusive with"
+            " --linear-objective-residual-head."
+        ),
+    )
     parser.add_argument("--entropy-weight", type=float, default=0.001)
     parser.add_argument(
         "--objective-residual",
@@ -3182,6 +3231,12 @@ def main() -> None:
     model = ConstraintFieldNet(
         grad_checkpointing=args.grad_checkpointing,
         gate_multipliers_by_binding=args.gate_multipliers_by_binding,
+        couple_resource_tokens=args.couple_resource_tokens,
+        couple_state_multipliers=args.couple_state_multipliers,
+        linear_objective_residual_head=args.linear_objective_residual_head,
+        unconditioned_objective_residual_head=(
+            args.unconditioned_objective_residual_head
+        ),
     ).to(args.device)
     # Joint refiner (CaR unified-encoder): EXPERIMENTAL, off by default (may be
     # removed or evolved in the future). Shares model.emb_net so its
