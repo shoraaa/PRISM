@@ -21,14 +21,10 @@ from train import (
     _inference_decoder_args,
     _neutral_guidance,
     _new_decoder,
-    _dual_loss,
     _epoch_lr,
     _epoch_seed,
     _objective_residual_loss,
     _random_guidance,
-    _feasibility_loss,
-    _positive_class_weight,
-    _rollout_class_weights,
     _training_accumulation_size,
     _training_variant_schedule,
     _validation_cost_groups,
@@ -71,8 +67,8 @@ def _args() -> Namespace:
         value_loss_weight=0.5,
         rl_weight=1.0,
         aux_rl_scale=0.1,
-        dual_weight=1.0,
-        feasibility_weight=1.0,
+        slack_weight=1.0,
+        
         binding_weight=0.25,
         price_weight=0.25,
         entropy_weight=0.001,
@@ -210,11 +206,13 @@ def test_event_driven_option_rollout_and_pretrain_update(
     args.pretrain_aux_scale = 0.25
     model = ConstraintFieldNet(depth=1, units=8)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
-    binding_before = model.binding_head.weight.detach().clone()
+    before = {
+        name: parameter.detach().clone()
+        for name, parameter in model.named_parameters()
+    }
     multiplier_before = model.multiplier_head.weight.detach().clone()
     coupler_before = model.coupler_query_head.weight.detach().clone()
     coupler_bias_before = model.coupler_bias_head.weight.detach().clone()
-    feasibility_before = model.feasibility_head.weight.detach().clone()
 
     rollout = collect_instance_rollout(model, problem, "cvrp", args)
     metrics = ppo_update(model, optimizer, [rollout], args, epoch=0)
@@ -240,26 +238,27 @@ def test_event_driven_option_rollout_and_pretrain_update(
     assert len(transition_steps) == rollout.improvements
     assert any(step.value_target is not None for step in rollout.steps)
     assert all(0.0 <= step.search_progress < 1.0 for step in rollout.steps)
-    assert {
-        "dual_loss",
-        "feasibility_loss",
-        "binding_loss",
-        "price_loss",
-        "approx_kl",
-        "clip_frac",
-    } <= metrics.keys()
+    # v14 reports one auxiliary. The four it replaces supervised quantities the
+    # decoder already computes exactly, or a head whose output could not reach a
+    # decision; `slack_loss` regresses the field onto the executed signed
+    # admissibility margin, which is also what the feasibility probes read.
+    assert {"slack_loss", "approx_kl", "clip_frac"} <= metrics.keys()
+    assert not {"dual_loss", "feasibility_loss", "binding_loss", "price_loss"} & metrics.keys()
     assert metrics["auxiliary_scale"] == pytest.approx(0.25)
-    assert not torch.equal(binding_before, model.binding_head.weight.detach())
-    assert not torch.equal(multiplier_before, model.multiplier_head.weight.detach())
-    assert not torch.equal(
-        feasibility_before, model.feasibility_head.weight.detach()
-    )
-    assert not (
-        torch.equal(coupler_before, model.coupler_query_head.weight.detach())
-        and torch.equal(
-            coupler_bias_before, model.coupler_bias_head.weight.detach()
-        )
-    )
+    # The pricing heads (multiplier, coupler, binding gate) kept their learned
+    # form but lost their auxiliary supervision: v14 deleted the terms that
+    # regressed them onto the decoder's own binding fraction. PPO is now their
+    # only teacher, so none of them is guaranteed to move within one short
+    # rollout, and asserting that they do would be re-testing the supervision
+    # that was removed. What the update must still produce is a policy signal
+    # and a real step somewhere in the model.
+    assert metrics["gradient_norm"] > 0.0
+    moved = [
+        name
+        for name, parameter in model.named_parameters()
+        if name in before and not torch.equal(before[name], parameter.detach())
+    ]
+    assert moved, "PPO produced no parameter update at all"
 
 
 @pytest.mark.parametrize(
@@ -303,7 +302,6 @@ def test_decision_level_ppo_moves_policy_without_auxiliary_losses(
             (
                 "objective_energy_residual_head",
                 "field_head",
-                "additive_head",
                 "multiplier_head",
             )
         )
@@ -347,12 +345,12 @@ def test_decision_level_ppo_moves_policy_without_auxiliary_losses(
     assert metrics["temporal_transitions"] == rollout.improvements
     if temporal_credit_weight:
         assert metrics["temporal_policy_signal"] > 0.0
-        assert metrics["critic_loss"] > 0.0
-        assert not torch.equal(value_before, model.value_head.weight.detach())
     else:
         assert metrics["temporal_policy_signal"] == 0.0
-        assert metrics["critic_loss"] == 0.0
-        assert torch.equal(value_before, model.value_head.weight.detach())
+    # v14 drops the critic from the objective. It was never on:
+    # --value-loss-weight defaulted to 0 and the advantage is a batch-mean
+    # baseline, not a value estimate, so value_head is untrained either way.
+    assert torch.equal(value_before, model.value_head.weight.detach())
     assert replay_drift and max(replay_drift) > 1e-7
     assert metrics["ppo_reuse_passes"] == 1.0
     assert metrics["ppo_clipping_active"] == 0.0
@@ -395,37 +393,6 @@ def test_tsp_refinement_transition_updates_objective_residual_head() -> None:
     assert not torch.equal(
         before, model.objective_energy_residual_head[-1].weight.detach()
     )
-
-
-def test_binding_weight_is_computed_across_rollout_steps() -> None:
-    channels = prism_decoder.FIELD_CHANNEL_COUNT
-    graph = SimpleNamespace(
-        active_channels=torch.tensor(
-            [[1.0] + [0.0] * (channels - 1)]
-        )
-    )
-    steps = []
-    for target in (0.0, 0.0, 0.0, 1.0):
-        steps.append(
-            OptionStep(
-                graph=graph,
-                trace={
-                    "feasibility_risk_labels": np.empty(0, dtype=np.float32)
-                },
-                old_logp=torch.empty(0),
-                decisions=torch.zeros(1, dtype=torch.int32),
-                rewards=torch.zeros(1),
-                resource_delta=None,
-                binding_target=torch.tensor(
-                    [target] + [0.0] * (channels - 1)
-                ),
-                duration=1,
-            )
-        )
-
-    weights = _rollout_class_weights(steps)
-
-    assert weights["binding"] == 3.0
 
 
 def test_smdp_returns_discount_across_variable_duration_options() -> None:
@@ -496,13 +463,6 @@ def test_winner_temporal_advantage_is_non_cancelling_pomo_contrast() -> None:
     assert float(advantage.abs().sum()) > 0.0
 
 
-def test_positive_class_weight_balances_rare_events() -> None:
-    target = torch.tensor([0.0, 0.0, 0.0, 1.0])
-
-    assert _positive_class_weight(target) == 3.0
-    assert _positive_class_weight(torch.zeros(4)) == 1.0
-
-
 def test_edge_logit_anchor_ignores_row_constants() -> None:
     step = SimpleNamespace(
         graph=SimpleNamespace(edge_offsets=torch.tensor([0, 2, 5]))
@@ -523,99 +483,6 @@ def test_edge_logit_anchor_ignores_row_constants() -> None:
 
     assert constant_loss == 0.0
     assert varying_loss > 0.0
-
-
-def test_feasibility_auxiliary_retains_legacy_unconstrained_supervision() -> None:
-    logits = torch.tensor([0.5, -0.5], requires_grad=True)
-    step = SimpleNamespace(
-        trace={
-            "feasibility_risk_labels": np.array([1.0, 0.0], dtype=np.float32),
-            "feasibility_edges": np.array([0, 1], dtype=np.int32),
-        }
-    )
-    output = {
-        "feasibility_logits": logits,
-        "active_channels": torch.zeros(1, prism_decoder.FIELD_CHANNEL_COUNT),
-    }
-
-    loss = _feasibility_loss(step, output)
-    loss.backward()
-
-    assert loss > 0.0
-    assert logits.grad is not None
-    assert logits.grad.norm() > 0.0
-
-
-def test_direct_dual_heads_learn_when_analytic_pressure_is_zero() -> None:
-    channels = prism_decoder.FIELD_CHANNEL_COUNT
-    edge_features = torch.zeros(1, prism_decoder.EDGE_FEATURE_COUNT)
-    graph = SimpleNamespace(
-        edge_attr=edge_features,
-        edge_offsets=torch.tensor([0, 1], dtype=torch.long),
-    )
-    trace = {
-        "screened_edges": np.array([0], dtype=np.int32),
-        "screened_resource_delta": np.array(
-            [[1.0] + [0.0] * (channels - 1)], dtype=np.float32
-        ),
-    }
-    step = OptionStep(
-        graph=graph,
-        trace=trace,
-        old_logp=torch.zeros(1),
-        decisions=torch.ones(1),
-        rewards=torch.zeros(1),
-        resource_delta=None,
-        binding_target=torch.zeros(channels),
-        duration=1,
-    )
-    residual = torch.zeros(1, channels, requires_grad=True)
-    additive = torch.zeros(1, channels, requires_grad=True)
-    output = {
-        "residual": residual,
-        "additive": additive,
-        "active_channels": torch.tensor(
-            [[1.0] + [0.0] * (channels - 1)]
-        ),
-    }
-
-    _dual_loss(step, output).backward()
-
-    assert additive.grad[0, 0] != 0.0
-    assert residual.grad[0, 0] != 0.0
-
-
-def test_screened_dual_loss_is_zero_without_active_resources() -> None:
-    channels = prism_decoder.FIELD_CHANNEL_COUNT
-    graph = SimpleNamespace(
-        edge_attr=torch.zeros(1, prism_decoder.EDGE_FEATURE_COUNT),
-        edge_offsets=torch.tensor([0, 1], dtype=torch.long),
-    )
-    step = OptionStep(
-        graph=graph,
-        trace={
-            "screened_edges": np.array([0], dtype=np.int32),
-            "screened_resource_delta": np.zeros(
-                (1, channels), dtype=np.float32
-            ),
-        },
-        old_logp=torch.zeros(1),
-        decisions=torch.ones(1),
-        rewards=torch.zeros(1),
-        resource_delta=None,
-        binding_target=torch.zeros(channels),
-        duration=1,
-    )
-    output = {
-        "residual": torch.ones(1, channels, requires_grad=True),
-        "additive": torch.zeros(1, channels, requires_grad=True),
-        "active_channels": torch.zeros(1, channels),
-    }
-
-    loss = _dual_loss(step, output)
-    loss.backward()
-
-    assert loss == 0.0
 
 
 def test_stagnant_options_reuse_field_and_skip_fallback_labels() -> None:

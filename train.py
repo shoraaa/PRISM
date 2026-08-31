@@ -142,7 +142,6 @@ def replay_decision_logp_from_cpp_batch_trace(
     global_edge = edge_offsets[current].unsqueeze(1) + local
     global_edge = global_edge.clamp_max(output["residual"].shape[0] - 1)
     residual = output["residual"][global_edge]
-    additive = output["additive"][global_edge]
     objective_energy_scale = graph.objective_energy_scale.to(device).reshape(-1)
     if objective_energy_scale.numel() != 1:
         raise ValueError("PPO trace replay expects exactly one decoder graph")
@@ -157,9 +156,8 @@ def replay_decision_logp_from_cpp_batch_trace(
     if not field_enabled:
         field_multiplier = torch.zeros_like(field_multiplier)
         objective_weight = torch.ones_like(objective_weight)
-    feasibility_risk = output["feasibility_risk"].detach()
     # Match the native dimensionless, signed, zero-neutral energy contract.
-    field_term = residual + additive
+    field_term = residual
     objective_residual = output["objective_residual"][global_edge]
     if not field_enabled:
         objective_residual = torch.zeros_like(objective_residual)
@@ -168,13 +166,10 @@ def replay_decision_logp_from_cpp_batch_trace(
     ) + (
         field_multiplier.unsqueeze(1) * field_term
     ).sum(dim=-1)
-    energy = energy + float(risk_penalty) * feasibility_risk[global_edge]
     logits = (-float(beta) * energy).masked_fill(~valid, -torch.inf)
 
     chosen_edge = edge_offsets[current[selected]] + chosen[selected]
-    chosen_field = (
-        output["residual"][chosen_edge] + output["additive"][chosen_edge]
-    )
+    chosen_field = output["residual"][chosen_edge]
     chosen_objective_residual = output["objective_residual"][chosen_edge]
     if not field_enabled:
         chosen_objective_residual = torch.zeros_like(chosen_objective_residual)
@@ -183,10 +178,6 @@ def replay_decision_logp_from_cpp_batch_trace(
         / objective_energy_scale[0]
         + chosen_objective_residual
     ) + (field_multiplier[selected] * chosen_field).sum(dim=-1)
-    chosen_energy = (
-        chosen_energy
-        + float(risk_penalty) * feasibility_risk[chosen_edge]
-    )
     step_logp = (
         -float(beta) * chosen_energy
         - torch.logsumexp(logits[selected], dim=1)
@@ -239,12 +230,10 @@ def _guidance_numpy(
             else torch.zeros_like(output["objective_residual"])
         ).detach().cpu().numpy(),
         "edge_field": output["residual"].detach().cpu().numpy(),
-        "edge_additive": output["additive"].detach().cpu().numpy(),
         "multipliers": multipliers.detach().cpu().numpy(),
         "coupler_weights": output["coupler_weights"][0].detach().cpu().numpy(),
         "coupler_bias": output["coupler_bias"][0].detach().cpu().numpy(),
-        "edge_risk": output["feasibility_risk"].detach().cpu().numpy(),
-        "risk_penalty": float(risk_penalty),
+        "risk_penalty": 0.0,
     }
 
 
@@ -277,16 +266,12 @@ def _neutral_guidance(decoder) -> dict:
         "edge_field": np.zeros(
             (decoder.metadata["edge_count"], channels), dtype=np.float32
         ),
-        "edge_additive": np.zeros(
-            (decoder.metadata["edge_count"], channels), dtype=np.float32
-        ),
         "multipliers": multiplier_values,
         "coupler_weights": np.zeros(
             (multipliers, channels),
             dtype=np.float32,
         ),
         "coupler_bias": np.zeros(multipliers, dtype=np.float32),
-        "edge_risk": np.zeros(decoder.metadata["edge_count"], dtype=np.float32),
         "risk_penalty": 0.0,
     }
 
@@ -827,178 +812,6 @@ def _decision_rollout_index(trace: dict, device: torch.device) -> torch.Tensor:
     )
 
 
-def _positive_class_weight(target: torch.Tensor) -> torch.Tensor:
-    positive = (target > 0.5).sum().float()
-    negative = target.numel() - positive
-    if positive == 0 or negative == 0:
-        return target.new_ones(())
-    return negative / positive
-
-
-def _rollout_class_weights(
-    steps: list[OptionStep],
-) -> dict[str, torch.Tensor]:
-    """Estimate rare-event weights over the full mixed-variant PPO batch."""
-    device = steps[0].binding_target.device
-    binding_targets = []
-    feasibility_targets = []
-    for step in steps:
-        active = step.graph.active_channels.to(device).reshape(-1).bool()
-        binding = (step.binding_target.to(device) >= 0.95).float()
-        binding_targets.append(binding[active])
-        feasibility = torch.as_tensor(
-            step.trace["feasibility_risk_labels"], device=device
-        ).float()
-        if feasibility.numel():
-            feasibility_targets.append(feasibility)
-
-    one = torch.ones((), device=device)
-    binding_weight = (
-        _positive_class_weight(torch.cat(binding_targets))
-        if binding_targets and any(target.numel() for target in binding_targets)
-        else one
-    )
-    feasibility_weight = (
-        _positive_class_weight(torch.cat(feasibility_targets))
-        if feasibility_targets
-        else one
-    )
-    return {
-        "binding": binding_weight.clamp_max(100.0).detach(),
-        "feasibility": feasibility_weight.clamp_max(100.0).detach(),
-    }
-
-
-def _balanced_regression_loss(
-    prediction: torch.Tensor, target: torch.Tensor
-) -> torch.Tensor:
-    elementwise = F.smooth_l1_loss(prediction, target, reduction="none")
-    positive = target > 1e-6
-    positive_count = positive.sum().float()
-    negative_count = target.numel() - positive_count
-    if positive_count == 0 or negative_count == 0:
-        return elementwise.mean()
-    weights = torch.where(
-        positive, negative_count / positive_count, target.new_ones(())
-    )
-    return (elementwise * weights).sum() / weights.sum().clamp_min(1.0)
-
-
-def _dual_loss(step: OptionStep, output: dict) -> torch.Tensor:
-    device = output["residual"].device
-    screened_edges = torch.as_tensor(
-        step.trace.get("screened_edges", []), device=device
-    ).long()
-    if screened_edges.numel():
-        target = torch.as_tensor(
-            step.trace["screened_resource_delta"], device=device
-        ).float()
-        prediction = (
-            output["residual"][screened_edges]
-            + output["additive"][screened_edges]
-        )
-        active = output["active_channels"][0].bool().expand_as(prediction)
-        if active.any():
-            return _balanced_regression_loss(
-                prediction[active], target[active]
-            )
-        return prediction.sum() * 0.0
-
-    # Construction-only instances have no SRR labels on their first option.
-    # Retain the rollout outcome as a lower-resolution supervision fallback.
-    current = torch.as_tensor(step.trace["current_nodes"], device=device).long()
-    chosen = torch.as_tensor(step.trace["chosen_indices"], device=device).long()
-    stochastic = torch.as_tensor(step.trace["stochastic"], device=device).bool()
-    if current.numel() == 0 or not stochastic.any():
-        return output["residual"].sum() * 0.0
-    rollout_index = _decision_rollout_index(step.trace, device)
-    edge = step.graph.edge_offsets.to(device)[current] + chosen
-    prediction = output["residual"][edge] + output["additive"][edge]
-    if step.resource_delta is None:
-        raise RuntimeError("missing fallback resource-delta labels")
-    target = step.resource_delta.to(device)[rollout_index]
-    active = output["active_channels"][0].bool().expand_as(prediction)
-    selected = stochastic.unsqueeze(1) & active
-    if not selected.any():
-        return prediction.sum() * 0.0
-    return _balanced_regression_loss(
-        prediction[selected], target[selected]
-    )
-
-
-def _feasibility_loss(
-    step: OptionStep,
-    output: dict,
-    pos_weight: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    device = output["feasibility_logits"].device
-    labels = torch.as_tensor(
-        step.trace["feasibility_risk_labels"], device=device
-    ).float()
-    edges = torch.as_tensor(
-        step.trace["feasibility_edges"], device=device
-    ).long()
-    if labels.numel() == 0:
-        return output["feasibility_logits"].sum() * 0.0
-    if labels.shape != edges.shape:
-        raise RuntimeError("feasibility labels are not aligned with edges")
-    target = labels
-    logits = output["feasibility_logits"][edges]
-    if pos_weight is None:
-        pos_weight = _positive_class_weight(target)
-    return F.binary_cross_entropy_with_logits(
-        logits, target, pos_weight=pos_weight.to(device)
-    )
-
-
-def _binding_loss(
-    step: OptionStep,
-    output: dict,
-    pos_weight: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    active = output["active_channels"][0].bool()
-    if not active.any():
-        return output["binding_logits"].sum() * 0.0
-    target = step.binding_target.to(output["binding_logits"].device)
-    target = (target >= 0.95).float()
-    if pos_weight is None:
-        pos_weight = _positive_class_weight(target[active])
-    return F.binary_cross_entropy_with_logits(
-        output["binding_logits"][0, active],
-        target[active],
-        pos_weight=pos_weight.to(target.device),
-    )
-
-
-def _price_loss(
-    model: ConstraintFieldNet, step: OptionStep, output: dict
-) -> torch.Tensor:
-    channels = output["active_channels"].shape[-1]
-    active = output["active_channels"][0].bool()
-    if not active.any():
-        return output["multipliers"].sum() * 0.0
-    # The objective weight slot (index FIELD_CHANNEL_COUNT) is not a resource
-    # intensity, so the binding supervision only applies to the field channels.
-    field_multipliers = output["multipliers"][0, :channels]
-    binding = step.binding_target.to(output["multipliers"].device)
-    base_loss = F.smooth_l1_loss(
-        field_multipliers[active], binding[active]
-    )
-    live_state = torch.as_tensor(
-        step.trace["live_state"],
-        dtype=torch.float32,
-        device=output["multipliers"].device,
-    )
-    if live_state.numel() == 0:
-        return base_loss
-    dynamic_target = torch.maximum(live_state, binding.unsqueeze(0))
-    coupled = model.couple(output, live_state)[:, :channels]
-    dynamic_active = active.unsqueeze(0).expand_as(coupled)
-    return base_loss + F.smooth_l1_loss(
-        coupled[dynamic_active], dynamic_target[dynamic_active]
-    )
-
-
 def _detached_output(
     output: dict,
 ) -> tuple[dict, list[tuple[torch.Tensor, torch.Tensor]]]:
@@ -1007,8 +820,6 @@ def _detached_output(
     for key in (
         "objective_residual",
         "residual",
-        "additive",
-        "feasibility_logits",
         "multipliers",
         "binding_logits",
         "coupler_weights",
@@ -1021,6 +832,47 @@ def _detached_output(
             detached[key] = proxy
             links.append((value, proxy))
     return detached, links
+
+
+def _slack_loss(step: OptionStep, output: dict) -> torch.Tensor:
+    """Shape the encoder to represent the executed admissibility margin.
+
+    The decoder publishes, for every candidate edge and every active row, the
+    signed margin by which taking that edge would clear (or breach) the row's
+    declared bound -- `incumbent_transition_features[..., SIGNED_MARGIN]`. It is
+    the declaration's own arithmetic, normalized by the row's declared scale, so
+    nothing about it is a feature choice: it is what the interpreter already
+    computed to decide legality.
+
+    Regressing the per-resource field onto it makes the representation carry
+    feasibility, which is exactly what the probes then measure. A constant
+    offset over a source row cancels in the decoder's comparison of candidates,
+    so both sides are row-centered first and only the policy-relevant
+    differences are penalized.
+    """
+    margin = step.graph.resource_transition_features[..., 1]
+    mask = step.graph.resource_transition_mask
+    field = output["residual"]
+    if margin.shape != field.shape or not margin.numel():
+        return field.sum() * 0.0
+    offsets = step.graph.edge_offsets.to(field.device)
+    counts = offsets[1:] - offsets[:-1]
+    source = torch.repeat_interleave(
+        torch.arange(counts.numel(), device=field.device), counts
+    )
+
+    def centered(values: torch.Tensor) -> torch.Tensor:
+        sums = values.new_zeros((counts.numel(),) + values.shape[1:])
+        sums = sums.index_add(0, source, values)
+        means = sums / counts.to(values.dtype).clamp_min(1.0).reshape(
+            -1, *([1] * (values.dim() - 1))
+        )
+        return values - means[source]
+
+    active = mask.to(field.dtype)
+    error = (centered(field) - centered(margin.to(field.dtype))) * active
+    denominator = active.sum().clamp_min(1.0)
+    return error.square().sum() / denominator
 
 
 def _objective_residual_loss(step: OptionStep, output: dict) -> torch.Tensor:
@@ -1059,7 +911,6 @@ def _step_loss(
     args: argparse.Namespace,
     rl_weight: float,
     auxiliary_scale: float,
-    class_weights: Optional[dict[str, torch.Tensor]] = None,
     adv_scale: Optional[torch.Tensor] = None,
     temporal_adv_scale: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, dict[str, float | torch.Tensor]]:
@@ -1212,32 +1063,28 @@ def _step_loss(
         critic_loss = F.smooth_l1_loss(value_prediction, value_target)
         critic_sample = 1.0
 
-    dual = _dual_loss(step, output)
-    feasibility = _feasibility_loss(
-        step,
-        output,
-        None if class_weights is None else class_weights["feasibility"],
-    )
-    binding = _binding_loss(
-        step,
-        output,
-        None if class_weights is None else class_weights["binding"],
-    )
-    price = _price_loss(model, step, output)
-    objective_residual_loss = _objective_residual_loss(step, output)
-    auxiliary = (
-        args.dual_weight * dual
-        + args.feasibility_weight * feasibility
-        + args.binding_weight * binding
-        + args.price_weight * price
-    )
+    # v14 objective: ordinary policy gradient plus one auxiliary.
+    #
+    # The four auxiliary terms it replaces supervised quantities the decoder
+    # already computes exactly -- `_dual_loss` regressed the learned field onto
+    # `screened_resource_delta`, `_price_loss` (disabled by default, because
+    # pinning prices to a feasibility indicator distorted ranking) and
+    # `_binding_loss` onto the binding fraction -- or supervised a head whose
+    # output could not reach a decision (`_feasibility_loss`; see the note on
+    # the deleted head in net.py). `slack` keeps the one thing they were
+    # collectively buying: it shapes the encoder to represent the executed
+    # admissibility margin, which is also what the feasibility probes read, so
+    # supervision and evaluation finally concern the same quantity.
+    #
+    # The critic is gone because it was never on: --value-loss-weight defaulted
+    # to 0 and the advantage is a batch-mean baseline, not a value estimate.
+    slack = _slack_loss(step, output)
     loss = (
         rl_weight * rl_loss
-        + auxiliary_scale * auxiliary
-        + float(getattr(args, "objective_residual_l2", 0.1)) * objective_residual_loss
-        + float(getattr(args, "value_loss_weight", 0.0)) * critic_loss
+        + auxiliary_scale * args.slack_weight * slack
         - args.entropy_weight * entropy
     )
+    objective_residual_loss = _objective_residual_loss(step, output)
     with torch.no_grad():
         risk_labels = torch.as_tensor(
             step.trace["feasibility_risk_labels"], device=logp.device
@@ -1263,12 +1110,9 @@ def _step_loss(
             "critic_sample": critic_sample,
             "value_prediction": value_prediction.detach(),
             "value_target": value_target.detach(),
-            "dual_loss": dual.detach(),
-            "feasibility_loss": feasibility.detach(),
-            "binding_loss": binding.detach(),
-            "price_loss": price.detach(),
+            "slack_loss": slack.detach(),
             "objective_residual_loss": objective_residual_loss.detach(),
-            "auxiliary_loss": auxiliary.detach(),
+            "auxiliary_loss": slack.detach(),
             "auxiliary_scale": float(auxiliary_scale),
             "feasibility_labels": float(risk_labels.numel()),
             "feasibility_positive_rate": (
@@ -1310,7 +1154,6 @@ def ppo_update(
     auxiliary_scale = (
         args.pretrain_aux_scale if pretraining else args.aux_rl_scale
     )
-    class_weights = _rollout_class_weights(steps)
     # Batch-pooled advantage scale: centre each option, pool the residuals over
     # the whole mixed-variant PPO batch, and normalise by that single std. This
     # keeps degenerate low-variance options from being amplified to unit scale
@@ -1364,7 +1207,6 @@ def ppo_update(
                         args,
                         rl_weight,
                         auxiliary_scale,
-                        class_weights,
                         adv_scale,
                         temporal_adv_scale,
                     )
@@ -1404,7 +1246,6 @@ def ppo_update(
                         args,
                         rl_weight,
                         auxiliary_scale,
-                        class_weights,
                         adv_scale,
                         temporal_adv_scale,
                     )
@@ -1449,8 +1290,6 @@ def ppo_update(
         ppo_optimizer_seconds=timing["optimizer"],
         ppo_reuse_passes=float(args.ppo_epochs),
         ppo_clipping_active=float(args.ppo_epochs > 1),
-        binding_pos_weight=float(class_weights["binding"]),
-        feasibility_pos_weight=float(class_weights["feasibility"]),
         gradient_norm=float(np.mean(gradient_norms)),
         advantage_scale=float(adv_scale) if adv_scale is not None else 0.0,
         temporal_advantage_scale=(
@@ -2482,6 +2321,18 @@ def parse_args() -> argparse.Namespace:
         "future). Auxiliary-loss scale after PPO fine-tuning starts; default 0 "
         "carries no auxiliary-head loss into RL",
     )
+    parser.add_argument(
+        "--slack-weight",
+        type=float,
+        default=1.0,
+        help=(
+            "Weight of the only auxiliary term: regress the per-resource field"
+            " onto the executed signed admissibility margin, row-centered so"
+            " only policy-relevant differences are penalized. Set 0 to train"
+            " with plain PPO and measure how much feasibility structure the"
+            " decision objective induces on its own."
+        ),
+    )
     parser.add_argument("--dual-weight", type=float, default=1.0)
     parser.add_argument("--feasibility-weight", type=float, default=1.0)
     parser.add_argument("--binding-weight", type=float, default=1.0)
@@ -2585,8 +2436,10 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--program-blind-resources",
-        action="store_true",
+        "--descriptor-resources",
+        dest="program_blind_resources",
+        action="store_false",
+        default=None,
         help=(
             "Parsimony ablation, one rung below --index-embedded-resources:"
             " give every resource the SAME constant type vector, so neither the"

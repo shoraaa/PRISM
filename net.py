@@ -82,7 +82,7 @@ OBJECTIVE_COEFF_DIM = 8
 # coefficient-conditioning layer is not gradient-starved (a zero-init output
 # layer sends zero gradient to the layer below it).
 OBJECTIVE_RESIDUAL_HEAD_INIT_STD = 0.1
-MODEL_SCHEMA = "typed_resource_v13_pooled_terms"
+MODEL_SCHEMA = "slack_energy_v14"
 
 
 def _squash_magnitude(value: float) -> float:
@@ -453,13 +453,12 @@ def decode_iteration(
     solution = decoder.solve(
         1,
         edge_field=edge_field,
-        edge_additive=output["additive"].detach().cpu().numpy(),
+
         multipliers=multipliers,
         coupler_weights=output["coupler_weights"][0].detach().cpu().numpy(),
         coupler_bias=output["coupler_bias"][0].detach().cpu().numpy(),
         objective_residual=output["objective_residual"].detach().cpu().numpy(),
-        edge_risk=output["feasibility_risk"].detach().cpu().numpy(),
-        risk_penalty=float(risk_penalty),
+        risk_penalty=0.0,
     )
     return solution, output
 
@@ -946,7 +945,13 @@ class ConstraintFieldNet(nn.Module):
         couple_state_multipliers=True,
         index_embedded_resources=False,
         monolithic_resource_field=False,
-        program_blind_resources=False,
+        # v14 default. The 14-row/20-term property maps are the most
+        # hand-designed object in the system, and the executed quantities the
+        # model reads -- the signed admissibility margin per candidate edge,
+        # the live state, the per-node attributes -- already distinguish every
+        # row in the benchmark. Descriptor conditioning stays available as the
+        # ablation rung above this one.
+        program_blind_resources=None,
         normalize_projections=True,
         pool_node_resources=True,
     ):
@@ -1005,8 +1010,16 @@ class ConstraintFieldNet(nn.Module):
         # forward result differs, so test.py must read the flag rather than
         # assume it.
         self.normalize_projections = normalize_projections
+        # None means "take the v14 default", which is blind unless a higher rung
+        # of the same ladder was asked for. Only an EXPLICIT True alongside
+        # another rung is ambiguous, and that is what still raises.
+        explicit_blind = program_blind_resources is True
+        if program_blind_resources is None:
+            program_blind_resources = not (
+                index_embedded_resources or monolithic_resource_field
+            )
         self.program_blind_resources = program_blind_resources
-        if program_blind_resources and (
+        if explicit_blind and (
             index_embedded_resources or monolithic_resource_field
         ):
             raise ValueError(
@@ -1121,9 +1134,14 @@ class ConstraintFieldNet(nn.Module):
         )
         self.token_projection = nn.Linear(units, units)
         self.graph_projection = nn.Linear(units, units)
+        # v14: one head per resource channel. `additive_head` was a second
+        # linear map of the SAME interaction vector whose output the decoder
+        # simply added to this one, so the pair was one head with extra steps.
+        # `feasibility_head` is gone with it: its output was constant within a
+        # graph (measured std 1e-15), and a constant added to every candidate at
+        # a node cancels in the comparison that picks one, so it could not
+        # change a decision whatever its loss did.
         self.field_head = nn.Linear(units, 1)
-        self.additive_head = nn.Linear(units, 1)
-        self.feasibility_head = nn.Linear(units, 1)
         self.multiplier_head = nn.Linear(units, 1)
         self.binding_head = nn.Linear(units, 1)
         self.coupler_query_head = nn.Linear(units, units)
@@ -1163,8 +1181,6 @@ class ConstraintFieldNet(nn.Module):
         )
         nn.init.zeros_(self.field_head.weight)
         nn.init.zeros_(self.field_head.bias)
-        nn.init.zeros_(self.additive_head.weight)
-        nn.init.zeros_(self.additive_head.bias)
         # Small non-zero init on the final layer so the hidden (coefficient-
         # conditioning) layer receives gradient from step 0. Bias stays zero so a
         # row-constant output remains neutral after row-centering; the residual
@@ -1179,13 +1195,6 @@ class ConstraintFieldNet(nn.Module):
             std=OBJECTIVE_RESIDUAL_HEAD_INIT_STD,
         )
         nn.init.zeros_(final_residual_layer.bias)
-        nn.init.zeros_(self.feasibility_head.weight)
-        # A fresh model must reproduce the plain-objective (E = c(e)) neutral
-        # search -- the initial policy from which the field is learned, not the
-        # flat fields-off baseline. sigmoid(-20) is below ranking tolerance even
-        # after a full route is aggregated, while BCE-with-logits still gives
-        # positive risk labels a gradient near -1.
-        nn.init.constant_(self.feasibility_head.bias, -20.0)
         nn.init.zeros_(self.coupler_query_head.weight)
         nn.init.zeros_(self.coupler_query_head.bias)
         nn.init.zeros_(self.coupler_bias_head.weight)
@@ -1221,10 +1230,7 @@ class ConstraintFieldNet(nn.Module):
         interaction = torch.tanh(
             edge_projection + token + resource_edge
         )
-        return (
-            self.field_head(interaction).squeeze(-1),
-            self.additive_head(interaction).squeeze(-1),
-        )
+        return self.field_head(interaction).squeeze(-1)
 
     def _resource_type_rows(self, pyg, resource_count):
         """Pool each resource's executable term set into [G, R, D]."""
@@ -1615,7 +1621,6 @@ class ConstraintFieldNet(nn.Module):
                 / edge_denominator[..., None]
             ).expand_as(resource_context_edges)
         raw_channels = []
-        additive_channels = []
         for channel in range(resource_count):
             token = (
                 projected_tokens[:, channel]
@@ -1637,7 +1642,7 @@ class ConstraintFieldNet(nn.Module):
                 and self.training
                 and torch.is_grad_enabled()
             ):
-                raw, additive_channel = torch.utils.checkpoint.checkpoint(
+                raw = torch.utils.checkpoint.checkpoint(
                     self._field_channel,
                     projected_edges,
                     token,
@@ -1646,11 +1651,10 @@ class ConstraintFieldNet(nn.Module):
                     use_reentrant=False,
                 )
             else:
-                raw, additive_channel = self._field_channel(
+                raw = self._field_channel(
                     projected_edges, token, resource_edge, edge_batch
                 )
             raw_channels.append(raw)
-            additive_channels.append(additive_channel)
         # An empty registry stacks to [edges, 0] rather than failing: a problem
         # with no resource rows has no resource energy, which the decoder
         # already accepts as an [edges, 0] field.
@@ -1664,18 +1668,7 @@ class ConstraintFieldNet(nn.Module):
         # it into energy. Signed terms let PPO reward useful capacity/route-limit
         # edges as well as penalize harmful ones; exact native feasibility
         # remains authoritative.
-        residual = torch.tanh(raw_residual)
-        additive = torch.tanh(
-            torch.stack(additive_channels, dim=1)
-            if additive_channels
-            else projected_edges.new_zeros(edge_count, 0)
-        )
-        feasibility_logits = self.feasibility_head(
-            torch.tanh(projected_edges)
-        ).squeeze(-1)
-        feasibility_risk = torch.sigmoid(feasibility_logits)
-        residual = residual * edge_active
-        additive = additive * edge_active
+        residual = torch.tanh(raw_residual) * edge_active
 
         projected_graph = self.graph_projection(graph_embedding)
         if self.normalize_projections:
@@ -1739,9 +1732,7 @@ class ConstraintFieldNet(nn.Module):
         return {
             "objective_residual": objective_residual,
             "residual": residual,
-            "additive": additive,
-            "feasibility_logits": feasibility_logits,
-            "feasibility_risk": feasibility_risk,
+
             "multipliers": multipliers,
             "binding_logits": binding_logits,
             "raw_residual": raw_residual,

@@ -12,6 +12,7 @@ sys.path.insert(0, str(ROOT / "src"))
 import prism_decoder  # noqa: E402
 from problem_data import problem_schema  # noqa: E402
 from net import (  # noqa: E402
+    MODEL_SCHEMA,
     EDGE_FEATURE_COUNT,
     FIELD_CHANNEL_COUNT,
     EDGE_RESOURCE_FEATURE_COUNT,
@@ -109,20 +110,15 @@ def test_constraint_field_net_uses_normalized_decoder_contract() -> None:
         decoder.metadata["multiplier_count"],
     )
     assert output["binding_logits"].shape == (1, channel_count)
-    assert output["feasibility_logits"].shape == (edge_count,)
-    assert output["feasibility_risk"].shape == (edge_count,)
     assert output["value_context"].shape == (1, 16)
     assert model.value(output, 0.5).shape == (1,)
     assert torch.equal(model.value(output, 0.5), torch.zeros(1))
-    assert torch.all(
-        (output["feasibility_risk"] >= 0.0)
-        & (output["feasibility_risk"] <= 1.0)
-    )
+    assert "feasibility_risk" not in output
+    assert "additive" not in output
     # Resource fields are signed and exactly zero-neutral at initialization.
     # Inactive channels remain masked to zero after learning.
     active = torch.as_tensor(decoder.metadata["field_channel_mask"]).bool()
     assert torch.equal(output["residual"], torch.zeros_like(output["residual"]))
-    assert torch.equal(output["additive"], torch.zeros_like(output["additive"]))
     assert torch.all(output["residual"][:, ~active] == 0.0)
     assert torch.all(output["multipliers"] >= 0.0)
     # The objective weight slot is a fixed unit anchor; field channels learn
@@ -137,9 +133,12 @@ def test_constraint_field_net_uses_normalized_decoder_contract() -> None:
     assert output["coupler_bias"][0, -1] == 0.0
     live_state = torch.rand(5, channel_count)
     assert torch.equal(model.couple(output, live_state)[:, -1], torch.ones(5))
-    assert _guidance_numpy(output, data, risk_penalty=10.0)[
-        "risk_penalty"
-    ] == 10.0
+    # v14 deleted the risk channel: its head produced a value that was constant
+    # within a graph, and a constant added to every candidate at a node cancels
+    # in the comparison that picks one, so it could never change a decision.
+    guidance = _guidance_numpy(output, data)
+    assert guidance["risk_penalty"] == 0.0
+    assert "edge_risk" not in guidance and "edge_additive" not in guidance
 
 
 def _pooling_fixture(seed: int = 907, name: str = "cvrptw"):
@@ -457,7 +456,7 @@ def test_prepooling_checkpoint_is_rejected_by_the_program_schema() -> None:
     assert narrow.emb_net.v_lin0.weight.shape[1] == NODE_FEATURE_COUNT
 
     pooled = ConstraintFieldNet(depth=1, units=8)
-    with pytest.raises(RuntimeError, match="typed_resource_v13_pooled_terms"):
+    with pytest.raises(RuntimeError, match=MODEL_SCHEMA):
         load_constraint_field_state_dict(pooled, state)
 
 
@@ -470,11 +469,11 @@ def test_program_checkpoint_loader_is_strict() -> None:
     }
     restored = ConstraintFieldNet(depth=1, units=8)
 
-    with pytest.raises(RuntimeError, match="typed_resource_v13_pooled_terms"):
+    with pytest.raises(RuntimeError, match=MODEL_SCHEMA):
         load_constraint_field_state_dict(restored, incomplete_v2)
     v1 = dict(original.state_dict())
     v1["resource_types"] = torch.eye(prism_decoder.FIELD_CHANNEL_COUNT)
-    with pytest.raises(RuntimeError, match="typed_resource_v13_pooled_terms"):
+    with pytest.raises(RuntimeError, match=MODEL_SCHEMA):
         load_constraint_field_state_dict(restored, v1)
     assert load_constraint_field_state_dict(restored, original.state_dict()) is None
 
@@ -483,7 +482,7 @@ def test_program_checkpoint_loader_is_strict() -> None:
         for key, value in original.state_dict().items()
         if not key.startswith("objective_energy_residual_head.")
     }
-    with pytest.raises(RuntimeError, match="typed_resource_v13_pooled_terms"):
+    with pytest.raises(RuntimeError, match=MODEL_SCHEMA):
         load_constraint_field_state_dict(restored, pre_residual)
 
 
@@ -596,11 +595,9 @@ def test_typed_field_accepts_unseen_runtime_resource_without_new_weights() -> No
         output = model(graph)
     traced = battery.sample_traced(
         edge_field=output["residual"].numpy(),
-        edge_additive=output["additive"].numpy(),
         multipliers=output["multipliers"][0].numpy(),
         coupler_weights=output["coupler_weights"][0].numpy(),
         coupler_bias=output["coupler_bias"][0].numpy(),
-        edge_risk=output["feasibility_risk"].numpy(),
     )
     assert all(solution["feasible"] for solution in traced["solutions"])
     assert traced["trace"]["live_state"].shape[1] == resource_count
@@ -615,7 +612,7 @@ def activate_field_heads(model: ConstraintFieldNet, seed: int) -> None:
     """
     generator = torch.Generator().manual_seed(seed)
     with torch.no_grad():
-        for head in (model.field_head, model.additive_head):
+        for head in (model.field_head,):
             head.weight.normal_(std=0.5, generator=generator)
             head.bias.normal_(std=0.5, generator=generator)
 
@@ -653,7 +650,11 @@ def test_index_embedded_resources_replaces_descriptor_semantics() -> None:
         graph.resource_row_properties, altered.resource_row_properties
     )
 
-    typed = ConstraintFieldNet(depth=1, units=8).eval()
+    # v14 makes program-blind the default, so the descriptor-conditioned model
+    # this ablation is measured against has to ask for the rung above it.
+    typed = ConstraintFieldNet(
+        depth=1, units=8, program_blind_resources=False
+    ).eval()
     activate_field_heads(typed, 4401)
     ablated = ConstraintFieldNet(
         depth=1, units=8, index_embedded_resources=True
@@ -1015,13 +1016,10 @@ def test_cpp_trace_replays_exact_state_dependent_policy() -> None:
     assert output["objective_residual"].std() > 0.0
     traced = decoder.sample_traced(
         edge_field=output["residual"].detach().numpy(),
-        edge_additive=output["additive"].detach().numpy(),
         multipliers=output["multipliers"][0].detach().numpy(),
         coupler_weights=output["coupler_weights"][0].detach().numpy(),
         coupler_bias=output["coupler_bias"][0].detach().numpy(),
         objective_residual=output["objective_residual"].detach().numpy(),
-        edge_risk=output["feasibility_risk"].detach().numpy(),
-        risk_penalty=3.0,
     )
     trace = traced["trace"]
     replayed, decisions = replay_logp_from_cpp_batch_trace(
@@ -1090,12 +1088,10 @@ def test_tsp_edge_logit_receives_objective_policy_gradient() -> None:
     output = model(graph)
     traced = decoder.sample_traced(
         edge_field=output["residual"].detach().numpy(),
-        edge_additive=output["additive"].detach().numpy(),
         multipliers=output["multipliers"][0].detach().numpy(),
         coupler_weights=output["coupler_weights"][0].detach().numpy(),
         coupler_bias=output["coupler_bias"][0].detach().numpy(),
         objective_residual=output["objective_residual"].detach().numpy(),
-        edge_risk=output["feasibility_risk"].detach().numpy(),
     )
     replayed, _ = replay_logp_from_cpp_batch_trace(
         traced["trace"], graph, output, model, beta=2.0
@@ -1139,9 +1135,12 @@ def test_default_depth_tsp_edge_logit_does_not_saturate_constant() -> None:
         torch.zeros_like(output["coupler_weights"][0, -1]),
     )
     assert output["coupler_bias"][0, -1] == 0.0
-    assert _guidance_numpy(output, graph, risk_penalty=10.0)[
-        "risk_penalty"
-    ] == 10.0
+    # v14 deleted the risk channel: its head produced a value that was constant
+    # within a graph, and a constant added to every candidate at a node cancels
+    # in the comparison that picks one, so it could never change a decision.
+    assert _guidance_numpy(output, graph)["risk_penalty"] == 0.0
+    assert "edge_risk" not in _guidance_numpy(output, graph)
+    assert "edge_additive" not in _guidance_numpy(output, graph)
 
 
 def test_objective_view_does_not_change_legacy_dynamic_batch_norm() -> None:
