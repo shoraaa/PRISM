@@ -104,23 +104,201 @@ problem["resources"] = [{
     "scope": "route",
     "initial": {"scalar": "battery_capacity"},
     "scale": {"scalar": "battery_capacity"},
-    "increment": {"edge_attribute": "distance", "coefficient": -1.0},
-    "reset": {
-        "node_attribute": "charger",
-        "value": {"scalar": "battery_capacity"},
-    },
-    "bounds": [{"lower": 0.0, "check": "transition"}],
+    "terms": [
+        {"edge_attribute": "distance", "coefficient": -1.0,
+         "op": "add", "phase": "before_bound"},
+        {"value": {"scalar": "battery_capacity"},
+         "op": "assign", "phase": "after_bound",
+         "when": "reset_arrival", "at_depot": True,
+         "at_nodes": {"node_attribute": "charger"}},
+    ],
+    "bounds": [{
+        "lower": 0.0,
+        "check": "transition",
+        "horizon": "return_construction",
+    }],
 }]
 ```
 
+A bound also declares its **horizon** -- how far ahead it is projected before it
+is tested. `transition` tests the arrival state only. `return` additionally
+projects the cheapest depot return leg and is enforced as a feasibility
+condition; it is sound whenever the row cannot be replenished mid-route, and it
+is what route and tour limits require. `return_construction` applies the same
+projection during construction only, as a stranding guard for rows that *can*
+be replenished at an interior node (a charger, a rest stop), where a closed
+route may legitimately reach the depot through a reset and so must not be
+rejected. Before this was declarable, the projection lived inside the compiled
+route- and tour-limit kernels and inside a signature test over spec fields; it
+is now a property of the row like any other.
+
 The binding resolves named arrays once, and native `extend + bound` replay then
 drives construction masks, incumbent validation, resource labels, pressure
-features, and live state. Each row also produces a 32-dimensional descriptor
-from algebraic properties (operator family, bound type, check phase, direction,
-scope, reset form, input coupling, scale, and tightness); names and registry
-positions are excluded. Resource tensors grow with the registry, while field
-channels retain their model indices so the distance-only control path retains
-exact behavior.
+features, and live state. Each row also produces a 20-property row vector and a
+variable-size set of 24-property term vectors. The properties describe behavior
+(source locality, read point, algebraic operation, phase, trigger, gate,
+coefficient, bound, scope, and horizon), not enum identities. Shared term
+weights pool each set to a fixed-width resource type, so adding an operation
+does not add an input dimension. Names and registry positions are excluded.
+
+### Compiled kernels are fast paths, not a private semantics
+
+A compiled constraint kernel is an execution specialization, not a second way of
+defining what a constraint means. Every kernel publishes the declarative
+resource row it implements through `Decoder.resource_declarations`, and that row
+-- never a switch over the kernel enum -- is what the row/term properties are
+derived from. `tests/python/test_resource_algebra_equivalence.py` rebuilds
+each declarable constraint from its published row alone, with the compiled
+kernel dropped from the schema, and requires the identical solution. Capacity,
+route limit, tour limit, and prize quota pass that test, so for those the
+network cannot tell a compiled kernel from a declared row, and the generality
+claim rests on the algebra rather than on the kernel table.
+
+Every compiled kernel is expressible. Two abstain (`declared: false`) on
+instances that leave the domain their declaration covers, and the equivalence
+test encodes that rule rather than a fixed list, so a new abstention has to be
+justified there before the suite passes:
+
+| kernel | abstains | why the language cannot express it |
+| --- | --- | --- |
+| `capacity` | a class order supplied only as another declared row | publication cannot infer that row's opening-load convention from the problem flags |
+| `time_windows` | a row with optional resets is active | a break costs wall time, so one row's reset must increment another row's state |
+
+Signed demand, including guarded depot opening/reload behavior, is now fully
+factored into terms. The remaining wall-time case is genuinely cross-row. One
+deviation is known and narrow: the compiled prize-quota
+kernel also lets a route close once every customer has been visited, so an
+instance whose total prize cannot reach the quota stays feasible for the kernel
+while the declared bound rejects it.
+
+### The tropical operator
+
+The `max_plus` semiring expresses resources whose arrival value is raised to a
+per-node floor before it is bounded -- the classic time REF. Time windows are
+declared by composing `add` and `join` terms:
+
+```python
+{"name": "time", "operator": "affine_accumulator", "semiring": "max_plus",
+ "terms": [
+   {"edge_attribute": "distance", "op": "add", "phase": "before_bound"},
+   {"node_attribute": "tw_start", "op": "join", "phase": "before_bound"},
+   {"node_attribute": "service_time", "op": "add", "phase": "after_bound"}],
+ "bounds": [{"upper": {"node_attribute": "tw_end"},
+             "check": "transition", "horizon": "return"}]}
+```
+
+The `join` term is the tropical floor applied to the arrival value. The service
+term is charged *after* the bound, so it delays the next transition
+without being tested against the arriving node's own window. A bound side may now
+be a named node attribute instead of a scalar, which is what a window that varies
+node by node requires. Resource `direction` accepts only `forward`:
+`backward` and `bidirectional` name real REF directions and have property-space
+coordinates, but execution extends a route forward only, so declaring them is rejected
+rather than silently run under a forward extension.
+
+### The precedence family
+
+Backhaul ordering and pickup--delivery are not resource extension functions:
+nothing accumulates, and admissibility is a predicate over what the route has
+already served. They are declared through a third operator whose two relation
+forms cover both, and whose properties describe behavior rather than kernel
+names -- a declared precedence row is byte-identical in its properties to
+the compiled kernel it replaces:
+
+```python
+{"name": "delivery_order", "operator": "precedence", "relation": "pairwise",
+ "scope": "route", "predecessor": {"node_attribute": "required_before"}}
+
+{"name": "linehaul_first", "operator": "precedence", "relation": "class_order",
+ "scope": "route", "class": {"node_attribute": "haul_class"}}
+```
+
+`pairwise` requires each node's declared predecessor to be served first;
+`class_order` requires classes to be served in non-decreasing order. The inverse
+of `predecessor` is derived, never declared twice, and a node may take part in
+one pairwise relation only -- generic operators move a pair together and assume
+a single partner.
+
+`scope` is executed rather than decorative: a `route`-scoped relation must be
+resolved before the route closes, which is what confines a pair to one route,
+while a `solution`-scoped one only requires the predecessor to come first
+somewhere and so may span routes. `tour` is rejected: it is indistinguishable
+from `solution` in execution, and accepting it would run solution semantics
+under another name. A row is also rejected if it declares a key its operator
+cannot act on -- `bounds` on a precedence row, `predecessor` on an accumulator --
+since a silently ignored key is how a declaration ends up meaning something
+other than it says.
+
+Neither kernel is the general case. Pickup--delivery is a depth-1 pair and
+backhaul a two-class order, so an arbitrary precedence chain `a -> b -> c` is a
+structurally new instantiation of the same declared relation, reachable with no
+new kernel, output head, or variant name;
+`test_a_precedence_chain_runs_although_no_kernel_expresses_one` exercises one.
+
+Generic operators consult `relational()` -- the consumer of
+`KERNEL_RELATIONAL`, which previously had none -- to decide whether a route may
+be cut between two linked nodes, and `relation_partner()` to move a pair
+together. Neither names a pickup or a delivery, so a declared relation
+constrains the move set exactly as the compiled kernel always has.
+
+The model inputs are generic too. Live state is **one vector indexed by
+resource**, in construction and in the model alike. `State` no longer carries
+private per-constraint scalars: `load`, `current_time`, `route_distance`,
+`collected_prize`, `open_pickups`, and the backhaul latch are accessors onto
+`resource_state`, each in the convention its published declaration states, and
+the registry always holds every field channel so each slot is a permanent home.
+A compiled kernel keeps its specialized arithmetic; what it no longer keeps is a
+second copy of the state. The live-state feature is read from the declaration
+rather than from a per-channel formula. The per-node flags are roles -- *opens an obligation* and
+*requires one* -- rather than *is a pickup* and *is a delivery*, and the prefix
+and suffix obligation counters come from the same `open_relation_delta` the piece
+cutter uses. A declared pairwise row therefore
+produces node features identical to the kernel it replaces, and a chain's middle
+node correctly holds both roles at once. A node may take part in one pairwise
+relation across the whole registry, compiled kernel included, because
+`relation_partner` returns a single partner.
+
+Per-node attributes are indexed by resource rather than named after a
+constraint. `node_resource_features` is `[N, resource_count, 5]` -- the node
+increment split by sign, the tropical clamp, the finite bound, and the departure
+term -- read off each row's published algebra. `net.py` gathers the arrival
+node's block onto each edge and feeds it through the same shared
+`resource_edge_projection` that already carried per-edge pressure and reset
+events, so the width grows with the number of resources and no weight is
+per-resource. Demand, window start and end, and service time therefore no longer
+have node-feature slots of their own: `NODE_FEATURE_COUNT` is 19, and what
+remains there is geometry, depot structure, objective coefficients, relation
+roles, and incumbent prefix/suffix state.
+
+This is the one place that reads `published_algebra` rather than
+`declared_algebra`, so an abstaining kernel still contributes its node
+attributes. That is sound because in all three abstention cases it is the
+*extension rule* that escapes the language -- a state-dependent reload, a
+cross-row duration, an exempt class -- never the per-node quantities. Signed
+demand covers 64 of 110 benchmark variants, so the alternative would have blanked
+demand across most of the suite.
+
+Two consequences follow from the operator rather than from a table. Search
+capabilities -- route or solution state, order sensitivity, reversal sensitivity,
+and the relational flag -- are derived from each row's algebra by
+`derived_capabilities`: a tropical clamp, an interior reset, or a mixed-sign
+increment each destroy order invariance.
+
+And resource pressure is computed from the published declaration for *every*
+kernel that has one, not from a per-channel formula. An accumulator's pressure
+includes the depot return leg when it declares a return horizon; a tropical row's
+is the wait-plus-warp quantity read off its clamp, bound, and departure fields; a
+precedence row's is the share of its relations an edge puts in the wrong order.
+The hand-written `analytic_resource_pressure` table now runs only for a kernel
+that abstains. `test_pressure_comes_from_the_declaration_not_the_kernel` pins all
+seven channels: without it a declared route-limit row reported half the pressure
+of the kernel it is otherwise equivalent to, because the generic formula ignored
+the declared horizon.
+
+All four resource replay paths -- the construction mask, the SRR trial validator,
+incumbent evaluation, and the resource report -- share a single
+`extend_declared`, so an operator primitive cannot be wired into one path and
+silently missed by the others.
 
 Native execution requires an explicit normalized schema. `constraints`,
 `objective`, `depot_count`, `multi_route`, and `open_route` must be declared;
@@ -181,12 +359,12 @@ installed; stagnation ends the current SMDP option without recomputing an
 identical graph, while the state coupler keeps responding to load, time, route
 progress, and other live variables at each stochastic choice.
 
-The token encoder consumes the native algebra descriptor rather than a
+The token encoder consumes pooled row/term property sets rather than a
 constraint-identity one-hot. Field, multiplier, quota, and token-to-token state
 coupler heads are shared across rows, so appending a resource adds no model
-parameter. This is a clean `typed_resource_v5_scale_equivariant_energy` checkpoint
-boundary: older checkpoints are rejected and must be retrained because the
-policy energy units and objective-residual units changed.
+parameter. This is a clean `typed_resource_v13_pooled_terms` checkpoint boundary:
+older checkpoints are rejected and must be retrained because the model input
+contract changed.
 
 ### Guaranteed-feasible action space
 
@@ -285,9 +463,53 @@ uv run pytest -q
 ```
 
 Problem schemas, generators, dataset discovery, and saved-file readers live in
-[`problem_data.py`](problem_data.py). Benchmark files can be placed under
-`baselines/URS/dataset`, relocated with `PRISM_DATASET_DIR`, or selected with
-`--dataset-dir`.
+[`problem_data.py`](problem_data.py). Benchmark files live under
+`datasets/benchmarks/<variant>/`, one directory per variant holding every scale
+generated or converted for it. Evaluation consumes the canonical neutral tensor
+dictionary named `<variant><scale>_prism.pt`; retained `.pkl`, `.txt`, and
+foreign-key `.pt` files are import provenance, not runtime dataset formats.
+Materialize or verify the canonical size-100 suite with:
+
+```bash
+uv run python scripts/normalize_benchmarks.py --scale 100
+```
+
+Persist a fresh full size-1000 suite (16 instances per variant, capacity 200,
+seed 1234) with:
+
+```bash
+uv run python scripts/generate_benchmark_suite.py --size 1000 --count 16 \
+  --capacity 200 --seed 1234 --force
+```
+
+Generation keeps the existing PRISM distributions unchanged. Each artifact has
+an adjacent JSON sidecar recording provenance, the absence of a paired oracle,
+and generator-certifiable infeasibility counts; the command prints those counts
+instead of filtering or rescaling samples.
+
+Evaluation CSV rows are synchronized after every completed in-process instance,
+so an interrupted run retains its latest measurement. Resume the same command
+and checkpoint by adding `--resume` while keeping the same `--csv` path:
+
+```bash
+uv run test.py --checkpoint checkpoint.pt --csv results/eval.csv ...
+uv run test.py --checkpoint checkpoint.pt --csv results/eval.csv --resume ...
+```
+
+Completed variant/method batches are skipped. An interrupted partial batch is
+rerun, but already persisted instance rows are not duplicated. `--cached`
+remains the separate facility for importing baseline rows from another CSV.
+
+For memory-bounded large-scale evaluation of constructive neural baselines,
+pass `--aug 1`. This shared override makes both URS and CCL evaluate one
+augmentation instead of their native test-time defaults, and is included in
+their CSV configuration and cache identity. Because augmentation changes the
+evaluation protocol, do not resume a CSV that was started without the same
+`--aug` value; start a new output CSV instead.
+
+Each variant directory may also hold per-instance oracle costs. The root can be relocated with
+`PRISM_DATASET_DIR` or selected per run with `--dataset-dir`, and the scale is
+chosen with `--dataset-scale`.
 
 The registry contains 110 benchmark compositions plus `vrptw`, a closed
 multi-route time-window problem without demand or capacity. Generate its fixed

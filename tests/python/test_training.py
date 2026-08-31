@@ -1,4 +1,3 @@
-import copy
 import random
 import sys
 from argparse import Namespace
@@ -24,10 +23,10 @@ from train import (
     _new_decoder,
     _dual_loss,
     _epoch_lr,
+    _epoch_seed,
     _objective_residual_loss,
     _random_guidance,
     _feasibility_loss,
-    _load_optimizer_state_compat,
     _positive_class_weight,
     _rollout_class_weights,
     _training_accumulation_size,
@@ -107,7 +106,47 @@ def test_setup_decoder_installs_a_neutral_greedy_incumbent() -> None:
     assert decoder.best_solution["feasible"]
     assert decoder.best_solution["route"].size > 0
     graph = build_decoder_data(decoder)
-    assert torch.count_nonzero(graph.x[:, 12]) > 0
+    assert torch.count_nonzero(graph.x[:, 5]) > 0
+
+
+def test_exact_resource_transition_features_train_the_shared_edge_encoder() -> None:
+    rng = np.random.default_rng(405)
+    coordinates = rng.random((18, 2), dtype=np.float32)
+    problem = problem_schema("cvrptw") | {
+        "name": "cvrptw",
+        "coordinates": coordinates,
+        "distance": np.linalg.norm(
+            coordinates[:, None] - coordinates[None, :], axis=-1
+        ).astype(np.float32),
+        "demand": np.r_[0.0, rng.uniform(0.01, 0.04, 17)].astype(np.float32),
+        "capacity": 0.5,
+        "tw_start": np.zeros(18, dtype=np.float32),
+        "tw_end": np.full(18, 10.0, dtype=np.float32),
+        "service_time": np.full(18, 0.01, dtype=np.float32),
+    }
+    decoder, _ = setup_decoder(problem, _args(), deterministic=True)
+    graph = build_decoder_data(decoder)
+    model = ConstraintFieldNet(depth=1, units=8)
+    assert graph.resource_transition_mask.any()
+    assert graph.resource_transition_features.shape[-1] == 2
+    resource_type = model._resource_type_rows(
+        graph, int(graph.active_channels.shape[-1])
+    )
+    augmented, rows = model.emb_net.augment_edges(
+        graph.edge_attr,
+        graph,
+        resource_type=resource_type,
+        return_resource_rows=True,
+    )
+    assert augmented.shape[0] == graph.edge_attr.shape[0]
+    assert rows.shape[:2] == graph.resource_transition_mask.shape
+    loss = rows.square().mean() + augmented.square().mean()
+    loss.backward()
+    assert model.emb_net.edge_resource_encoder.attr_proj.weight.grad is not None
+    assert (
+        model.emb_net.edge_resource_encoder.attr_proj.weight.grad.abs().sum()
+        > 0
+    )
 
 
 def test_new_decoder_propagates_min_changed_edges(monkeypatch) -> None:
@@ -185,7 +224,7 @@ def test_event_driven_option_rollout_and_pretrain_update(
     # Match the successful pipeline: PPO sees only incumbent-conditioned
     # refinement states after a neutral feasible bootstrap.
     assert all(
-        torch.count_nonzero(step.graph.x[:, 12]) > 0
+        torch.count_nonzero(step.graph.x[:, 5]) > 0
         for step in rollout.steps
     )
     assert all(
@@ -220,45 +259,6 @@ def test_event_driven_option_rollout_and_pretrain_update(
         and torch.equal(
             coupler_bias_before, model.coupler_bias_head.weight.detach()
         )
-    )
-
-
-def test_typed_candidate_quota_receives_winner_gated_ppo_gradient() -> None:
-    rng = np.random.default_rng(406)
-    coordinates = rng.random((20, 2), dtype=np.float32)
-    problem = {
-        "name": "cvrp",
-        "coordinates": coordinates,
-        "distance": np.linalg.norm(
-            coordinates[:, None] - coordinates[None, :], axis=-1
-        ).astype(np.float32),
-        "demand": np.r_[0.0, rng.uniform(0.01, 0.05, 19)].astype(np.float32),
-        "capacity": 0.5,
-    }
-    problem = problem_schema("cvrp") | problem
-    args = _args()
-    model = ConstraintFieldNet(depth=1, units=8)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
-    rollout = collect_instance_rollout(model, problem, "cvrp", args)
-    step = rollout.steps[0]
-    with torch.no_grad():
-        output = model(step.graph)
-        policy = torch.distributions.Multinomial(
-            total_count=args.candidates,
-            logits=output["candidate_quota_logits"][0],
-        )
-        counts = policy.sample()
-        step.quota_counts = counts
-        step.old_quota_logp = policy.log_prob(counts)
-    step.transition_rollout = 0
-    step.temporal_advantage = 1.0
-    before = model.candidate_quota_head.weight.detach().clone()
-
-    metrics = ppo_update(model, optimizer, [rollout], args, epoch=1)
-
-    assert "quota_rl_loss" in metrics
-    assert not torch.equal(
-        before, model.candidate_quota_head.weight.detach()
     )
 
 
@@ -359,7 +359,7 @@ def test_decision_level_ppo_moves_policy_without_auxiliary_losses(
     assert metrics["auxiliary_scale"] == pytest.approx(args.aux_rl_scale)
 
 
-def test_tsp_refinement_transition_updates_edge_logit_head() -> None:
+def test_tsp_refinement_transition_updates_objective_residual_head() -> None:
     rng = np.random.default_rng(409)
     coordinates = rng.random((20, 2), dtype=np.float32)
     problem = problem_schema("tsp") | {
@@ -382,7 +382,7 @@ def test_tsp_refinement_transition_updates_edge_logit_head() -> None:
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
     rollout = collect_instance_rollout(model, problem, "tsp", args)
     refinement = rollout.steps[0]
-    assert torch.count_nonzero(refinement.graph.x[:, 12]) > 0
+    assert torch.count_nonzero(refinement.graph.x[:, 5]) > 0
     assert refinement.old_logp.numel() > 0
     refinement.rewards = torch.tensor([-1.0, 1.0])
     rollout.steps = [refinement]
@@ -494,30 +494,6 @@ def test_winner_temporal_advantage_is_non_cancelling_pomo_contrast() -> None:
     )
     assert float(advantage.sum()) == pytest.approx(0.0)
     assert float(advantage.abs().sum()) > 0.0
-
-
-def test_optimizer_state_initializes_appended_objective_logit_head() -> None:
-    model = ConstraintFieldNet(depth=1, units=8)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
-    sum(parameter.square().sum() for parameter in model.parameters()).backward()
-    optimizer.step()
-    legacy = copy.deepcopy(optimizer.state_dict())
-    removed = legacy["param_groups"][0]["params"][-2:]
-    legacy["param_groups"][0]["params"] = legacy["param_groups"][0][
-        "params"
-    ][:-2]
-    for parameter_id in removed:
-        legacy["state"].pop(parameter_id)
-    restored = ConstraintFieldNet(depth=1, units=8)
-    restored_optimizer = torch.optim.AdamW(restored.parameters(), lr=1e-4)
-
-    added = _load_optimizer_state_compat(restored_optimizer, legacy)
-
-    assert added == 2
-    assert len(restored_optimizer.param_groups[0]["params"]) == len(
-        list(restored.parameters())
-    )
-    assert len(restored_optimizer.state) == len(list(restored.parameters())) - 2
 
 
 def test_positive_class_weight_balances_rare_events() -> None:
@@ -667,7 +643,7 @@ def test_stagnant_options_reuse_field_and_skip_fallback_labels() -> None:
     assert len(rollout.steps) == args.search_iterations
     assert len({id(step.graph) for step in rollout.steps}) == 1
     assert all(
-        torch.count_nonzero(step.graph.x[:, 12]) > 0 for step in rollout.steps
+        torch.count_nonzero(step.graph.x[:, 5]) > 0 for step in rollout.steps
     )
     assert all(
         step.trace["screened_edges"].size > 0 for step in rollout.steps
@@ -839,9 +815,9 @@ def test_policy_replay_uses_direct_field_not_analytic_pressure() -> None:
         "starts": np.array([0, 1], dtype=np.int32),
         "stochastic": np.array([1], dtype=np.uint8),
         "chosen_indices": np.array([0], dtype=np.int32),
-        "live_state": np.zeros(
-            (1, prism_decoder.LIVE_STATE_FEATURE_COUNT), dtype=np.float32
-        ),
+        # Live state is one value per registry row, so it is as wide as the
+        # synthetic graph's registry rather than as wide as a global constant.
+        "live_state": np.zeros((1, channels), dtype=np.float32),
         "valid_offsets": np.array([0, 2], dtype=np.int32),
         "valid_indices": np.array([0, 1], dtype=np.int32),
     }
@@ -886,9 +862,9 @@ def test_policy_replay_is_objective_scale_and_resource_unit_invariant() -> None:
         "starts": np.array([0, 1], dtype=np.int32),
         "stochastic": np.array([1], dtype=np.uint8),
         "chosen_indices": np.array([1], dtype=np.int32),
-        "live_state": np.zeros(
-            (1, prism_decoder.LIVE_STATE_FEATURE_COUNT), dtype=np.float32
-        ),
+        # Live state is one value per registry row, so it is as wide as the
+        # synthetic graph's registry rather than as wide as a global constant.
+        "live_state": np.zeros((1, channels), dtype=np.float32),
         "valid_offsets": np.array([0, 2], dtype=np.int32),
         "valid_indices": np.array([0, 1], dtype=np.int32),
     }
@@ -944,9 +920,9 @@ def test_policy_replay_resource_energy_is_channel_permutation_invariant() -> Non
         "starts": np.array([0, 1], dtype=np.int32),
         "stochastic": np.array([1], dtype=np.uint8),
         "chosen_indices": np.array([0], dtype=np.int32),
-        "live_state": np.zeros(
-            (1, prism_decoder.LIVE_STATE_FEATURE_COUNT), dtype=np.float32
-        ),
+        # Live state is one value per registry row, so it is as wide as the
+        # synthetic graph's registry rather than as wide as a global constant.
+        "live_state": np.zeros((1, channels), dtype=np.float32),
         "valid_offsets": np.array([0, 2], dtype=np.int32),
         "valid_indices": np.array([0, 1], dtype=np.int32),
     }
@@ -1139,6 +1115,29 @@ def test_default_cosine_lr_decays_to_zero() -> None:
     assert rates[0] == pytest.approx(args.lr)
     assert rates[-1] == pytest.approx(args.lr_min)
     assert all(left >= right for left, right in zip(rates, rates[1:]))
+
+
+def test_epoch_seed_depends_on_epoch_not_resume_point() -> None:
+    """A resumed run must not replay the instance stream from epoch 0."""
+    from problem_data import generated_problem
+    from train import setup_seeds
+
+    def first_instances(seed: int, epoch: int) -> list[float]:
+        setup_seeds(_epoch_seed(seed, epoch))
+        return [
+            float(np.asarray(generated_problem(variant, 8).get("coordinates")).sum())
+            for variant in ("tsp", "cvrp")
+        ]
+
+    # Same epoch index reproduces the same data no matter when it is reached.
+    assert first_instances(1234, 43) == first_instances(1234, 43)
+    # Consecutive epochs, and epoch 0 in particular, draw different data.
+    assert first_instances(1234, 43) != first_instances(1234, 0)
+    assert first_instances(1234, 43) != first_instances(1234, 44)
+    # Distinct run seeds stay independent.
+    assert first_instances(1234, 43) != first_instances(4321, 43)
+    # np.random.seed only accepts 32-bit seeds.
+    assert all(0 <= _epoch_seed(1234, epoch) < 2**32 for epoch in range(64))
 
 
 @pytest.mark.parametrize(

@@ -30,15 +30,11 @@ if str(SRC) not in sys.path:
 
 import prism_decoder
 from net import (
-    BatchedRelocate,
     ConstraintFieldNet,
     MODEL_SCHEMA,
     build_decoder_data,
     load_constraint_field_state_dict,
-    schema_vector,
 )
-from route_eval import RouteEvaluator
-from refine import neural_refine_solve, candidate_adjacency
 from problem_data import (
     ALL_VARIANTS,
     DEFAULT_DATASET_DIR,
@@ -47,7 +43,6 @@ from problem_data import (
     VariantCurriculum,
     channel_balanced_weights,
     generated_problem,
-    problem_schema,
 )
 from utils import MetricsCollector, get_logger, init_logger
 
@@ -70,11 +65,6 @@ class OptionStep:
     temporal_advantage: float = 0.0
     old_value: float = 0.0
     value_target: Optional[float] = None
-    quota_counts: Optional[torch.Tensor] = None
-    old_quota_logp: Optional[torch.Tensor] = None
-    # Algebra descriptor [SCHEMA_FEATURE_DIM] for the schema-conditioned advantage
-    # scale g_phi(schema); populated in ppo_update only when --schema-adv-scale.
-    schema: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -87,112 +77,6 @@ class InstanceRollout:
     improvements: int
     neural_seconds: float
     decoder_seconds: float
-    # Joint-training refiner supervision (CaR unified-encoder): a best-improvement
-    # teacher trajectory whose imitation loss is added to the same backward, so
-    # the shared GNN encoder is trained by construction RL AND refinement CE.
-    refiner: Optional["RefinerSupervision"] = None
-
-
-@dataclass
-class RefinerSupervision:
-    graph: Any  # decoder graph (build_decoder_data) at the bootstrap state
-    live: torch.Tensor  # [T, N, C] per-state node resource features
-    rt: torch.Tensor  # [T, L] teacher-visited route states
-    valid: torch.Tensor  # [T, L] bool
-    rm_pos: torch.Tensor  # [T] teacher removal / segment-start position
-    gap: torch.Tensor  # [T] teacher reinsertion gap
-    schema: torch.Tensor  # [SCHEMA_FEATURE_DIM] schema descriptor
-    depot_count: int
-    evaluator: Any  # RouteEvaluator (holds gap_feas_fn)
-    oropt: bool = False  # or-opt teacher (segment) vs relocate-1
-    seg_len: Optional[torch.Tensor] = None  # [T] segment length (or-opt)
-    rev: Optional[torch.Tensor] = None  # [T] reversal flag (or-opt)
-
-
-# The relocate refiner only models the min-distance visit-all family; op/pctsp
-# (subset/maximize) need an add/drop operator, so joint supervision skips them.
-def _refiner_supported(problem: dict) -> bool:
-    return (
-        problem.get("objective", "distance") == "distance"
-        and "visit_all" in problem.get("constraints", [])
-        and problem.get("multi_route", False)
-    )
-
-
-def build_refiner_supervision(
-    decoder, problem: dict, incumbent: dict, args: argparse.Namespace,
-    max_steps: int = 40,
-) -> Optional[RefinerSupervision]:
-    """Best-improvement teacher trajectory from the bootstrap incumbent, computed
-    entirely in torch. Uses OR-OPT (best_oropt: segment relocate) when
-    --refiner-max-seg>1, else relocate-1 (best_relocate). None if the schema is
-    unsupported or the bootstrap is already a local optimum."""
-    if not _refiner_supported(problem):
-        return None
-    device = args.device
-    try:
-        ev = RouteEvaluator(problem, device=device)
-    except NotImplementedError:
-        return None
-    max_seg = getattr(args, "refiner_max_seg", 1)
-    oropt = max_seg > 1
-    # Candidate-restricted teachers (O(L*K) not O(L^2)) -- far faster than the
-    # exact all-gaps teacher and no OOM at n=1000. `local` is the fully
-    # incremental Δ path (no evaluate) for the cvrp family; `restricted` uses the
-    # exact scan (correct for tw/route_limit/backhaul/pd/md/open) on the same
-    # candidate set. Both need the candidate neighbour lists.
-    use_local = (
-        not oropt
-        and int(problem.get("depot_count", 1)) == 1
-        and not problem.get("open_route", False)
-        and set(problem.get("constraints", [])) <= {"visit_all", "capacity"}
-    )
-    nbr = None
-    if not oropt:
-        adj = candidate_adjacency(decoder, device)  # [N,N] bool
-        Kc = min(int(adj.sum(1).max().item()) if adj.numel() else 1, adj.shape[1])
-        Kc = max(Kc, 1)
-        vals, idx = adj.float().topk(Kc, dim=1)
-        nbr = torch.where(vals > 0, idx, torch.full_like(idx, -1))
-    start = list(incumbent["route"])
-    L = len(start)
-    rt = torch.tensor(start, dtype=torch.long, device=device).view(1, L)
-    valid = torch.ones(1, L, dtype=torch.bool, device=device)
-    s_rt, s_valid, s_rm, s_gap, s_len, s_rev = [], [], [], [], [], []
-    for _ in range(max_steps):
-        res = (ev.best_oropt(rt, valid, max_seg=max_seg) if oropt
-               else ev.best_relocate_local(rt, valid, nbr) if use_local
-               else ev.best_relocate_restricted(rt, valid, nbr))
-        if not bool(res["improved"][0]):
-            break
-        s_rt.append(rt)
-        s_valid.append(valid)
-        s_gap.append(res["gap"])
-        if oropt:
-            s_rm.append(res["seg_pos"])
-            s_len.append(res["seg_len"])
-            s_rev.append(res["rev"])
-        else:
-            s_rm.append(res["rm_pos"])
-        rt, valid = res["new_rt"], res["new_valid"]
-    if not s_rt:
-        return None
-    rt_b = torch.cat(s_rt)
-    valid_b = torch.cat(s_valid)
-    return RefinerSupervision(
-        graph=build_decoder_data(decoder, device=device),
-        live=ev.node_state_batch(rt_b, valid_b),
-        rt=rt_b,
-        valid=valid_b,
-        rm_pos=torch.cat(s_rm),
-        gap=torch.cat(s_gap),
-        schema=schema_vector(problem, device=device),
-        depot_count=int(decoder.metadata["depot_count"]),
-        evaluator=ev,
-        oropt=oropt,
-        seg_len=torch.cat(s_len) if oropt else None,
-        rev=torch.cat(s_rev) if oropt else None,
-    )
 
 
 @dataclass
@@ -544,10 +428,7 @@ def _new_decoder(
 ):
     decoder = prism_decoder.Decoder(
         problem,
-        candidate_config={
-            "max_candidates": args.candidates,
-            "candidate_mode": getattr(args, "candidate_mode", "schema"),
-        },
+        candidate_config={"max_candidates": args.candidates},
         search_config={
             "use_srr": use_srr,
             "min_changed_edges": getattr(args, "min_changed_edges", 8),
@@ -647,7 +528,14 @@ def setup_decoder_resampling(
             if "bootstrap failed" not in str(exc):
                 raise
             last_error = str(exc)
-            problem = generated_problem(variant, args.n_node, args.capacity)
+            problem = generated_problem(
+                variant,
+                args.n_node,
+                args.capacity,
+                randomize_resource_program=getattr(
+                    args, "randomize_resource_programs", False
+                ),
+            )
     raise RuntimeError(
         f"bootstrap failed for {variant} after {max_attempts} resamples: "
         f"{last_error}"
@@ -751,14 +639,6 @@ def collect_instance_rollout(
         problem, variant, args,
         model=model, field_enabled=field_enabled, risk_penalty=risk_penalty,
     )
-    # Joint-training: capture the refiner teacher trajectory from the bootstrap
-    # state (before the C++ search perturbs the incumbent / decoder features).
-    refiner_sup = None
-    if getattr(args, "joint_refiner", False):
-        refiner_sup = build_refiner_supervision(
-            decoder, problem, incumbent, args,
-            max_steps=getattr(args, "refiner_teacher_steps", 40),
-        )
     steps: list[OptionStep] = []
     emissions = 0
     improvements = 0
@@ -771,9 +651,6 @@ def collect_instance_rollout(
     cached_output = None
     cached_guidance = None
     cached_binding = None
-    cached_quota_counts = None
-    cached_quota_logp = None
-    cached_quota_fractions = None
     iteration = 0
 
     while iteration < args.search_iterations:
@@ -801,23 +678,6 @@ def collect_instance_rollout(
             cached_output = old_output
             cached_guidance = guidance
             cached_binding = binding_target
-            if (
-                getattr(args, "learned_candidate_quotas", False)
-                and field_enabled
-            ):
-                quota_policy = torch.distributions.Multinomial(
-                    total_count=args.candidates,
-                    logits=old_output["candidate_quota_logits"][0],
-                )
-                cached_quota_counts = quota_policy.sample()
-                cached_quota_logp = quota_policy.log_prob(cached_quota_counts)
-                cached_quota_fractions = (
-                    cached_quota_counts[:-1] / float(args.candidates)
-                ).detach().cpu().numpy().astype(np.float32)
-            else:
-                cached_quota_counts = None
-                cached_quota_logp = None
-                cached_quota_fractions = None
             emissions += 1
         else:
             graph = cached_graph
@@ -902,12 +762,6 @@ def collect_instance_rollout(
                 _gain(option_incumbent, iteration_best, 0.0), 0.0
             )
             if normalized_gain > args.improvement_epsilon:
-                if cached_quota_fractions is not None:
-                    decoder.set_candidate_resource_quotas(
-                        cached_quota_fractions
-                    )
-                    step.quota_counts = cached_quota_counts.detach()
-                    step.old_quota_logp = cached_quota_logp.detach()
                 decoder.set_incumbent(iteration_best["route"])
                 incumbent = iteration_best
                 improvements += 1
@@ -963,7 +817,6 @@ def collect_instance_rollout(
         improvements=improvements,
         neural_seconds=neural_seconds,
         decoder_seconds=decoder_seconds,
-        refiner=refiner_sup,
     )
 
 
@@ -1161,7 +1014,6 @@ def _detached_output(
         "coupler_weights",
         "coupler_bias",
         "value_context",
-        "candidate_quota_logits",
     ):
         value = output[key]
         if value.requires_grad:
@@ -1212,8 +1064,6 @@ def _step_loss(
     temporal_adv_scale: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, dict[str, float | torch.Tensor]]:
     zero = output["residual"].sum() * 0.0
-    schema_scale_loss = zero
-    schema_scale_pred = zero
     temporal_credit_weight = float(
         getattr(args, "temporal_credit_weight", 0.0)
     )
@@ -1271,35 +1121,7 @@ def _step_loss(
                 if adv_scale is not None
                 else rollout_advantage.std(unbiased=False) + 1e-8
             )
-            if getattr(args, "schema_adv_scale", False) and step.schema is not None:
-                # g_phi(schema) is a per-schema RELATIVE multiplier on the
-                # batch-pooled scale, not an absolute dispersion predictor. The
-                # pooled scale supplies the stationary global magnitude; g_phi only
-                # corrects each schema's dispersion relative to the batch. It is
-                # initialised at 1.0, so scale == base_scale and enabling this is an
-                # exact no-op until fitted -- an absolute-dispersion head instead
-                # starts ~1/base_scale off and ramps the effective step size by
-                # orders of magnitude over training, which diverges. The divisor is
-                # detached (the policy cannot game it) and depends only on the
-                # schema, so degenerate low-variance options are not amplified.
-                eps = rollout_advantage.new_tensor(1e-6)
-                pred_scale = model.reward_scale(
-                    step.schema.to(rollout_advantage.device)
-                )
-                # Bound the target and the applied multiplier to a sane band: a
-                # degenerate near-zero-dispersion option must not drag g_phi toward
-                # zero and re-amplify advantages. The relative correction lives in
-                # [0.25, 4]x of the pooled scale; anything outside is a mis-fit, not
-                # signal, so the effective step size can never diverge.
-                target_rel = (reward_std.detach() / base_scale).clamp(0.1, 10.0)
-                schema_scale_loss = F.smooth_l1_loss(
-                    pred_scale.clamp_min(eps).log(), target_rel.log()
-                )
-                schema_scale_pred = pred_scale.detach()
-                scale = base_scale * pred_scale.detach().clamp(0.25, 4.0)
-            else:
-                scale = base_scale
-            rollout_advantage = rollout_advantage / scale
+            rollout_advantage = rollout_advantage / base_scale
         temporal_rollout_advantage = torch.zeros_like(rollout_advantage)
         if temporal_enabled and step.transition_rollout is not None:
             temporal_rollout_advantage = _winner_temporal_advantage(
@@ -1378,34 +1200,6 @@ def _step_loss(
         temporal_policy_signal = zero
         temporal_advantage_abs = zero
 
-    quota_rl_loss = zero
-    quota_ratio = zero
-    quota_entropy = zero
-    if (
-        temporal_enabled
-        and step.quota_counts is not None
-        and step.old_quota_logp is not None
-    ):
-        counts = step.quota_counts.to(output["candidate_quota_logits"].device)
-        quota_policy = torch.distributions.Multinomial(
-            total_count=int(counts.sum().item()),
-            logits=output["candidate_quota_logits"][0],
-        )
-        quota_logp = quota_policy.log_prob(counts)
-        old_quota_logp = step.old_quota_logp.to(quota_logp.device)
-        quota_ratio = torch.exp(quota_logp - old_quota_logp)
-        quota_advantage = quota_logp.new_tensor(step.temporal_advantage)
-        if temporal_adv_scale is not None:
-            quota_advantage = quota_advantage / temporal_adv_scale
-        clipped_quota_ratio = torch.clamp(
-            quota_ratio, 1 - args.ppo_clip, 1 + args.ppo_clip
-        )
-        quota_rl_loss = -torch.minimum(
-            quota_ratio * quota_advantage,
-            clipped_quota_ratio * quota_advantage,
-        )
-        quota_entropy = quota_policy.entropy()
-
     critic_loss = zero
     value_prediction = zero
     value_target = zero
@@ -1439,11 +1233,9 @@ def _step_loss(
     )
     loss = (
         rl_weight * rl_loss
-        + rl_weight * temporal_credit_weight * quota_rl_loss
         + auxiliary_scale * auxiliary
         + float(getattr(args, "objective_residual_l2", 0.1)) * objective_residual_loss
         + float(getattr(args, "value_loss_weight", 0.0)) * critic_loss
-        + float(getattr(args, "schema_scale_weight", 0.1)) * schema_scale_loss
         - args.entropy_weight * entropy
     )
     with torch.no_grad():
@@ -1464,14 +1256,7 @@ def _step_loss(
             "rl_score_proxy": rl_score_proxy.detach(),
             "policy_signal": policy_signal.detach(),
             "temporal_policy_signal": temporal_policy_signal.detach(),
-            "quota_rl_loss": quota_rl_loss.detach(),
-            "quota_ratio": quota_ratio.detach(),
-            "quota_entropy": quota_entropy.detach(),
             "reward_std": reward_std.detach(),
-            "schema_scale_loss": schema_scale_loss.detach(),
-            "schema_scale_pred": schema_scale_pred.detach()
-            if torch.is_tensor(schema_scale_pred)
-            else schema_scale_pred,
             "advantage_abs": advantage_abs.detach(),
             "temporal_advantage_abs": temporal_advantage_abs.detach(),
             "critic_loss": critic_loss.detach(),
@@ -1504,73 +1289,16 @@ def _step_loss(
     return loss, metrics
 
 
-def joint_parameters(model, refiner):
-    """Deduplicated parameter list over field + refiner (shared emb_net counted
-    once) for the optimizer and grad clipping."""
-    params = list(model.parameters())
-    if refiner is not None:
-        seen = {id(p) for p in params}
-        params += [p for p in refiner.parameters() if id(p) not in seen]
-    return params
-
-
-def _refiner_batch_loss(refiner, rollouts, args):
-    """Mean imitation CE over the batch's teacher trajectories, forwarding
-    through the SHARED encoder so the joint backward trains it. None if no
-    rollout carried refiner supervision."""
-    losses = []
-    for rollout in rollouts:
-        sup = getattr(rollout, "refiner", None)
-        if sup is None:
-            continue
-        node_emb = refiner.encode_static(sup.graph)  # shared emb_net forward
-        if sup.oropt:
-            losses.append(
-                refiner.oropt_imitation_loss(
-                    node_emb, sup.live, sup.rt, sup.valid, sup.evaluator,
-                    seg_pos=sup.rm_pos, seg_len=sup.seg_len, gap=sup.gap,
-                    rev=sup.rev, depot_count=sup.depot_count, schema=sup.schema,
-                )
-            )
-        else:
-            losses.append(
-                refiner.imitation_loss(
-                    node_emb, sup.live, sup.rt, sup.valid, adj=None,
-                    rm_pos=sup.rm_pos, gap_target=sup.gap,
-                    depot_count=sup.depot_count,
-                    gap_feas_fn=sup.evaluator.insertion_feasible,
-                    schema=sup.schema,
-                )
-            )
-    if not losses:
-        return None
-    return torch.stack(losses).mean()
-
-
 def ppo_update(
     model: ConstraintFieldNet,
     optimizer: torch.optim.Optimizer,
     rollouts: list[InstanceRollout],
     args: argparse.Namespace,
     epoch: int,
-    refiner: Optional[BatchedRelocate] = None,
 ) -> dict[str, float]:
     steps = [step for rollout in rollouts for step in rollout.steps]
     if not steps:
         return {}
-    if getattr(args, "schema_adv_scale", False):
-        # Attach the per-variant algebra descriptor to each step so _step_loss can
-        # normalise advantages by g_phi(schema). Cached per variant per update.
-        schema_cache: dict[str, torch.Tensor] = {}
-        for rollout in rollouts:
-            descriptor = schema_cache.get(rollout.variant)
-            if descriptor is None:
-                descriptor = schema_vector(
-                    problem_schema(rollout.variant), device=args.device
-                )
-                schema_cache[rollout.variant] = descriptor
-            for step in rollout.steps:
-                step.schema = descriptor
     option_groups: list[list[OptionStep]] = []
     for step in steps:
         if not option_groups or option_groups[-1][0].graph is not step.graph:
@@ -1690,18 +1418,9 @@ def ppo_update(
             synchronize()
             timing["backward"] += time.perf_counter() - phase_started
 
-        # Joint refiner loss: accumulate its gradient onto the SAME step, so one
-        # optimizer.step() trains the shared encoder with construction RL + the
-        # refinement CE (CaR unified-encoder joint objective).
-        if refiner is not None:
-            refiner_ce = _refiner_batch_loss(refiner, rollouts, args)
-            if refiner_ce is not None:
-                (args.refiner_ce_weight * refiner_ce).backward()
-                collector.add_dict({"refiner_ce": float(refiner_ce.detach())})
-
         phase_started = time.perf_counter()
         gradient_norm = torch.nn.utils.clip_grad_norm_(
-            joint_parameters(model, refiner), args.grad_clip
+            model.parameters(), args.grad_clip
         )
         gradient_norms.append(float(gradient_norm))
         optimizer.step()
@@ -1828,7 +1547,6 @@ def train_epoch(
     args: argparse.Namespace,
     curriculum: VariantCurriculum,
     ema: Optional["WeightEMA"] = None,
-    refiner: Optional[BatchedRelocate] = None,
 ) -> tuple[int, float, float, float, float, dict[str, float]]:
     """Accumulate mixed-variant rollouts before each optimizer update."""
     logger = get_logger()
@@ -1856,7 +1574,14 @@ def train_epoch(
         )
         for variant in variant_schedule[completed : completed + group]:
             phase_started = time.perf_counter()
-            problem = generated_problem(variant, args.n_node, args.capacity)
+            problem = generated_problem(
+                variant,
+                args.n_node,
+                args.capacity,
+                randomize_resource_program=getattr(
+                    args, "randomize_resource_programs", False
+                ),
+            )
             generation_seconds += time.perf_counter() - phase_started
             phase_started = time.perf_counter()
             rollout = collect_instance_rollout(
@@ -1872,7 +1597,7 @@ def train_epoch(
             costs.append(rollout.average_cost)
             neural_seconds += rollout.neural_seconds
             decoder_seconds += rollout.decoder_seconds
-        metrics = ppo_update(model, optimizer, rollouts, args, epoch, refiner=refiner)
+        metrics = ppo_update(model, optimizer, rollouts, args, epoch)
         if ema is not None:
             ema.update(model)
         ppo_seconds += metrics.get("ppo_seconds", 0.0)
@@ -1955,62 +1680,10 @@ def train_epoch(
     )
 
 
-def train_refiner_only_epoch(
-    model, refiner, optimizer, global_step, epoch, args, curriculum,
-    ema=None,
-):
-    """Refiner-only epoch: NO field RL / C++ search. Per accumulation group,
-    bootstrap a cheap construction, build the best-improvement teacher trajectory,
-    and take one imitation step (which also trains the shared encoder). Much
-    faster than joint since it skips collect_instance_rollout + ppo_update."""
-    logger = get_logger()
-    started = time.perf_counter()
-    variant_schedule = _training_variant_schedule(curriculum, args, epoch)
-    accum = _training_accumulation_size(curriculum, args, epoch)
-    completed = 0
-    ces = []
-    progress = tqdm(total=args.steps_per_epoch, desc="Epoch(refiner)", leave=True)
-    while completed < args.steps_per_epoch:
-        group = min(accum, args.steps_per_epoch - completed)
-        rollouts = []
-        for variant in variant_schedule[completed: completed + group]:
-            problem = generated_problem(variant, args.n_node, args.capacity)
-            try:
-                decoder, incumbent = setup_decoder(problem, args, deterministic=True)
-            except RuntimeError:
-                continue
-            sup = build_refiner_supervision(
-                decoder, problem, incumbent, args,
-                max_steps=args.refiner_teacher_steps,
-            )
-            if sup is not None:
-                rollouts.append(InstanceRollout(
-                    variant, [], 0.0, 0.0, 0, 0, 0.0, 0.0, refiner=sup))
-        optimizer.zero_grad(set_to_none=True)
-        ce = _refiner_batch_loss(refiner, rollouts, args)
-        if ce is not None:
-            (args.refiner_ce_weight * ce).backward()
-            torch.nn.utils.clip_grad_norm_(joint_parameters(model, refiner), args.grad_clip)
-            optimizer.step()
-            if ema is not None:
-                ema.update(model)
-            ces.append(float(ce.detach()))
-            logger.log_metrics({"refiner_ce": ces[-1]}, step=global_step)
-        completed += group
-        global_step += 1
-        progress.update(group)
-    progress.close()
-    epoch_time = time.perf_counter() - started
-    mean_ce = float(np.mean(ces)) if ces else 0.0
-    return global_step, mean_ce, 0.0, 0.0, epoch_time, {"refiner_ce": mean_ce}
-
-
-@torch.no_grad()
 def infer_instance(
     model: Optional[ConstraintFieldNet],
     problem: dict,
     args: argparse.Namespace,
-    refiner: Optional[BatchedRelocate] = None,
     initial_route: Optional[np.ndarray] = None,
     baseline: str = "constant",
 ) -> tuple[float, dict, dict[str, float]]:
@@ -2021,28 +1694,6 @@ def infer_instance(
     if model is None and baseline not in {"constant", "distance", "random"}:
         raise ValueError(f"unknown inference baseline: {baseline}")
     decoder_args = _inference_decoder_args(args, model)
-    # Neural-refinement deployment: REPLACE hand-designed SRR. Build the decoder
-    # with SRR off (C++ only constructs) and refine with the trained refiner.
-    if getattr(args, "neural_refine", False) and refiner is not None:
-        if _refiner_supported(problem):
-            srr_decoder = _new_decoder(
-                problem, decoder_args, deterministic=True, use_srr=False
-            )
-            # construct the incumbent (SRR off) from the neutral bootstrap, the
-            # same start the SRR path uses; refinement is then purely neural.
-            initial = list(srr_decoder.sample(**_neutral_guidance(srr_decoder)))
-            incumbent, _ = _best_feasible_solution(
-                initial, context="neutral bootstrap"
-            )
-            solution = neural_refine_solve(
-                srr_decoder, problem, refiner,
-                start_route=incumbent["route"],
-                group_size=args.neural_refine_group,
-                improve_steps=args.neural_refine_steps,
-                device=args.device,
-            )
-            return _canonical_cost(solution), solution, {"emissions": 0.0}
-        # op/pctsp etc.: refiner has no operator yet -> fall through to SRR.
     decoder = _new_decoder(
         problem,
         decoder_args,
@@ -2124,14 +1775,6 @@ def infer_instance(
         graph = build_decoder_data(decoder, args.device)
         output = model(graph)
         evaluations = 1
-        if getattr(args, "learned_candidate_quotas", False):
-            decoder.set_candidate_resource_quotas(
-                output["candidate_quota"][0].detach().cpu().numpy()
-            )
-            decoder.set_incumbent(decoder.best_solution["route"])
-            graph = build_decoder_data(decoder, args.device)
-            output = model(graph)
-            evaluations += 1
         return (
             _guidance_numpy(output, graph, risk_penalty=risk_penalty),
             evaluations,
@@ -2288,7 +1931,6 @@ def validation(
     args: argparse.Namespace,
     *,
     capture_paired_baseline: bool = False,
-    refiner: Optional[BatchedRelocate] = None,
 ) -> tuple[float, float, float, dict[str, float]]:
     validation_args = copy.copy(args)
     validation_args.n_rollouts = (
@@ -2310,7 +1952,7 @@ def validation(
     group_best_costs: dict[str, list[float]] = {}
     for item in tqdm(dataset, desc="Validating", leave=False):
         average, best, metrics = infer_instance(
-            model, item["problem"], validation_args, refiner=refiner
+            model, item["problem"], validation_args
         )
         collector.add_dict(metrics)
         variant = item["variant"]
@@ -2616,7 +2258,6 @@ def save_checkpoint(
     global_step: int = 0,
     validation_manifest: Optional[tuple[tuple[str, int, str], ...]] = None,
     ema_state: Optional[dict[str, torch.Tensor]] = None,
-    refiner: Optional[BatchedRelocate] = None,
 ) -> None:
     payload = {
         "model_schema": MODEL_SCHEMA,
@@ -2626,8 +2267,6 @@ def save_checkpoint(
         "config": vars(args),
         "global_step": int(global_step),
     }
-    if refiner is not None:
-        payload["refiner_state_dict"] = refiner.state_dict()
     if ema_state is not None:
         payload["ema_state_dict"] = ema_state
     if val_gap is not None:
@@ -2640,33 +2279,6 @@ def save_checkpoint(
     if validation_manifest is not None:
         payload["validation_manifest"] = validation_manifest
     torch.save(payload, path)
-
-
-def _load_optimizer_state_compat(
-    optimizer: torch.optim.Optimizer, state_dict: dict
-) -> int:
-    """Load optimizer state while initializing newly appended parameters.
-
-    New compatibility heads are appended after all legacy model parameters, so
-    their optimizer slots retain the same order. Returns the number of new
-    parameters initialized without saved optimizer state.
-    """
-    current = optimizer.state_dict()
-    saved = copy.deepcopy(state_dict)
-    if len(saved["param_groups"]) != len(current["param_groups"]):
-        raise ValueError("optimizer checkpoint has a different group count")
-    added = 0
-    for saved_group, current_group in zip(
-        saved["param_groups"], current["param_groups"]
-    ):
-        saved_count = len(saved_group["params"])
-        current_count = len(current_group["params"])
-        if saved_count > current_count:
-            raise ValueError("optimizer checkpoint has more parameters")
-        added += current_count - saved_count
-        saved_group["params"] = current_group["params"]
-    optimizer.load_state_dict(saved)
-    return added
 
 
 def parse_args() -> argparse.Namespace:
@@ -2703,6 +2315,21 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--randomize-resource-programs",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Append one anonymous resource program sampled in final term "
+            "coordinates to every generated training instance. Off by default: "
+            "the sampled bound is sized from a singleton route "
+            "(append_random_resource_program), which no route in pctsp, pdtsp, "
+            "pdcvrp, opdcvrp or amdocvrp can satisfy, so construction has no "
+            "feasible solution and the run aborts at the first epoch. Turn it "
+            "back on once the bound is derived from a real route rather than a "
+            "constant leg factor."
+        ),
+    )
+    parser.add_argument(
         "--val-size",
         type=int,
         default=8,
@@ -2714,46 +2341,20 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_DATASET_DIR,
         help=(
             "Benchmark dataset root. Defaults to PRISM_DATASET_DIR, then "
-            "baselines/URS/dataset"
+            "datasets/benchmarks"
         ),
     )
-    parser.add_argument("--capacity", type=int, default=50)
+    parser.add_argument(
+        "--capacity",
+        type=int,
+        default=None,
+        help=(
+            "override the vehicle capacity. Defaults to the benchmark value "
+            "for each variant (20 for pickup-delivery, 50 otherwise), which is "
+            "what the saved evaluation instances use."
+        ),
+    )
     parser.add_argument("--candidates", type=int, default=64)
-    parser.add_argument(
-        "--candidate-mode",
-        choices=["schema", "geometric"],
-        default="geometric",
-        help=(
-            "Candidate-graph construction. 'schema' (default) admits resource "
-            "candidates by the schema-derived relevance, using a uniform "
-            "equal-share prior over active resources when no learned quota is "
-            "installed, so any declared resource is covered without per-variant "
-            "tuning. 'geometric' is an explicit ablation that keeps only the "
-            "distance neighborhood. Currently geometric show more consistent improvement."
-        ),
-    )
-    parser.add_argument(
-        "--learned-candidate-quotas",
-        action="store_true",
-        help=(
-            "EXPERIMENTAL (off by default; may be removed or evolved in the "
-            "future). Let the typed multinomial quota policy reweight the schema "
-            "candidate allocation (schema mode only). Without it the allocation "
-            "stays at the uniform equal-share prior; with it the learned "
-            "fractions replace that prior. No effect under --candidate-mode "
-            "geometric."
-        ),
-    )
-    parser.add_argument(
-        "--typed-noninferiority-margin",
-        type=float,
-        default=0.25,
-        help=(
-            "Maximum allowed known-resource macro degradation in percentage "
-            "points before a typed-neighborhood checkpoint can become best.pt "
-            "(default: 0.25)."
-        ),
-    )
     parser.add_argument("--n-rollouts", type=int, default=32)
     parser.add_argument(
         "--val-n-rollouts",
@@ -2874,62 +2475,6 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--rl-weight", type=float, default=1.0)
     parser.add_argument(
-        "--joint-refiner",
-        action="store_true",
-        help="EXPERIMENTAL (off by default; may be removed or evolved in the "
-        "future). Jointly train a BatchedRelocate refiner sharing the field GNN "
-        "encoder; its best-improvement imitation loss is added to each PPO step "
-        "(CaR unified-encoder joint training)",
-    )
-    parser.add_argument(
-        "--refiner-ce-weight",
-        type=float,
-        default=1.0,
-        help="weight of the joint refiner imitation CE in the combined loss",
-    )
-    parser.add_argument(
-        "--refiner-only",
-        action="store_true",
-        help="EXPERIMENTAL (off by default; may be removed or evolved in the "
-        "future). Train ONLY the neural refiner (imitation): skip the field RL / C++ "
-        "search rollout entirely; per step just bootstrap a construction, build "
-        "the teacher trajectory, and take an imitation step. Much faster; the "
-        "field/construction stays neutral (pair with --neural-refine to deploy).",
-    )
-    parser.add_argument(
-        "--refiner-teacher-steps",
-        type=int,
-        default=40,
-        help="max best-improvement teacher trajectory length per instance",
-    )
-    parser.add_argument(
-        "--refiner-max-seg",
-        type=int,
-        default=1,
-        help="OR-OPT neighborhood: relocate contiguous segments of length "
-        "1..max_seg (with reversal for len>1). 1 = single-node relocate.",
-    )
-    parser.add_argument(
-        "--neural-refine",
-        action="store_true",
-        help="EXPERIMENTAL (off by default; may be removed or evolved in the "
-        "future). DEPLOY the trained refiner in place of C++ SRR: validation/"
-        "inference build the decoder with use_srr=False (C++ only constructs) "
-        "and refine with the neural model",
-    )
-    parser.add_argument(
-        "--neural-refine-group",
-        type=int,
-        default=32,
-        help="stochastic rollouts per instance for neural refinement",
-    )
-    parser.add_argument(
-        "--neural-refine-steps",
-        type=int,
-        default=60,
-        help="neural refinement improvement steps per instance",
-    )
-    parser.add_argument(
         "--aux-rl-scale",
         type=float,
         default=0.0,
@@ -3011,6 +2556,85 @@ def parse_args() -> argparse.Namespace:
             " --linear-objective-residual-head."
         ),
     )
+    parser.add_argument(
+        "--index-embedded-resources",
+        action="store_true",
+        help=(
+            "Semantic-factorization ablation: replace the algebra-derived"
+            " resource descriptor with a learned embedding of the resource's"
+            " registry POSITION (same width, same unit-interval range, so only"
+            " the semantics change). The field can then only memorize resource"
+            " identities seen in training; an appended schema row falls onto a"
+            " single shared cold row. Tests the claim that semantic"
+            " factorization -- not token capacity -- is what carries transfer to"
+            " unseen compositions."
+        ),
+    )
+    parser.add_argument(
+        "--no-normalize-projections",
+        dest="normalize_projections",
+        action="store_false",
+        help=(
+            "Restore the pre-fix forward pass, in which edge_projection and"
+            " graph_projection feed tanh unnormalized. Their activations reach"
+            " |40| after the residual GNN, saturating every consuming head, so"
+            " the per-edge field collapses to 1-3 distinct values and the"
+            " feasibility-risk head becomes constant. Kept as a flag rather"
+            " than deleted so the cost of the bug can be measured against a"
+            " matched run; there is no reason to train with it."
+        ),
+    )
+    parser.add_argument(
+        "--program-blind-resources",
+        action="store_true",
+        help=(
+            "Parsimony ablation, one rung below --index-embedded-resources:"
+            " give every resource the SAME constant type vector, so neither the"
+            " executable row/term properties nor the resource's identity reach"
+            " the model. Per-resource factorization is kept -- each row still"
+            " has its own token, multiplier and field head, and still receives"
+            " live state, node attributes and candidate-conditioned effects"
+            " u_r(e, t). Tests whether the hand-designed property maps supply"
+            " anything the executed effects do not. Mutually exclusive with"
+            " --index-embedded-resources and --monolithic-resource-field."
+        ),
+    )
+    parser.add_argument(
+        "--monolithic-resource-field",
+        action="store_true",
+        help=(
+            "Factorization ablation (coarse end of the ladder): collapse every"
+            " active resource onto one shared token, so a single"
+            " undifferentiated penalty intensity serves the whole composition"
+            " and two constraints can no longer be priced differently. Unlike"
+            " --index-embedded-resources this degrades in-distribution as well,"
+            " and it makes resource-token coupling vacuous, so it is an"
+            " everything-off reference point rather than a clean separation of"
+            " factorization from contextualization. Mutually exclusive with"
+            " --index-embedded-resources."
+        ),
+    )
+    parser.add_argument(
+        "--resource-pooling",
+        "--node-resource-pooling",
+        dest="resource_pooling",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Give the GNN encoder a pooled, descriptor-keyed summary of the"
+            " per-resource quantities the decoder publishes: node attributes"
+            " (demand, window bounds, service time) plus live incumbent state,"
+            " and per-edge pressure and reset events. Without it only the seven"
+            " compiled channels have named columns, so a declared row reaches"
+            " the model at the field head alone and never enters the node or"
+            " edge embeddings the feasibility, binding, coupler and"
+            " objective-residual heads are built from. Pooling is masked by the"
+            " active rows and shared across resources, so the width is"
+            " independent of the registry and nothing reads a registry"
+            " position. --no-resource-pooling is the ablation; it narrows both"
+            " encoder inputs, so an ablated run must train from scratch."
+        ),
+    )
     parser.add_argument("--entropy-weight", type=float, default=0.001)
     parser.add_argument(
         "--objective-residual",
@@ -3066,26 +2690,6 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--no-adv-norm", action="store_true")
-    parser.add_argument(
-        "--schema-adv-scale",
-        action="store_true",
-        help=(
-            "Normalise policy-gradient advantages by a learned schema-conditioned "
-            "scale g_phi(schema) instead of a single batch-pooled std. g_phi reads "
-            "the algebra descriptor and is fitted to per-schema reward dispersion, "
-            "so the normaliser generalises to held-out compositions with no "
-            "per-objective grouping. Off by default (pooled std)."
-        ),
-    )
-    parser.add_argument(
-        "--schema-scale-weight",
-        type=float,
-        default=0.1,
-        help=(
-            "Weight on the log-space regression fitting g_phi(schema) to observed "
-            "reward dispersion (used only with --schema-adv-scale)."
-        ),
-    )
     parser.add_argument("--beta", type=float, default=2.0)
     parser.add_argument(
         "--feasibility-lookahead-depth", type=int, default=2
@@ -3188,6 +2792,20 @@ def setup_seeds(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+def _epoch_seed(seed: int, epoch: int) -> int:
+    """Derive an epoch-local RNG seed that ignores where the process started.
+
+    Training instances and rollout sampling draw from the process-global RNGs,
+    which setup_seeds fixes once at startup. Reseeding them from (seed, epoch)
+    at the top of every epoch is what keeps a resumed run from replaying the
+    stream from its first epoch: without it, epoch 43 of a resumed run trains
+    on exactly the problems a fresh run sees at epoch 0. Mirrors the
+    epoch-local scheduler seed in VariantCurriculum.schedule; the value is
+    masked to 32 bits because np.random.seed rejects anything wider.
+    """
+    return random.Random((int(seed) << 32) ^ int(epoch)).randrange(1 << 32)
+
+
 def main() -> None:
     args = parse_args()
     if not 0.0 <= args.smdp_gamma <= 1.0:
@@ -3200,8 +2818,6 @@ def main() -> None:
         raise ValueError("value_loss_weight must be nonnegative")
     if args.objective_residual_l2 < 0.0:
         raise ValueError("objective_residual_l2 must be nonnegative")
-    if args.typed_noninferiority_margin < 0.0:
-        raise ValueError("typed_noninferiority_margin must be nonnegative")
     if args.smallvram is None:
         args.smallvram = (
             torch.version.hip is not None
@@ -3237,26 +2853,13 @@ def main() -> None:
         unconditioned_objective_residual_head=(
             args.unconditioned_objective_residual_head
         ),
+        index_embedded_resources=args.index_embedded_resources,
+        monolithic_resource_field=args.monolithic_resource_field,
+        program_blind_resources=args.program_blind_resources,
+        normalize_projections=args.normalize_projections,
+        pool_node_resources=args.resource_pooling,
     ).to(args.device)
-    # Joint refiner (CaR unified-encoder): EXPERIMENTAL, off by default (may be
-    # removed or evolved in the future). Shares model.emb_net so its
-    # imitation gradient trains the same GNN. units MUST match the encoder width.
-    # Build the refiner when jointly TRAINING it (--joint-refiner) OR DEPLOYING
-    # it in place of SRR (--neural-refine); deployment must not require joint
-    # training (a refiner can be loaded via --resume).
-    refiner = None
-    if args.joint_refiner or args.neural_refine or args.refiner_only:
-        refiner = BatchedRelocate(
-            units=model.emb_net.units, emb_net=model.emb_net,
-            grad_checkpointing=args.grad_checkpointing,
-            max_seg=args.refiner_max_seg,
-        ).to(args.device)
-        if args.neural_refine and not args.joint_refiner and not args.resume:
-            get_logger().warning(
-                "--neural-refine without --joint-refiner or --resume: the "
-                "refiner is UNTRAINED; validation/inference will be poor"
-            )
-    optimizer = torch.optim.AdamW(joint_parameters(model, refiner), lr=args.lr)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
     start_epoch = 0
     global_step = 0
     checkpoint = None
@@ -3266,27 +2869,12 @@ def main() -> None:
         )
         if checkpoint.get("model_schema") != MODEL_SCHEMA:
             raise RuntimeError(
-                "resume checkpoint is not a typed-resource v5 scale-equivariant-energy "
-                "checkpoint"
+                "resume checkpoint declares model schema "
+                f"{checkpoint.get('model_schema')!r}, but this model is "
+                f"{MODEL_SCHEMA!r}"
             )
-        upgraded = load_constraint_field_state_dict(
-            model, checkpoint["model_state_dict"]
-        )
-        if refiner is not None and checkpoint.get("refiner_state_dict") is not None:
-            refiner.load_state_dict(checkpoint["refiner_state_dict"])
-        added_optimizer_parameters = _load_optimizer_state_compat(
-            optimizer, checkpoint["optimizer_state_dict"]
-        )
-        if upgraded:
-            logger.warning(
-                "resumed a checkpoint without objective-conditioned edge "
-                "logits; initialized the new signed heads at zero"
-            )
-        if added_optimizer_parameters:
-            logger.warning(
-                "initialized optimizer state for "
-                f"{added_optimizer_parameters} new model parameters"
-            )
+        load_constraint_field_state_dict(model, checkpoint["model_state_dict"])
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         start_epoch = int(checkpoint["epoch"]) + 1
         global_step = int(
             checkpoint.get("global_step", start_epoch * args.steps_per_epoch)
@@ -3360,6 +2948,7 @@ def main() -> None:
         )
         logger.log_baseline(baseline_gap)
     for epoch in range(start_epoch, args.epochs):
+        setup_seeds(_epoch_seed(args.seed, epoch))
         phase_lr = _epoch_lr(args, epoch)
         for group in optimizer.param_groups:
             group["lr"] = phase_lr
@@ -3370,16 +2959,8 @@ def main() -> None:
             _decoder_time,
             epoch_time,
             epoch_timing,
-        ) = (
-            train_refiner_only_epoch(
-                model, refiner, optimizer, global_step, epoch, args, curriculum,
-                ema=ema,
-            )
-            if args.refiner_only
-            else train_epoch(
-                model, optimizer, global_step, epoch, args, curriculum, ema=ema,
-                refiner=refiner,
-            )
+        ) = train_epoch(
+            model, optimizer, global_step, epoch, args, curriculum, ema=ema
         )
         val_best = 0.0
         val_gap = None
@@ -3396,23 +2977,10 @@ def main() -> None:
 
             with _eval_context():
                 val_average, val_best, val_gap, val_metrics = validation(
-                    model, validation_data, args, refiner=refiner
+                    model, validation_data, args
                 )
-            typed_gate_pass = (
-                not args.learned_candidate_quotas
-                or (
-                    val_metrics.get("feasibility_rate", 0.0) == 1.0
-                    and val_metrics.get(
-                        "macro_baseline_improvement_percent", float("-inf")
-                    )
-                    >= -float(args.typed_noninferiority_margin)
-                )
-            )
-            val_metrics["typed_neighborhood_gate_pass"] = float(
-                typed_gate_pass
-            )
             validation_rank = _validation_rank(val_metrics, val_best)
-            if typed_gate_pass and validation_rank < best_validation_rank:
+            if validation_rank < best_validation_rank:
                 best_validation_rank = validation_rank
                 with _eval_context():
                     save_checkpoint(
@@ -3426,7 +2994,6 @@ def main() -> None:
                         best_validation_rank=best_validation_rank,
                         global_step=global_step,
                         validation_manifest=validation_manifest,
-                        refiner=refiner,
                     )
                 is_best = True
                 logger.info(

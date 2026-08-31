@@ -16,6 +16,8 @@
 #include <pybind11/stl.h>
 
 namespace py = pybind11;
+using prism::BoundHorizon;
+using prism::PrecedenceRelation;
 using prism::BACKHAUL_ORDER;
 using prism::CandidateConfig;
 using prism::CAPACITY;
@@ -31,6 +33,21 @@ using prism::ResourceSpec;
 using prism::ResourceOperator;
 using prism::ResourceDirection;
 using prism::ResourceScope;
+using prism::ResourceSemiring;
+
+// Spelling of a row's semiring in the published declaration. Kept next to the
+// parse above so the two directions cannot drift.
+static const char *semiring_name(ResourceSemiring semiring) {
+  switch (semiring) {
+  case ResourceSemiring::MAX_PLUS:
+    return "max_plus";
+  case ResourceSemiring::MIN_PLUS:
+    return "min_plus";
+  case ResourceSemiring::ARITHMETIC:
+    break;
+  }
+  return "arithmetic";
+}
 using prism::BoundCheck;
 using prism::SearchConfig;
 using prism::Solution;
@@ -232,6 +249,17 @@ std::vector<float> algebra_node_attribute(const py::dict &problem,
   return optional_vector(wrapper, "value", node_count, 0.0f);
 }
 
+std::vector<int32_t> algebra_index_attribute(const py::dict &problem,
+                                             const std::string &name,
+                                             int32_t node_count) {
+  const std::vector<float> values =
+      algebra_node_attribute(problem, name, node_count);
+  std::vector<int32_t> indices(values.size());
+  for (size_t i = 0; i < values.size(); ++i)
+    indices[i] = static_cast<int32_t>(std::lround(values[i]));
+  return indices;
+}
+
 std::vector<float> algebra_edge_attribute(const py::dict &problem,
                                           const std::string &name,
                                           int32_t node_count) {
@@ -268,30 +296,135 @@ std::vector<ResourceSpec> parse_resource_algebra(const py::dict &data,
           "resource row requires 'name' and 'operator'");
     spec.name = row["name"].cast<std::string>();
     const std::string op = row["operator"].cast<std::string>();
-    if (op != "affine_accumulator")
+    if (op == "affine_accumulator") {
+      spec.op = ResourceOperator::AFFINE_ACCUMULATOR;
+    } else if (op == "affine_max") {
+      // Retained spelling. `affine_max` was an operator family; it is now the
+      // affine family in the max-plus semiring, which is the same execution it
+      // always had. Declaring `semiring` explicitly is equivalent.
+      spec.op = ResourceOperator::AFFINE_ACCUMULATOR;
+      spec.semiring = ResourceSemiring::MAX_PLUS;
+    } else if (op == "precedence") {
+      spec.op = ResourceOperator::PRECEDENCE;
+    } else {
       throw std::invalid_argument("unknown resource operator: " + op);
-    spec.op = ResourceOperator::AFFINE_ACCUMULATOR;
+    }
+    if (row.contains("semiring")) {
+      const std::string semiring = row["semiring"].cast<std::string>();
+      if (semiring == "arithmetic")
+        spec.semiring = ResourceSemiring::ARITHMETIC;
+      else if (semiring == "max_plus")
+        spec.semiring = ResourceSemiring::MAX_PLUS;
+      else if (semiring == "min_plus")
+        spec.semiring = ResourceSemiring::MIN_PLUS;
+      else
+        throw std::invalid_argument("unknown resource semiring: " + semiring);
+    }
+    if (spec.op == ResourceOperator::PRECEDENCE) {
+      const std::string relation =
+          value_or<std::string>(row, "relation", "pairwise");
+      if (relation == "pairwise") {
+        spec.relation = PrecedenceRelation::PAIRWISE;
+        if (!row.contains("predecessor"))
+          throw std::invalid_argument(
+              "a pairwise precedence row requires 'predecessor'");
+        const py::dict reference = row["predecessor"].cast<py::dict>();
+        spec.predecessor = algebra_index_attribute(
+            data, reference["node_attribute"].cast<std::string>(), node_count);
+        // The inverse is derived, never declared twice: an obligation is opened
+        // at the predecessor and closed at the node that requires it.
+        spec.successor.assign(node_count, -1);
+        for (int32_t node = 0; node < node_count; ++node) {
+          const int32_t required = spec.predecessor[node];
+          if (required < -1 || required >= node_count)
+            throw std::invalid_argument("precedence predecessor out of range");
+          if (required >= 0) {
+            if (required == node)
+              throw std::invalid_argument("a node cannot precede itself");
+            if (spec.successor[required] >= 0)
+              throw std::invalid_argument(
+                  "a precedence predecessor may be required by one node only");
+            spec.successor[required] = node;
+          }
+        }
+      } else if (relation == "dag") {
+        spec.relation = PrecedenceRelation::DAG;
+        if (!row.contains("predecessors"))
+          throw std::invalid_argument(
+              "a dag precedence row requires 'predecessors'");
+        // One list of required predecessors per node, in node order. A CSR is
+        // built once here because admission reads it on every candidate edge.
+        const py::sequence rows = row["predecessors"].cast<py::sequence>();
+        if (static_cast<int32_t>(py::len(rows)) != node_count)
+          throw std::invalid_argument(
+              "dag 'predecessors' needs one entry per node");
+        spec.predecessor_offsets.assign(node_count + 1, 0);
+        spec.successor_count.assign(node_count, 0);
+        spec.predecessor_list.clear();
+        for (int32_t node = 0; node < node_count; ++node) {
+          const py::sequence required = rows[node].cast<py::sequence>();
+          for (const auto &item : required) {
+            const int32_t from = item.cast<int32_t>();
+            if (from < 0 || from >= node_count)
+              throw std::invalid_argument("precedence predecessor out of range");
+            if (from == node)
+              throw std::invalid_argument("a node cannot precede itself");
+            spec.predecessor_list.push_back(from);
+            spec.successor_count[from] += 1;
+          }
+          spec.predecessor_offsets[node + 1] =
+              static_cast<int32_t>(spec.predecessor_list.size());
+        }
+        // The counter starts at every relation outstanding and is discharged
+        // one in-edge at a time, so terminal feasibility is the same "nothing
+        // unresolved" test the matching relation uses. The scale that turns
+        // that counter into a fraction is pinned in the decoder, next to the
+        // pin it replaces, so there is one place a relation's unit is decided.
+        spec.initial = static_cast<float>(spec.predecessor_list.size());
+      } else if (relation == "class_order") {
+        spec.relation = PrecedenceRelation::CLASS_ORDER;
+        if (!row.contains("class"))
+          throw std::invalid_argument(
+              "a class_order precedence row requires 'class'");
+        const py::dict reference = row["class"].cast<py::dict>();
+        spec.node_class = algebra_index_attribute(
+            data, reference["node_attribute"].cast<std::string>(), node_count);
+        for (int32_t value : spec.node_class) {
+          if (value < 0)
+            throw std::invalid_argument("precedence class must be non-negative");
+        }
+      } else {
+        throw std::invalid_argument("unknown precedence relation: " + relation);
+      }
+    }
     spec.state_dim = value_or<int32_t>(row, "state_dim", 1);
     const std::string direction =
         value_or<std::string>(row, "direction", "forward");
-    spec.direction = direction == "forward"
-                         ? ResourceDirection::FORWARD
-                         : direction == "backward"
-                               ? ResourceDirection::BACKWARD
-                               : direction == "bidirectional"
-                                     ? ResourceDirection::BIDIRECTIONAL
-                                     : throw std::invalid_argument(
-                                           "unknown resource direction: " +
-                                           direction);
+    // Execution extends a route forward only. `backward` and `bidirectional`
+    // name real REF directions and keep their descriptor slots, but accepting
+    // them here would silently run forward semantics under a backward label, so
+    // they are rejected until the extension exists.
+    if (direction == "backward" || direction == "bidirectional")
+      throw std::invalid_argument(
+          "resource direction '" + direction +
+          "' is declared but not executed: extension is forward-only");
+    if (direction != "forward")
+      throw std::invalid_argument("unknown resource direction: " + direction);
+    spec.direction = ResourceDirection::FORWARD;
     const std::string scope = value_or<std::string>(row, "scope", "route");
-    spec.scope = scope == "route"
-                     ? ResourceScope::ROUTE
-                     : scope == "tour"
-                           ? ResourceScope::TOUR
-                           : scope == "solution"
-                                 ? ResourceScope::SOLUTION
-                                 : throw std::invalid_argument(
-                                       "unknown resource scope: " + scope);
+    // `tour` is indistinguishable from `solution` in execution -- only `route`
+    // resets at the depot -- so accepting it would silently run solution
+    // semantics under a different name.
+    if (scope == "tour")
+      throw std::invalid_argument(
+          "resource scope 'tour' is declared but not executed: it is "
+          "indistinguishable from 'solution'");
+    if (scope == "route")
+      spec.scope = ResourceScope::ROUTE;
+    else if (scope == "solution")
+      spec.scope = ResourceScope::SOLUTION;
+    else
+      throw std::invalid_argument("unknown resource scope: " + scope);
     if (row.contains("initial"))
       spec.initial = algebra_scalar(data, row["initial"], "initial");
     if (row.contains("scale"))
@@ -315,18 +448,211 @@ std::vector<ResourceSpec> parse_resource_algebra(const py::dict &data,
             data, increment["node_attribute"].cast<std::string>(), node_count);
       }
     }
+    // `clamp` is the older spelling of the same operand, from when the join was
+    // hardcoded to max. Both name one field; declaring both is a contradiction
+    // rather than a merge, so it is rejected.
+    if (row.contains("join") && row.contains("clamp"))
+      throw std::invalid_argument(
+          "declare either 'join' or its older spelling 'clamp', not both");
+    const char *operand_key = row.contains("join") ? "join" : "clamp";
+    if (row.contains(operand_key)) {
+      const py::dict operand = row[operand_key].cast<py::dict>();
+      if (operand.contains("node_attribute"))
+        spec.join_values = algebra_node_attribute(
+            data, operand["node_attribute"].cast<std::string>(), node_count);
+      else
+        spec.join_values.assign(
+            static_cast<size_t>(node_count),
+            algebra_scalar(data, operand["value"],
+                           row.contains("join") ? "join.value"
+                                                : "clamp.value"));
+    }
+    if (row.contains("departure")) {
+      const py::dict departure = row["departure"].cast<py::dict>();
+      spec.departure_coefficient =
+          value_or<float>(departure, "coefficient", 1.0f);
+      spec.departure_values = algebra_node_attribute(
+          data, departure["node_attribute"].cast<std::string>(), node_count);
+    }
     if (row.contains("reset")) {
       const py::dict reset = row["reset"].cast<py::dict>();
       spec.reset_value = reset.contains("value")
                              ? algebra_scalar(data, reset["value"], "reset.value")
                              : spec.initial;
       spec.reset_at_depot = value_or<bool>(reset, "at_depot", false);
+      // A reset value conditional on the work the route has left. `guard`
+      // names a node attribute and a sign; while some unserved node still
+      // matches, the reset installs `value`, and once none does it installs
+      // `otherwise`.
+      if (reset.contains("guard")) {
+        const py::dict guard = reset["guard"].cast<py::dict>();
+        if (!guard.contains("node_attribute"))
+          throw std::invalid_argument(
+              "reset.guard requires 'node_attribute'");
+        spec.reset_guard_values = algebra_node_attribute(
+            data, guard["node_attribute"].cast<std::string>(), node_count);
+        const std::string sign =
+            value_or<std::string>(guard, "sign", "positive");
+        if (sign == "positive")
+          spec.reset_guard_sign = 1.0f;
+        else if (sign == "negative")
+          spec.reset_guard_sign = -1.0f;
+        else
+          throw std::invalid_argument("unknown reset.guard sign: " + sign);
+        spec.reset_otherwise =
+            reset.contains("otherwise")
+                ? algebra_scalar(data, reset["otherwise"], "reset.otherwise")
+                : spec.initial;
+      } else if (reset.contains("otherwise")) {
+        throw std::invalid_argument(
+            "reset.otherwise has no meaning without reset.guard");
+      }
+      const bool optional_before_transition =
+          value_or<bool>(reset, "optional_before_transition", false);
+      spec.optional_reset_duration =
+          value_or<float>(reset, "duration", 0.0f);
       if (reset.contains("node_attribute")) {
         const std::vector<float> flags = algebra_node_attribute(
             data, reset["node_attribute"].cast<std::string>(), node_count);
-        spec.reset_nodes.resize(node_count);
-        std::transform(flags.begin(), flags.end(), spec.reset_nodes.begin(),
+        std::vector<uint8_t> &nodes = optional_before_transition
+                                          ? spec.optional_reset_nodes
+                                          : spec.reset_nodes;
+        nodes.resize(node_count);
+        std::transform(flags.begin(), flags.end(), nodes.begin(),
                        [](float value) { return value > 0.5f ? 1 : 0; });
+      } else if (optional_before_transition) {
+        throw std::invalid_argument(
+            "optional pre-transition reset requires node_attribute");
+      }
+    }
+    // Generic term list: the row states its own extension in the language's own
+    // coordinates rather than through named fields. `increment`, `departure`
+    // and `join` remain as the shorthand the instance generators emit; a row
+    // may use one form or the other, never both, because they would silently
+    // sum rather than conflict.
+    if (row.contains("terms")) {
+      // A row has one execution form.  All named forms lower to terms, so
+      // mixing them with an explicit term set would silently duplicate effects.
+      for (const char *named : {"increment", "departure", "join", "clamp",
+                                "reset"}) {
+        if (row.contains(named))
+          throw std::invalid_argument(
+              std::string("declare either 'terms' or the shorthand '") + named +
+              "', not both");
+      }
+      for (const py::handle handle : row["terms"].cast<py::list>()) {
+        const py::dict entry = py::reinterpret_borrow<py::dict>(handle);
+        prism::ResourceTerm term;
+        term.coefficient = value_or<float>(entry, "coefficient", 1.0f);
+
+        const std::string operation =
+            value_or<std::string>(entry, "op", "add");
+        if (operation == "add")
+          term.operation = prism::TermOperation::ADD;
+        else if (operation == "join")
+          term.operation = prism::TermOperation::JOIN;
+        else if (operation == "assign")
+          term.operation = prism::TermOperation::ASSIGN;
+        else if (operation == "checkpoint")
+          term.operation = prism::TermOperation::CHECKPOINT;
+        else if (operation == "restore")
+          term.operation = prism::TermOperation::RESTORE;
+        else
+          throw std::invalid_argument("unknown term operation: " + operation);
+
+        const std::string phase =
+            value_or<std::string>(entry, "phase", "before_bound");
+        if (phase == "before_bound")
+          term.phase = prism::TermPhase::BEFORE_BOUND;
+        else if (phase == "after_bound")
+          term.phase = prism::TermPhase::AFTER_BOUND;
+        else
+          throw std::invalid_argument("unknown term phase: " + phase);
+
+        const std::string when =
+            value_or<std::string>(entry, "when", "always");
+        if (when == "always")
+          term.trigger = prism::TermTrigger::ALWAYS;
+        else if (when == "reset_departure")
+          term.trigger = prism::TermTrigger::RESET_DEPARTURE;
+        else if (when == "reset_arrival")
+          term.trigger = prism::TermTrigger::RESET_ARRIVAL;
+        else if (when == "bound_failure")
+          term.trigger = prism::TermTrigger::BOUND_FAILURE;
+        else if (when == "checkpoint_arrival")
+          term.trigger = prism::TermTrigger::CHECKPOINT_ARRIVAL;
+        else
+          throw std::invalid_argument("unknown term trigger: " + when);
+
+        term.trigger_at_depot = value_or<bool>(entry, "at_depot", false);
+        if (entry.contains("at_nodes")) {
+          const py::dict selector = entry["at_nodes"].cast<py::dict>();
+          if (!selector.contains("node_attribute"))
+            throw std::invalid_argument(
+                "term.at_nodes requires node_attribute");
+          const std::vector<float> flags = algebra_node_attribute(
+              data, selector["node_attribute"].cast<std::string>(),
+              node_count);
+          term.trigger_nodes.resize(node_count);
+          std::transform(flags.begin(), flags.end(), term.trigger_nodes.begin(),
+                         [](float value) { return value > 0.5f ? 1 : 0; });
+        }
+
+        if (entry.contains("gate")) {
+          const py::dict gate = entry["gate"].cast<py::dict>();
+          if (!gate.contains("node_attribute"))
+            throw std::invalid_argument(
+                "term.gate requires node_attribute");
+          term.gate_values = algebra_node_attribute(
+              data, gate["node_attribute"].cast<std::string>(), node_count);
+          const std::string sign =
+              value_or<std::string>(gate, "sign", "positive");
+          if (sign == "positive")
+            term.gate_sign = 1.0f;
+          else if (sign == "negative")
+            term.gate_sign = -1.0f;
+          else
+            throw std::invalid_argument("unknown term gate sign: " + sign);
+          const std::string branch =
+              value_or<std::string>(gate, "branch", "default");
+          if (branch == "default")
+            term.gate = prism::TermGate::REMAINDER_DEFAULT;
+          else if (branch == "alternative")
+            term.gate = prism::TermGate::REMAINDER_ALTERNATIVE;
+          else
+            throw std::invalid_argument("unknown term gate branch: " + branch);
+        }
+
+        const std::string at = value_or<std::string>(entry, "at", "to");
+        if (at == "to")
+          term.point = prism::TermPoint::TO;
+        else if (at == "from")
+          term.point = prism::TermPoint::FROM;
+        else
+          throw std::invalid_argument("unknown term read point: " + at);
+
+        if (entry.contains("node_attribute")) {
+          term.source = prism::TermSource::NODE_ATTRIBUTE;
+          term.values = algebra_node_attribute(
+              data, entry["node_attribute"].cast<std::string>(), node_count);
+        } else if (entry.contains("edge_attribute")) {
+          const std::string attribute =
+              entry["edge_attribute"].cast<std::string>();
+          if (attribute == "distance") {
+            term.source = prism::TermSource::DISTANCE;
+          } else {
+            term.source = prism::TermSource::EDGE_ATTRIBUTE;
+            term.values = algebra_edge_attribute(data, attribute, node_count);
+          }
+        } else if (entry.contains("value")) {
+          term.source = prism::TermSource::CONSTANT;
+          term.constant = algebra_scalar(data, entry["value"], "term.value");
+        } else if (term.operation != prism::TermOperation::RESTORE) {
+          throw std::invalid_argument(
+              "a term needs one of 'node_attribute', 'edge_attribute' or "
+              "'value'");
+        }
+        spec.terms.push_back(std::move(term));
       }
     }
     if (row.contains("bounds")) {
@@ -335,10 +661,26 @@ std::vector<ResourceSpec> parse_resource_algebra(const py::dict &data,
         throw std::invalid_argument(
             "resource algebra v1 requires exactly one bound row");
       const py::dict bound = py::reinterpret_borrow<py::dict>(bounds[0]);
-      if (bound.contains("lower"))
-        spec.lower = algebra_scalar(data, bound["lower"], "bound.lower");
-      if (bound.contains("upper"))
-        spec.upper = algebra_scalar(data, bound["upper"], "bound.upper");
+      // A bound side may be a scalar or, for a window that varies node by
+      // node, a named node attribute.
+      const auto read_side = [&](const char *side, float &scalar,
+                                 std::vector<float> &values) {
+        if (!bound.contains(side))
+          return;
+        const py::handle value = bound[side];
+        if (py::isinstance<py::dict>(value)) {
+          const py::dict reference = py::reinterpret_borrow<py::dict>(value);
+          if (reference.contains("node_attribute")) {
+            values = algebra_node_attribute(
+                data, reference["node_attribute"].cast<std::string>(),
+                node_count);
+            return;
+          }
+        }
+        scalar = algebra_scalar(data, value, side);
+      };
+      read_side("lower", spec.lower, spec.lower_values);
+      read_side("upper", spec.upper, spec.upper_values);
       const std::string check =
           value_or<std::string>(bound, "check", "transition");
       spec.bound_check = check == "transition"
@@ -350,6 +692,38 @@ std::vector<ResourceSpec> parse_resource_algebra(const py::dict &data,
                                          : throw std::invalid_argument(
                                                "unknown resource bound phase: " +
                                                check);
+      const std::string horizon =
+          value_or<std::string>(bound, "horizon", "transition");
+      spec.horizon =
+          horizon == "transition"
+              ? BoundHorizon::TRANSITION
+              : horizon == "return"
+                    ? BoundHorizon::RETURN
+                    : horizon == "return_construction"
+                          ? BoundHorizon::RETURN_CONSTRUCTION
+                          : throw std::invalid_argument(
+                                "unknown resource bound horizon: " + horizon);
+    }
+    static const char *kExtensionKeys[] = {
+        "increment", "reset",     "bounds",    "join",      "clamp",
+        "departure", "initial",   "state_dim", "semiring",  "terms"};
+    static const char *kRelationKeys[] = {"relation", "predecessor",
+                                         "predecessors", "class"};
+    // A key this operator does not read would be silently ignored, which is how
+    // a declaration ends up meaning something other than it says.
+    if (spec.op == ResourceOperator::PRECEDENCE) {
+      for (const char *key : kExtensionKeys) {
+        if (row.contains(key))
+          throw std::invalid_argument(
+              std::string("a precedence row has no '") + key +
+              "': it accumulates nothing");
+      }
+    } else {
+      for (const char *key : kRelationKeys) {
+        if (row.contains(key))
+          throw std::invalid_argument(
+              std::string("only a precedence row declares '") + key + "'");
+      }
     }
     result.push_back(std::move(spec));
   }
@@ -449,15 +823,6 @@ CandidateConfig parse_candidate_config(const py::dict &data) {
 #define CONFIG_INT(field)                                                      \
   config.field = value_or<int32_t>(data, #field, config.field)
   CONFIG_INT(max_candidates);
-  if (data.contains("candidate_mode")) {
-    const std::string mode = data["candidate_mode"].cast<std::string>();
-    if (mode == "schema")
-      config.candidate_mode = prism::CandidateMode::SCHEMA;
-    else if (mode == "geometric")
-      config.candidate_mode = prism::CandidateMode::GEOMETRIC;
-    else
-      throw std::invalid_argument("unknown candidate_mode: " + mode);
-  }
 #undef CONFIG_INT
   return config;
 }
@@ -658,10 +1023,15 @@ py::dict trace_to_dict(const DecisionTrace &trace, int32_t resource_count) {
   result["screened_edges"] = vector_copy<int32_t>(
       trace.screened_edges,
       {static_cast<py::ssize_t>(trace.screened_edges.size())});
+  const py::ssize_t screened_rows =
+      static_cast<py::ssize_t>(trace.screened_edges.size());
   result["screened_resource_delta"] = vector_copy<float>(
       trace.screened_resource_delta,
-      {static_cast<py::ssize_t>(trace.screened_edges.size()),
-       prism::FIELD_CHANNEL_COUNT});
+      {screened_rows,
+       screened_rows > 0
+           ? static_cast<py::ssize_t>(trace.screened_resource_delta.size()) /
+                 screened_rows
+           : 0});
   result["screening_fast_evaluations"] = trace.screening_fast_evaluations;
   result["screening_fallback_evaluations"] =
       trace.screening_fallback_evaluations;
@@ -669,10 +1039,9 @@ py::dict trace_to_dict(const DecisionTrace &trace, int32_t resource_count) {
       trace.screening_verification_failures;
   result["screening_verification_failures_by_channel"] =
       vector_copy<int64_t>(
-          std::vector<int64_t>(
-              trace.screening_verification_failures_by_channel.begin(),
-              trace.screening_verification_failures_by_channel.end()),
-          {prism::FIELD_CHANNEL_COUNT});
+          trace.screening_verification_failures_by_channel,
+          {static_cast<py::ssize_t>(
+              trace.screening_verification_failures_by_channel.size())});
   return result;
 }
 
@@ -958,6 +1327,8 @@ public:
     result["objective_coeffs"] = std::move(objective_coeffs);
     result["multi_route"] = problem.multi_route;
     result["open_route"] = problem.open_route;
+    result["metric_symmetric"] = solver_.metric_symmetric();
+    result["metric_skew"] = solver_.metric_skew();
     result["edge_count"] = solver_.edge_count();
     result["graph_version"] = solver_.graph_version();
     result["guidance_mode"] = "energy";
@@ -969,20 +1340,7 @@ public:
           std::max(maximum_degree, offsets[node] - offsets[node - 1]);
     }
     result["maximum_degree"] = maximum_degree;
-    const CandidateConfig &config = solver_.candidate_config();
-    bool any_active_resource = false;
-    for (const auto &spec : solver_.resources())
-      any_active_resource |= spec.active;
-    result["candidate_strategy"] =
-        config.candidate_mode == prism::CandidateMode::GEOMETRIC ||
-                !any_active_resource
-            ? "distance"
-            : solver_.candidate_resource_quotas().empty()
-                  ? "uniform_schema"
-                  : "typed_resource_quota";
-    result["candidate_resource_quotas"] = vector_copy<float>(
-        solver_.candidate_resource_quotas(),
-        {static_cast<py::ssize_t>(solver_.candidate_resource_quotas().size())});
+    result["candidate_strategy"] = "distance";
     result["candidate_feature_names"] = prism::candidate_feature_names();
     result["field_channel_names"] = prism::field_channel_names();
     py::list resource_rows;
@@ -992,17 +1350,26 @@ public:
       row["active"] = resource.active;
       row["state_dim"] = resource.state_dim;
       row["operator"] = prism::resource_kernel(resource.op).name;
+      row["semiring"] = semiring_name(resource.semiring);
       resource_rows.append(std::move(row));
     }
     result["resources"] = std::move(resource_rows);
     result["resource_count"] = solver_.resource_count();
     result["multiplier_count"] = solver_.multiplier_count();
-    result["resource_descriptor_version"] = "resource_descriptor_v1";
+    result["resource_program_version"] = "resource_terms_v1";
     result["node_feature_names"] = prism::node_feature_names();
     std::vector<uint8_t> active_channels;
     active_channels.reserve(solver_.resource_count());
-    for (const ResourceSpec &resource : solver_.resources())
+    std::vector<std::string> resource_names;
+    resource_names.reserve(solver_.resource_count());
+    for (const ResourceSpec &resource : solver_.resources()) {
       active_channels.push_back(static_cast<uint8_t>(resource.active));
+      resource_names.push_back(resource.name);
+    }
+    // Registry order for THIS problem. A row's position depends on which
+    // constraints the instance declares, so it cannot be read off a global
+    // channel list.
+    result["resource_names"] = resource_names;
     result["field_channel_mask"] = vector_copy<uint8_t>(
         active_channels, {solver_.resource_count()});
     const SearchConfig &search = solver_.search_config();
@@ -1030,6 +1397,13 @@ public:
         {solver_.edge_count(), prism::EDGE_FEATURE_COUNT});
   }
 
+  py::array_t<float> node_resource_features() const {
+    return vector_copy<float>(
+        solver_.node_resource_features(),
+        {solver_.problem().node_count, solver_.resource_count(),
+         prism::NODE_RESOURCE_FEATURE_COUNT});
+  }
+
   py::array_t<float> node_features() const {
     return vector_copy<float>(
         solver_.node_features(),
@@ -1040,6 +1414,38 @@ public:
     return vector_copy<float>(
         solver_.incumbent_live_state(),
         {solver_.problem().node_count, solver_.live_state_feature_count()});
+  }
+
+  py::array_t<float> node_objective_features() const {
+    return vector_copy<float>(solver_.node_objective_features(),
+                              {solver_.problem().node_count,
+                               prism::OBJECTIVE_NODE_TERM_COUNT});
+  }
+
+  py::array_t<float> incumbent_suffix_state() const {
+    return vector_copy<float>(
+        solver_.incumbent_suffix_state(),
+        {solver_.problem().node_count, solver_.live_state_feature_count()});
+  }
+
+  py::array_t<float> incumbent_suffix_features() const {
+    return vector_copy<float>(
+        solver_.incumbent_suffix_features(),
+        {solver_.problem().node_count, solver_.resource_count(),
+         prism::RESOURCE_SUFFIX_FEATURE_COUNT});
+  }
+
+  py::array_t<float> incumbent_transition_features() const {
+    return vector_copy<float>(
+        solver_.incumbent_transition_features(),
+        {solver_.edge_count(), solver_.resource_count(),
+         prism::RESOURCE_TRANSITION_FEATURE_COUNT});
+  }
+
+  py::array_t<uint8_t> incumbent_transition_feature_mask() const {
+    return vector_copy<uint8_t>(
+        solver_.incumbent_transition_feature_mask(),
+        {solver_.edge_count(), solver_.resource_count()});
   }
 
   py::array_t<float> resource_features() const {
@@ -1054,6 +1460,12 @@ public:
         {solver_.edge_count(), solver_.resource_count()});
   }
 
+  py::array_t<float> compiled_resource_pressure() const {
+    return vector_copy<float>(
+        solver_.compiled_resource_pressures(),
+        {solver_.edge_count(), solver_.resource_count()});
+  }
+
   py::array_t<float> resource_events() const {
     return vector_copy<float>(
         solver_.resource_events(),
@@ -1065,10 +1477,182 @@ public:
                               {solver_.resource_count()});
   }
 
-  py::array_t<float> resource_descriptors() const {
+  // The declarative resource row each registry entry implements. A compiled
+  // kernel is an execution fast path for the row it publishes here, so the row
+  // -- not the kernel enum -- defines the semantics, drives the properties, and
+  // is what tests replay to prove the two agree. `declared` is false for the
+  // kernels whose semantics the language cannot yet express.
+  py::list resource_declarations() const {
+    py::list rows;
+    for (int32_t index = 0; index < solver_.resource_count(); ++index) {
+      bool declared = false;
+      const prism::ResourceSpec spec = solver_.declared_algebra(index, &declared);
+      py::dict row;
+      row["name"] = spec.name;
+      row["active"] = spec.active;
+      row["declared"] = declared;
+      // Which compiled kernel executes this row, or "" when the declarative
+      // interpreter does. This used to read the row's operator, which named the
+      // kernel only while a row's operator doubled as a constraint identity.
+      row["kernel"] = prism::fast_path_name(
+          solver_.resources()[index].fast_path);
+      row["operator"] = prism::resource_kernel(spec.op).name;
+      row["semiring"] = semiring_name(spec.semiring);
+      if (!declared) {
+        rows.append(std::move(row));
+        continue;
+      }
+      if (spec.op == prism::ResourceOperator::PRECEDENCE) {
+        row["relation"] = spec.relation == PrecedenceRelation::PAIRWISE
+                              ? "pairwise"
+                              : "class_order";
+        row["predecessor"] = vector_copy<int32_t>(
+            spec.predecessor,
+            {static_cast<py::ssize_t>(spec.predecessor.size())});
+        row["class"] = vector_copy<int32_t>(
+            spec.node_class,
+            {static_cast<py::ssize_t>(spec.node_class.size())});
+        row["scope"] = spec.scope == prism::ResourceScope::ROUTE
+                           ? "route"
+                           : spec.scope == prism::ResourceScope::TOUR
+                                 ? "tour"
+                                 : "solution";
+        rows.append(std::move(row));
+        continue;
+      }
+      row["state_dim"] = spec.state_dim;
+      row["direction"] = spec.direction == prism::ResourceDirection::FORWARD
+                             ? "forward"
+                             : spec.direction ==
+                                       prism::ResourceDirection::BACKWARD
+                                   ? "backward"
+                                   : "bidirectional";
+      row["scope"] = spec.scope == prism::ResourceScope::ROUTE
+                         ? "route"
+                         : spec.scope == prism::ResourceScope::TOUR ? "tour"
+                                                                    : "solution";
+      row["initial"] = spec.initial;
+      row["scale"] = spec.scale;
+      // Canonical execution form. Reset, join, opening and optional checkpoint
+      // restore are terms here; no named execution block survives publication.
+      py::list terms;
+      for (const prism::ResourceTerm &term : spec.terms) {
+        py::dict entry;
+        switch (term.operation) {
+        case prism::TermOperation::ADD:
+          entry["op"] = "add";
+          break;
+        case prism::TermOperation::JOIN:
+          entry["op"] = "join";
+          break;
+        case prism::TermOperation::ASSIGN:
+          entry["op"] = "assign";
+          break;
+        case prism::TermOperation::CHECKPOINT:
+          entry["op"] = "checkpoint";
+          break;
+        case prism::TermOperation::RESTORE:
+          entry["op"] = "restore";
+          break;
+        }
+        entry["phase"] = term.phase == prism::TermPhase::BEFORE_BOUND
+                             ? "before_bound"
+                             : "after_bound";
+        switch (term.trigger) {
+        case prism::TermTrigger::ALWAYS:
+          entry["when"] = "always";
+          break;
+        case prism::TermTrigger::RESET_DEPARTURE:
+          entry["when"] = "reset_departure";
+          break;
+        case prism::TermTrigger::RESET_ARRIVAL:
+          entry["when"] = "reset_arrival";
+          break;
+        case prism::TermTrigger::BOUND_FAILURE:
+          entry["when"] = "bound_failure";
+          break;
+        case prism::TermTrigger::CHECKPOINT_ARRIVAL:
+          entry["when"] = "checkpoint_arrival";
+          break;
+        }
+        entry["at"] = term.point == prism::TermPoint::FROM ? "from" : "to";
+        entry["coefficient"] = term.coefficient;
+        entry["at_depot"] = term.trigger_at_depot;
+        entry["trigger_nodes"] = vector_copy<uint8_t>(
+            term.trigger_nodes,
+            {static_cast<py::ssize_t>(term.trigger_nodes.size())});
+        entry["gate"] = term.gate == prism::TermGate::REMAINDER_DEFAULT
+                            ? "remainder_default"
+                        : term.gate ==
+                                  prism::TermGate::REMAINDER_ALTERNATIVE
+                            ? "remainder_alternative"
+                            : "always";
+        entry["gate_sign"] = term.gate_sign;
+        entry["gate_values"] = vector_copy<float>(
+            term.gate_values,
+            {static_cast<py::ssize_t>(term.gate_values.size())});
+        switch (term.source) {
+        case prism::TermSource::DISTANCE:
+          entry["source"] = "distance";
+          break;
+        case prism::TermSource::EDGE_ATTRIBUTE:
+          entry["source"] = "edge_attribute";
+          break;
+        case prism::TermSource::NODE_ATTRIBUTE:
+          entry["source"] = "node_attribute";
+          break;
+        case prism::TermSource::CONSTANT:
+          entry["source"] = "value";
+          entry["value"] = term.constant;
+          break;
+        }
+        entry["values"] = vector_copy<float>(
+            term.values, {static_cast<py::ssize_t>(term.values.size())});
+        terms.append(std::move(entry));
+      }
+      row["terms"] = std::move(terms);
+      py::dict bound;
+      bound["lower"] = spec.lower;
+      bound["upper"] = spec.upper;
+      bound["lower_values"] = vector_copy<float>(
+          spec.lower_values,
+          {static_cast<py::ssize_t>(spec.lower_values.size())});
+      bound["upper_values"] = vector_copy<float>(
+          spec.upper_values,
+          {static_cast<py::ssize_t>(spec.upper_values.size())});
+      bound["check"] = spec.bound_check == prism::BoundCheck::TRANSITION
+                           ? "transition"
+                           : spec.bound_check == prism::BoundCheck::ROUTE_END
+                                 ? "route_end"
+                                 : "solution_end";
+      bound["horizon"] =
+          spec.horizon == BoundHorizon::TRANSITION
+              ? "transition"
+              : spec.horizon == BoundHorizon::RETURN ? "return"
+                                                     : "return_construction";
+      row["bounds"] = py::make_tuple(std::move(bound));
+      rows.append(std::move(row));
+    }
+    return rows;
+  }
+
+  py::array_t<float> resource_row_properties() const {
     return vector_copy<float>(
-        solver_.resource_descriptors(),
-        {solver_.resource_count(), prism::RESOURCE_DESCRIPTOR_DIM});
+        solver_.resource_row_properties(),
+        {solver_.resource_count(), prism::RESOURCE_ROW_PROPERTY_DIM});
+  }
+
+  py::array_t<float> resource_term_properties() const {
+    const py::ssize_t terms = static_cast<py::ssize_t>(
+        solver_.resource_term_properties().size() /
+        prism::RESOURCE_TERM_PROPERTY_DIM);
+    return vector_copy<float>(solver_.resource_term_properties(),
+                              {terms, prism::RESOURCE_TERM_PROPERTY_DIM});
+  }
+
+  py::array_t<int32_t> resource_term_counts() const {
+    return vector_copy<int32_t>(solver_.resource_term_counts(),
+                                {solver_.resource_count()});
   }
 
   py::array_t<float> objective_edge_costs() const {
@@ -1115,16 +1699,6 @@ public:
     const int32_t *values = static_cast<const int32_t *>(buffer.ptr);
     solver_.set_incumbent(
         std::vector<int32_t>(values, values + buffer.shape[0]));
-  }
-
-  void set_candidate_resource_quotas(
-      py::array_t<float, py::array::c_style | py::array::forcecast> quotas) {
-    const py::buffer_info buffer = quotas.request();
-    if (buffer.ndim != 1)
-      throw std::invalid_argument("candidate resource quotas must be one-dimensional");
-    const float *values = static_cast<const float *>(buffer.ptr);
-    solver_.set_candidate_resource_quotas(
-        std::vector<float>(values, values + buffer.shape[0]));
   }
 
 private:
@@ -1196,22 +1770,43 @@ PYBIND11_MODULE(prism_decoder, module) {
       .def("evaluate_resources", &PyDecoder::evaluate_resources,
            py::arg("route"))
       .def("set_incumbent", &PyDecoder::set_incumbent, py::arg("route"))
-      .def("set_candidate_resource_quotas",
-           &PyDecoder::set_candidate_resource_quotas, py::arg("quotas"))
       .def("mask", &PyDecoder::mask, py::arg("prefix"))
       .def_property_readonly("metadata", &PyDecoder::metadata)
       .def_property_readonly("edge_features", &PyDecoder::edge_features)
       .def_property_readonly("node_features", &PyDecoder::node_features)
+      .def_property_readonly("node_resource_features",
+                             &PyDecoder::node_resource_features)
       .def_property_readonly("incumbent_live_state",
                              &PyDecoder::incumbent_live_state)
+      .def_property_readonly("incumbent_suffix_state",
+                             &PyDecoder::incumbent_suffix_state)
+      .def_property_readonly("incumbent_suffix_features",
+                             &PyDecoder::incumbent_suffix_features)
+      .def_property_readonly("incumbent_transition_features",
+                             &PyDecoder::incumbent_transition_features)
+      .def_property_readonly("incumbent_transition_feature_mask",
+                             &PyDecoder::incumbent_transition_feature_mask)
+      .def_property_readonly("node_objective_features",
+                             &PyDecoder::node_objective_features)
       .def_property_readonly("resource_features",
                              &PyDecoder::resource_features)
       .def_property_readonly("resource_pressure",
                              &PyDecoder::resource_pressure)
+      // Diagnostic reference: each registry row priced by its own kernel rather
+      // than by the declaration it publishes. Equal to resource_pressure
+      // wherever a published row is faithful.
+      .def_property_readonly("compiled_resource_pressure",
+                             &PyDecoder::compiled_resource_pressure)
       .def_property_readonly("resource_events", &PyDecoder::resource_events)
       .def_property_readonly("resource_scales", &PyDecoder::resource_scales)
-      .def_property_readonly("resource_descriptors",
-                             &PyDecoder::resource_descriptors)
+      .def_property_readonly("resource_row_properties",
+                             &PyDecoder::resource_row_properties)
+      .def_property_readonly("resource_term_properties",
+                             &PyDecoder::resource_term_properties)
+      .def_property_readonly("resource_term_counts",
+                             &PyDecoder::resource_term_counts)
+      .def_property_readonly("resource_declarations",
+                             &PyDecoder::resource_declarations)
       .def_property_readonly("objective_edge_costs",
                              &PyDecoder::objective_edge_costs)
       .def_property_readonly("objective_energy_scale",
@@ -1226,7 +1821,17 @@ PYBIND11_MODULE(prism_decoder, module) {
   module.attr("NODE_FEATURE_COUNT") = prism::NODE_FEATURE_COUNT;
   module.attr("EDGE_FEATURE_COUNT") = prism::EDGE_FEATURE_COUNT;
   module.attr("FIELD_CHANNEL_COUNT") = prism::FIELD_CHANNEL_COUNT;
-  module.attr("LIVE_STATE_FEATURE_COUNT") = prism::LIVE_STATE_FEATURE_COUNT;
-  module.attr("MULTIPLIER_COUNT") = prism::MULTIPLIER_COUNT;
-  module.attr("RESOURCE_DESCRIPTOR_DIM") = prism::RESOURCE_DESCRIPTOR_DIM;
+  module.attr("OBJECTIVE_NODE_TERM_COUNT") = prism::OBJECTIVE_NODE_TERM_COUNT;
+
+
+  module.attr("RESOURCE_ROW_PROPERTY_DIM") =
+      prism::RESOURCE_ROW_PROPERTY_DIM;
+  module.attr("RESOURCE_TERM_PROPERTY_DIM") =
+      prism::RESOURCE_TERM_PROPERTY_DIM;
+  module.attr("NODE_RESOURCE_FEATURE_COUNT") =
+      prism::NODE_RESOURCE_FEATURE_COUNT;
+  module.attr("RESOURCE_SUFFIX_FEATURE_COUNT") =
+      prism::RESOURCE_SUFFIX_FEATURE_COUNT;
+  module.attr("RESOURCE_TRANSITION_FEATURE_COUNT") =
+      prism::RESOURCE_TRANSITION_FEATURE_COUNT;
 }

@@ -2,6 +2,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import torch
 import pytest
 
 
@@ -136,6 +137,16 @@ def test_search_configuration_is_exposed() -> None:
     }
 
 
+def _registry(solver) -> list[str]:
+    """Registry order for THIS problem.
+
+    A row's position depends on which constraints the instance declares, so it
+    cannot be read off a global list: prism_decoder.FIELD_CHANNEL_NAMES
+    enumerates the compiled fast paths, not any one problem's rows.
+    """
+    return list(solver.metadata["resource_names"])
+
+
 def test_random_escape_lets_flat_constant_guidance_spend_budget() -> None:
     coordinates, distance = euclidean_problem(18, 1)
     problem = {
@@ -143,10 +154,6 @@ def test_random_escape_lets_flat_constant_guidance_spend_budget() -> None:
         "coordinates": coordinates,
         "distance": distance,
     }
-    constant_multipliers = np.zeros(
-        prism_decoder.MULTIPLIER_COUNT, dtype=np.float32
-    )
-
     incumbent_solver = make_decoder(
         problem,
         candidate_config={"max_candidates": 17},
@@ -155,6 +162,12 @@ def test_random_escape_lets_flat_constant_guidance_spend_budget() -> None:
         beta=2.0,
     )
     incumbent_solver.seed(9001)
+    # Multiplier width is a per-problem fact: one slot per registry row plus the
+    # objective slot. A TSP declares no constraint, so this is the objective
+    # slot alone.
+    constant_multipliers = np.zeros(
+        incumbent_solver.metadata["multiplier_count"], dtype=np.float32
+    )
     bootstrap = incumbent_solver.sample_greedy(
         multipliers=constant_multipliers
     )
@@ -316,6 +329,11 @@ def test_candidate_graph_keeps_required_depot_overlay() -> None:
 def test_incremental_screening_resources_match_full_evaluation_and_search(
     variant: str,
 ) -> None:
+    # generated_problem draws from the global torch RNG, so without a seed the
+    # instance depends on whichever tests ran first -- and the coverage
+    # assertions below (that the certified and incremental SRR paths are
+    # exercised at all) are instance-dependent.
+    torch.manual_seed(20260828)
     problem = generated_problem(variant, 50 if variant == "pctsp" else 30, 20)
 
     def make_solver(verify: bool) -> prism_decoder.Decoder:
@@ -371,21 +389,14 @@ def test_typed_field_mode_is_exposed_and_feasible() -> None:
         {"name": "tsp", "coordinates": coordinates, "distance": distance},
         n_rollouts=8,
     )
-    channels = list(prism_decoder.FIELD_CHANNEL_NAMES)
-    assert channels == [
-        "capacity",
-        "time_window",
-        "route_limit",
-        "tour_limit",
-        "backhaul_order",
-        "pickup_delivery",
-        "prize_quota",
-    ]
+    # A TSP declares no constraint, so it carries no resource rows at all. The
+    # registry used to open with one inactive row per compiled channel, which is
+    # why this asserted seven names and an all-zero mask; a row's presence now
+    # means the problem declared it, so the mask has no zeros left to check.
+    channels = _registry(solver)
+    assert channels == []
     assert solver.metadata["guidance_mode"] == "energy"
-    assert np.array_equal(
-        solver.metadata["field_channel_mask"],
-        np.zeros(len(channels), dtype=np.uint8),
-    )
+    assert solver.metadata["field_channel_mask"].shape == (0,)
 
     default_energy = solver.solve(1)
     assert default_energy["feasible"]
@@ -393,8 +404,8 @@ def test_typed_field_mode_is_exposed_and_feasible() -> None:
     field = np.ones(
         (solver.metadata["edge_count"], len(channels)), dtype=np.float32
     )
-    multipliers = np.zeros(prism_decoder.MULTIPLIER_COUNT, dtype=np.float32)
-    multipliers[prism_decoder.FIELD_CHANNEL_COUNT] = 1.0
+    multipliers = np.zeros(solver.metadata["multiplier_count"], dtype=np.float32)
+    multipliers[-1] = 1.0
     version = solver.graph_version
     result = solver.solve(2, edge_field=field, multipliers=multipliers)
 
@@ -424,7 +435,7 @@ def test_all_decoder_gnn_inputs_are_normalized() -> None:
     for values, width in (
         (solver.node_features, prism_decoder.NODE_FEATURE_COUNT),
         (solver.edge_features, prism_decoder.EDGE_FEATURE_COUNT),
-        (solver.resource_features, prism_decoder.FIELD_CHANNEL_COUNT),
+        (solver.resource_features, solver.metadata["resource_count"]),
     ):
         assert values.ndim == 2
         assert values.shape[1] == width
@@ -434,7 +445,7 @@ def test_all_decoder_gnn_inputs_are_normalized() -> None:
 
     solver.seed(2121)
     solver.solve(1)
-    assert np.any(solver.node_features[:, 12] == 1.0)
+    assert np.any(solver.node_features[:, 5] == 1.0)
     assert np.isfinite(solver.node_features).all()
     assert np.all((solver.node_features >= 0.0) & (solver.node_features <= 1.0))
 
@@ -464,7 +475,7 @@ def test_incumbent_live_state_matches_transition_scales_and_timing() -> None:
 
     solver.set_incumbent(np.array([0, 1, 2, 3, 0], dtype=np.int32))
 
-    channels = list(prism_decoder.FIELD_CHANNEL_NAMES)
+    channels = _registry(solver)
     live = solver.incumbent_live_state[1]
     assert live[channels.index("time_window")] == pytest.approx(4.0 / 30.0)
     assert live[channels.index("route_limit")] == pytest.approx(2.0 / 20.0)
@@ -495,7 +506,7 @@ def test_incumbent_tour_state_uses_tour_limit() -> None:
 
     solver.set_incumbent(np.array([0, 1, 2, 3, 0], dtype=np.int32))
 
-    channels = list(prism_decoder.FIELD_CHANNEL_NAMES)
+    channels = _registry(solver)
     live = solver.incumbent_live_state[1]
     assert live[channels.index("tour_limit")] == pytest.approx(2.0 / 20.0)
 
@@ -515,13 +526,12 @@ def test_resource_features_use_exported_cpp_scales() -> None:
 
     scales = solver.resource_scales
     expected = np.clip(solver.resource_pressure / scales[None, :], 0.0, 1.0)
-    assert scales.shape == (prism_decoder.FIELD_CHANNEL_COUNT,)
+    assert scales.shape == (solver.metadata["resource_count"],)
     assert np.all(scales > 0.0)
     assert np.allclose(solver.resource_features, expected)
-    assert np.allclose(
-        solver.edge_features[:, 1 : 1 + prism_decoder.FIELD_CHANNEL_COUNT],
-        expected,
-    )
+    # The per-channel copy that used to sit in edge_features slots 1..7 is gone;
+    # resource_features is the single per-resource carrier.
+    assert "capacity" not in prism_decoder.CANDIDATE_FEATURE_NAMES
 
     resources = solver.evaluate_resources(np.array([0, 1, 2, 0]))
     assert resources["structurally_valid"]
@@ -547,15 +557,20 @@ def test_resource_semantics_are_invariant_to_physical_unit_rescaling() -> None:
 
     reference = make_solver(1.0)
     scaled = make_solver(100.0)
-    capacity = list(prism_decoder.FIELD_CHANNEL_NAMES).index("capacity")
+    capacity = _registry(reference).index("capacity")
 
     assert scaled.resource_scales[capacity] == pytest.approx(
         100.0 * reference.resource_scales[capacity]
     )
     assert np.allclose(reference.resource_features, scaled.resource_features)
     assert np.allclose(
-        reference.resource_descriptors,
-        scaled.resource_descriptors,
+        reference.resource_row_properties,
+        scaled.resource_row_properties,
+        atol=1e-7,
+    )
+    assert np.allclose(
+        reference.resource_term_properties,
+        scaled.resource_term_properties,
         atol=1e-7,
     )
 
@@ -579,35 +594,41 @@ def test_resource_evaluator_returns_aligned_labels() -> None:
 
     assert labels["structurally_valid"]
     assert labels["error"] == ""
-    assert labels["violation"].shape == (prism_decoder.FIELD_CHANNEL_COUNT,)
-    assert labels["binding"].shape == (prism_decoder.FIELD_CHANNEL_COUNT,)
+    assert labels["violation"].shape == (solver.metadata["resource_count"],)
+    assert labels["binding"].shape == (solver.metadata["resource_count"],)
     assert np.all(labels["violation"] >= 0.0)
     assert np.all((labels["binding"] >= 0.0) & (labels["binding"] <= 1.0))
     assert np.allclose(labels["violation"], 0.0, atol=1e-5)
 
 
-def test_guidance_validation_and_inactive_channel_masking() -> None:
+def test_guidance_validation_and_every_registry_row_is_declared() -> None:
     coordinates, distance = euclidean_problem(28, 103)
+    demand = np.r_[0.0, np.full(27, 0.03, dtype=np.float32)]
 
     def make_solver() -> prism_decoder.Decoder:
         solver = make_decoder(
-            {"name": "tsp", "coordinates": coordinates, "distance": distance},
+            {
+                "name": "cvrp",
+                "coordinates": coordinates,
+                "distance": distance,
+                "demand": demand,
+                "capacity": 0.5,
+            },
             n_rollouts=4,
         )
         solver.seed(919)
         return solver
 
     solver = make_solver()
-    shape = (solver.metadata["edge_count"], len(prism_decoder.FIELD_CHANNEL_NAMES))
+    shape = (solver.metadata["edge_count"], solver.metadata["resource_count"])
     ones = np.ones(shape, dtype=np.float32)
-    inactive_noise = np.random.default_rng(104).uniform(0.0, 20.0, shape).astype(
-        np.float32
-    )
 
-    clean = solver.solve(1, edge_field=ones)
-    noisy = make_solver().solve(1, edge_field=inactive_noise)
-    assert np.array_equal(clean["route"], noisy["route"])
-    assert clean["objective"] == noisy["objective"]
+    # This used to check that noise on an INACTIVE channel could not reach the
+    # route. There is no inactive row to hide behind any more: the registry
+    # holds exactly the constraints the problem declares, so guidance on a row
+    # is guidance on something the instance actually enforces.
+    assert _registry(solver) == ["capacity"]
+    assert np.all(solver.metadata["field_channel_mask"] == 1)
 
     with np.testing.assert_raises_regex(ValueError, "must have shape"):
         make_solver().solve(1, edge_field=ones[:, :-1])
@@ -623,7 +644,7 @@ def test_guidance_validation_and_inactive_channel_masking() -> None:
             1,
             edge_field=ones,
             multipliers=-np.ones(
-                prism_decoder.MULTIPLIER_COUNT, dtype=np.float32
+                make_solver().metadata["multiplier_count"], dtype=np.float32
             ),
         )
 
@@ -648,12 +669,12 @@ def test_typed_field_changes_greedy_construction() -> None:
     baseline_solver = make_solver()
     shape = (
         baseline_solver.metadata["edge_count"],
-        len(prism_decoder.FIELD_CHANNEL_NAMES),
+        baseline_solver.metadata["resource_count"],
     )
     # High resource-field intensities with a unit objective weight (final slot),
     # so the field dominates the plain objective as this test intends.
-    multipliers = np.full(prism_decoder.MULTIPLIER_COUNT, 100.0, dtype=np.float32)
-    multipliers[prism_decoder.FIELD_CHANNEL_COUNT] = 1.0
+    multipliers = np.full(baseline_solver.metadata["multiplier_count"], 100.0, dtype=np.float32)
+    multipliers[-1] = 1.0
     baseline = baseline_solver.solve(
         1,
         edge_field=np.zeros(shape, np.float32),
@@ -700,13 +721,13 @@ def test_additive_field_guides_zero_pressure_edge() -> None:
     baseline_solver = make_solver()
     shape = (
         baseline_solver.metadata["edge_count"],
-        prism_decoder.FIELD_CHANNEL_COUNT,
+        baseline_solver.metadata["resource_count"],
     )
     field = np.ones(shape, dtype=np.float32)
     additive = np.zeros(shape, dtype=np.float32)
-    multipliers = np.zeros(prism_decoder.MULTIPLIER_COUNT, dtype=np.float32)
+    multipliers = np.zeros(baseline_solver.metadata["multiplier_count"], dtype=np.float32)
     multipliers[0] = 100.0
-    multipliers[prism_decoder.FIELD_CHANNEL_COUNT] = 1.0
+    multipliers[-1] = 1.0
     baseline = baseline_solver.sample_greedy(
         edge_field=field,
         edge_additive=additive,
@@ -763,12 +784,12 @@ def test_signed_objective_residual_guides_multi_constraint_objective() -> None:
     field = np.zeros(
         (
             baseline_solver.metadata["edge_count"],
-            prism_decoder.FIELD_CHANNEL_COUNT,
+            baseline_solver.metadata["resource_count"],
         ),
         dtype=np.float32,
     )
-    multipliers = np.zeros(prism_decoder.MULTIPLIER_COUNT, dtype=np.float32)
-    multipliers[prism_decoder.FIELD_CHANNEL_COUNT] = 1.0
+    multipliers = np.zeros(baseline_solver.metadata["multiplier_count"], dtype=np.float32)
+    multipliers[-1] = 1.0
     baseline = baseline_solver.sample_greedy(
         edge_field=field,
         multipliers=multipliers,
@@ -900,14 +921,14 @@ def test_srr_aggregate_comparison_uses_the_same_edge_energy() -> None:
     ordinary_solver = make_solver()
     shape = (
         ordinary_solver.metadata["edge_count"],
-        prism_decoder.FIELD_CHANNEL_COUNT,
+        ordinary_solver.metadata["resource_count"],
     )
     field = rng.uniform(0.0, 2.0, shape).astype(np.float32)
     additive = rng.uniform(0.0, 0.2, shape).astype(np.float32)
     risk = rng.uniform(0.0, 0.3, shape[0]).astype(np.float32)
-    multipliers = np.zeros(prism_decoder.MULTIPLIER_COUNT, dtype=np.float32)
+    multipliers = np.zeros(ordinary_solver.metadata["multiplier_count"], dtype=np.float32)
     multipliers[0] = 1.3
-    multipliers[prism_decoder.FIELD_CHANNEL_COUNT] = 0.8
+    multipliers[-1] = 0.8
     risk_penalty = 0.7
     ordinary = ordinary_solver.sample_greedy(
         edge_field=field,
@@ -964,9 +985,9 @@ def test_lookahead_risk_labels_and_avoids_time_window_dead_end() -> None:
         return solver
 
     solver = make_solver()
-    shape = (solver.metadata["edge_count"], prism_decoder.FIELD_CHANNEL_COUNT)
-    multipliers = np.zeros(prism_decoder.MULTIPLIER_COUNT, dtype=np.float32)
-    multipliers[prism_decoder.FIELD_CHANNEL_COUNT] = 1.0
+    shape = (solver.metadata["edge_count"], solver.metadata["resource_count"])
+    multipliers = np.zeros(solver.metadata["multiplier_count"], dtype=np.float32)
+    multipliers[-1] = 1.0
     guidance = {
         "edge_field": np.ones(shape, dtype=np.float32),
         "multipliers": multipliers,
@@ -1143,14 +1164,26 @@ def test_runtime_battery_resource_enforces_reset_and_exports_dynamic_rows() -> N
     }
     solver = make_decoder(problem, n_rollouts=1)
 
-    assert solver.metadata["resource_count"] == prism_decoder.FIELD_CHANNEL_COUNT + 1
+    # The problem declares no compiled constraint, so the battery row it appends
+    # is the whole registry. It used to sit at position 7 behind seven rows the
+    # instance never used.
+    assert _registry(solver) == ["battery"]
     assert solver.metadata["multiplier_count"] == solver.metadata["resource_count"] + 1
     assert solver.resource_features.shape[1] == solver.metadata["resource_count"]
-    assert solver.resource_descriptors.shape == (
+    assert solver.resource_row_properties.shape == (
         solver.metadata["resource_count"],
-        prism_decoder.RESOURCE_DESCRIPTOR_DIM,
+        prism_decoder.RESOURCE_ROW_PROPERTY_DIM,
     )
-    assert [row["operator"] for row in solver.metadata["resources"][:7]] == [
+    assert solver.resource_term_properties.shape[1] == (
+        prism_decoder.RESOURCE_TERM_PROPERTY_DIM
+    )
+    assert solver.resource_term_counts.shape == (
+        solver.metadata["resource_count"],
+    )
+    # The seven compiled kernels remain the fast-path vocabulary, but a problem
+    # that uses none of them publishes none of them: this list used to be
+    # asserted as a fixed prefix ahead of the appended row.
+    assert list(prism_decoder.FIELD_CHANNEL_NAMES) == [
         "capacity",
         "time_window",
         "route_limit",
@@ -1159,8 +1192,10 @@ def test_runtime_battery_resource_enforces_reset_and_exports_dynamic_rows() -> N
         "pickup_delivery",
         "prize_quota",
     ]
+    assert [row["operator"] for row in solver.metadata["resources"]] == [
+        "affine_accumulator"
+    ]
     assert solver.metadata["resources"][-1]["name"] == "battery"
-    assert solver.metadata["resources"][-1]["operator"] == "affine_accumulator"
     assert solver.metadata["field_channel_mask"][-1] == 1
     coordinate_only = dict(problem)
     coordinate_only.pop("distance")
@@ -1177,6 +1212,133 @@ def test_runtime_battery_resource_enforces_reset_and_exports_dynamic_rows() -> N
     labels = solver.evaluate_resources(np.array([0, 1, 0], dtype=np.int32))
     assert labels["violation"].shape == (solver.metadata["resource_count"],)
     assert labels["violation"][-1] > 0.0
+
+
+def test_optional_pre_transition_reset_enforces_driver_breaks() -> None:
+    coordinates = np.array(
+        [[0.0, 0.0], [2.0, 0.0], [4.0, 0.0], [6.0, 0.0]],
+        dtype=np.float32,
+    )
+    distance = np.linalg.norm(
+        coordinates[:, None] - coordinates[None, :], axis=-1
+    ).astype(np.float32)
+    resource = {
+        "name": "continuous_driving_time",
+        "operator": "affine_accumulator",
+        "initial": 0.0,
+        "scale": 4.5,
+        "increment": {"edge_attribute": "distance", "coefficient": 1.0},
+        "reset": {
+            "node_attribute": "break_allowed",
+            "value": 0.0,
+            "at_depot": True,
+            "optional_before_transition": True,
+            "duration": 0.75,
+        },
+        "bounds": [{"upper": 4.5, "check": "transition"}],
+    }
+    solver = make_decoder(
+        {
+            "name": "vrpdb",
+            "coordinates": coordinates,
+            "distance": distance,
+            "constraints": [],
+            "multi_route": False,
+            "node_attributes": {
+                "break_allowed": np.ones(4, dtype=np.float32)
+            },
+            "resources": [resource],
+        },
+        n_rollouts=1,
+    )
+
+    with_break = solver.evaluate(np.array([0, 1, 2, 0], dtype=np.int32))
+    overlong_leg = solver.evaluate(np.array([0, 3, 0], dtype=np.int32))
+
+    assert with_break["feasible"]
+    assert not overlong_leg["feasible"]
+    assert "continuous_driving_time" in overlong_leg["error"]
+    labels = solver.evaluate_resources(np.array([0, 1, 2, 0], dtype=np.int32))
+    assert labels["violation"][-1] == pytest.approx(0.0)
+
+
+def test_driver_break_duration_advances_route_time() -> None:
+    coordinates = np.array(
+        [[0.0, 0.0], [2.0, 0.0], [4.0, 0.0], [3.0, 0.0]],
+        dtype=np.float32,
+    )
+    distance = np.linalg.norm(
+        coordinates[:, None] - coordinates[None, :], axis=-1
+    ).astype(np.float32)
+    base = {
+        "name": "vrpdb-time",
+        "coordinates": coordinates,
+        "distance": distance,
+        "constraints": ["time_windows"],
+        "multi_route": False,
+        "tw_start": np.zeros(4, dtype=np.float32),
+        "tw_end": np.array([100.0, 100.0, 100.0, 5.5], dtype=np.float32),
+        "node_attributes": {"break_allowed": np.ones(4, dtype=np.float32)},
+    }
+    reset = {
+        "node_attribute": "break_allowed",
+        "value": 0.0,
+        "at_depot": True,
+        "optional_before_transition": True,
+    }
+    resource = {
+        "name": "continuous_driving_time",
+        "operator": "affine_accumulator",
+        "initial": 0.0,
+        "scale": 4.5,
+        "increment": {"edge_attribute": "distance", "coefficient": 1.0},
+        "reset": {**reset, "duration": 0.75},
+        "bounds": [{"upper": 4.5, "check": "transition"}],
+    }
+    no_duration = {**resource, "reset": {**reset, "duration": 0.0}}
+    route = np.array([0, 1, 2, 3, 0], dtype=np.int32)
+
+    assert make_decoder(
+        {**base, "resources": [no_duration]}, n_rollouts=1
+    ).evaluate(route)["feasible"]
+    assert not make_decoder(
+        {**base, "resources": [resource]}, n_rollouts=1
+    ).evaluate(route)["feasible"]
+
+
+def test_driver_break_duration_is_charged_on_depot_return() -> None:
+    coordinates = np.array([[0.0, 0.0], [2.5, 0.0]], dtype=np.float32)
+    resource = {
+        "name": "continuous_driving_time",
+        "operator": "affine_accumulator",
+        "initial": 0.0,
+        "scale": 4.5,
+        "increment": {"edge_attribute": "distance", "coefficient": 1.0},
+        "reset": {
+            "node_attribute": "break_allowed",
+            "value": 0.0,
+            "at_depot": True,
+            "optional_before_transition": True,
+            "duration": 0.75,
+        },
+        "bounds": [{"upper": 4.5, "check": "transition"}],
+    }
+    problem = {
+        "name": "vrpdbtw-return",
+        "coordinates": coordinates,
+        "constraints": ["visit_all", "time_windows"],
+        "multi_route": True,
+        "tw_start": np.zeros(2, dtype=np.float32),
+        "tw_end": np.array([5.5, 100.0], dtype=np.float32),
+        "node_attributes": {"break_allowed": np.ones(2, dtype=np.float32)},
+        "resources": [resource],
+    }
+
+    result = make_decoder(problem, n_rollouts=1).evaluate(
+        np.array([0, 1, 0], dtype=np.int32)
+    )
+
+    assert not result["feasible"]
 
 
 def test_dynaco_policy_refines_through_runtime_resource_schema() -> None:
@@ -1232,112 +1394,154 @@ def test_dynaco_policy_refines_through_runtime_resource_schema() -> None:
     assert resources["violation"][-1] == 0.0
 
 
-def test_typed_candidate_quota_admits_reset_edge_behind_distance_gate() -> None:
-    coordinates = np.array(
-        [[0.0, 0.0], [1.0, 0.0], [1.1, 0.0], [3.0, 0.0]],
-        dtype=np.float32,
-    )
-    distance = np.linalg.norm(
-        coordinates[:, None] - coordinates[None, :], axis=-1
-    ).astype(np.float32)
-    solver = make_decoder(
-        {
-            "name": "cvrp",
-            "coordinates": coordinates,
-            "distance": distance,
-            "constraints": [],
-            "multi_route": False,
-            "node_attributes": {
-                "charging_station": np.array(
-                    [0.0, 0.0, 0.0, 1.0], dtype=np.float32
-                )
-            },
-            "resources": [
-                {
-                    "name": "battery",
-                    "operator": "affine_accumulator",
-                    "initial": 10.0,
-                    "scale": 10.0,
-                    "increment": {
-                        "edge_attribute": "distance",
-                        "coefficient": -1.0,
-                    },
-                    "reset": {
-                        "node_attribute": "charging_station",
-                        "value": 10.0,
-                    },
-                    "bounds": [{"lower": 0.0}],
-                }
-            ],
-        },
-        candidate_config={"max_candidates": 2},
-        n_rollouts=1,
-    )
-    incumbent = np.array([0, 1, 2, 3, 0], dtype=np.int32)
-    solver.set_incumbent(incumbent)
+def test_objective_edge_term_slot_carries_the_declared_objective() -> None:
+    """The edge slot reports the declared objective, not a route-structure flag.
 
-    def neighbors(node: int) -> set[int]:
-        start, end = solver.edge_offsets[node : node + 2]
-        return set(solver.edge_index[1, start:end].tolist())
+    It replaced a hard-coded waived-open-return lever. On an open route the
+    depot leg is free in the declared objective, so the slot reports that
+    directly -- and it stays meaningful on objectives that declare no travel
+    term at all, which the lever could not express.
+    """
+    names = list(prism_decoder.CANDIDATE_FEATURE_NAMES)
+    slot = names.index("objective_edge_term")
+    # No slot is named after a constraint or a route structure any more.
+    assert not ({"capacity", "backhaul_order", "open_return"} & set(names))
 
-    assert neighbors(1) == {0, 2}
-    quotas = np.zeros(solver.metadata["resource_count"], dtype=np.float32)
-    quotas[-1] = 1.0
-    solver.set_candidate_resource_quotas(quotas)
-    solver.set_incumbent(incumbent)
-    assert neighbors(1) == {0, 3}
-    assert solver.metadata["candidate_strategy"] == "typed_resource_quota"
+    problem = generated_problem("ocvrpb", 16)
+    solver = prism_decoder.Decoder(problem)
+    edges = np.asarray(solver.edge_features)
+    heads = np.asarray(solver.edge_index)[1]
+    depot_arcs = heads < problem["depot_count"]
+    # 0.5 is the squash's neutral point: a genuinely free leg. Every other arc
+    # of a distance objective costs something, so it sits strictly above.
+    assert np.allclose(edges[depot_arcs, slot], 0.5)
+    assert np.all(edges[~depot_arcs, slot] > 0.5)
+
+    # A closed route charges the return leg, so no arc is free.
+    closed = prism_decoder.Decoder(generated_problem("cvrpb", 16))
+    assert np.all(np.asarray(closed.edge_features)[:, slot] > 0.5)
 
 
-def test_schema_mode_admits_resource_candidate_without_learned_quota() -> None:
-    """The schema-derived neighborhood covers a resource-relevant node with no
-    learned quota and no per-variant tuning; the geometric ablation drops it."""
-    coordinates = np.array(
-        [[5.0, 0.0], [0.0, 0.0], [0.1, 0.0], [0.2, 0.0], [0.3, 0.0], [10.0, 0.0]],
-        dtype=np.float32,
-    )
-    distance = np.linalg.norm(
-        coordinates[:, None] - coordinates[None, :], axis=-1
-    ).astype(np.float32)
-    problem = {
-        "name": "cvrp",
-        "coordinates": coordinates,
-        "distance": distance,
-        "constraints": [],
-        "demand": np.zeros(6, dtype=np.float32),
-        "capacity": 1.0,
-        "node_attributes": {
-            "charging": np.array([0, 0, 0, 0, 0, 1.0], dtype=np.float32)
-        },
-        "resources": [
+def test_reverse_distance_slot_carries_the_opposite_leg() -> None:
+    """The reverse leg is encoded even when its arc is not a candidate."""
+    slot = list(prism_decoder.CANDIDATE_FEATURE_NAMES).index("reverse_distance")
+    problem = generated_problem("acvrp", 40)
+    # A tight candidate budget is what makes the point: rows are ranked per
+    # source, so many reverse arcs are pruned away entirely.
+    solver = prism_decoder.Decoder(problem, candidate_config={"max_candidates": 5})
+    distance = np.asarray(problem["distance"], dtype=np.float32)
+    # The distance scale is the instance's own magnitude, so a metric-closure
+    # matrix normalizes by its maximum rather than by a floor.
+    scale = float(distance.max())
+    edges = np.asarray(solver.edge_features)
+    tails, heads = np.asarray(solver.edge_index)
+    assert np.allclose(edges[:, slot], distance[heads, tails] / scale, atol=1e-6)
+    # Asymmetry is visible: the two legs of a candidate arc differ.
+    assert np.abs(edges[:, 0] - edges[:, slot]).max() > 1e-3
+    # A reverse leg is reported even where the reverse arc was pruned.
+    candidates = {(int(a), int(b)) for a, b in zip(tails, heads)}
+    assert any((b, a) not in candidates for a, b in candidates)
+
+    symmetric = prism_decoder.Decoder(generated_problem("cvrp", 24))
+    symmetric_edges = np.asarray(symmetric.edge_features)
+    assert np.allclose(symmetric_edges[:, 0], symmetric_edges[:, slot])
+
+
+def test_node_distance_profiles_replace_missing_coordinates() -> None:
+    """Asymmetric instances have no x/y, so the profiles are their only geometry."""
+    names = list(prism_decoder.NODE_FEATURE_NAMES)
+    out_slot = names.index("mean_out_distance")
+    in_slot = names.index("mean_in_distance")
+    solver = prism_decoder.Decoder(generated_problem("acvrp", 24))
+    nodes = np.asarray(solver.node_features)
+    assert np.all(nodes[:, names.index("x")] == 0.0)
+    assert np.all(nodes[:, names.index("y")] == 0.0)
+    assert np.all(nodes[:, out_slot] > 0.0)
+    assert np.all(nodes[:, in_slot] > 0.0)
+    # Their difference is the node's own asymmetry, which x/y could never carry.
+    assert np.abs(nodes[:, out_slot] - nodes[:, in_slot]).max() > 1e-3
+
+    # Each profile is the mean candidate-arc distance on its own side.
+    tails, heads = np.asarray(solver.edge_index)
+    forward = np.asarray(solver.edge_features)[:, 0]
+    for node in range(nodes.shape[0]):
+        outgoing = forward[tails == node]
+        incoming = forward[heads == node]
+        assert nodes[node, out_slot] == pytest.approx(outgoing.mean(), abs=1e-6)
+        assert nodes[node, in_slot] == pytest.approx(incoming.mean(), abs=1e-6)
+
+
+def test_metric_symmetry_is_reported_separately_from_reversal_safety() -> None:
+    """The metric's symmetry is model conditioning; reversal safety is not.
+
+    A symmetric time-window instance is reversal-unsafe (the kernel is
+    reversal-sensitive) while its metric is still perfectly symmetric, so the
+    two predicates cannot share one flag.
+    """
+    euclidean = prism_decoder.Decoder(generated_problem("cvrptw", 16))
+    assert euclidean.metadata["metric_symmetric"] is True
+    assert euclidean.metadata["metric_skew"] == 0.0
+
+    asymmetric = prism_decoder.Decoder(generated_problem("acvrp", 16))
+    assert asymmetric.metadata["metric_symmetric"] is False
+    assert 0.0 < asymmetric.metadata["metric_skew"] <= 1.0
+
+
+def test_features_are_invariant_to_distance_and_time_unit_rescaling() -> None:
+    """The same instance in different units must encode identically.
+
+    Every scale used to be seeded at one and only grown, so it acted as
+    max(1, true_max) and stopped normalizing anything measuring less than a unit
+    across. That put the whole asymmetric family -- whose metric-closure
+    distances shrink toward zero as node count grows -- into the encoder at a
+    few percent of the range its Euclidean counterpart used, and made this test
+    false for any sub-unit instance. Only the energy scale is unit-bearing: it
+    converts energy, so it scales with the unit by construction.
+    """
+    coordinates, distance = euclidean_problem(24, 321)
+    rng = np.random.default_rng(322)
+    demand = np.r_[0.0, rng.uniform(0.01, 0.06, 23)].astype(np.float32)
+    tw_start = np.r_[0.0, rng.uniform(0.0, 2.0, 23)].astype(np.float32)
+    tw_end = (tw_start + 5.0).astype(np.float32)
+    service = np.r_[0.0, np.full(23, 0.05, dtype=np.float32)].astype(np.float32)
+
+    def make_solver(factor: float) -> prism_decoder.Decoder:
+        return make_decoder(
             {
-                "name": "battery",
-                "operator": "affine_accumulator",
-                "initial": 100.0,
-                "scale": 100.0,
-                "increment": {"edge_attribute": "distance", "coefficient": -1.0},
-                "reset": {"node_attribute": "charging", "value": 100.0},
-                "bounds": [{"lower": 0.0}],
-            }
-        ],
-    }
+                "name": "cvrptw",
+                "coordinates": (coordinates * factor).astype(np.float32),
+                "distance": (distance * factor).astype(np.float32),
+                "demand": demand,
+                "capacity": 0.8,
+                "tw_start": (tw_start * factor).astype(np.float32),
+                "tw_end": (tw_end * factor).astype(np.float32),
+                "service_time": (service * factor).astype(np.float32),
+            },
+            n_rollouts=1,
+        )
 
-    def neighbors(solver, node: int) -> set[int]:
-        start, end = solver.edge_offsets[node : node + 2]
-        return set(solver.edge_index[1, start:end].tolist())
-
-    schema = make_decoder(
-        problem, candidate_config={"max_candidates": 3}, n_rollouts=1
-    )
-    geometric = make_decoder(
-        problem,
-        candidate_config={"max_candidates": 3, "candidate_mode": "geometric"},
-        n_rollouts=1,
-    )
-    # Node 5 is the farthest node (highest battery pressure) but not among node
-    # 1's nearest neighbours. Schema mode reserves it via the uniform equal-share
-    # prior; geometric mode fills purely by distance and excludes it.
-    assert 5 in neighbors(schema, 1)
-    assert 5 not in neighbors(geometric, 1)
-    assert schema.metadata["candidate_strategy"] == "uniform_schema"
-    assert geometric.metadata["candidate_strategy"] == "distance"
+    reference = make_solver(1.0)
+    # 0.05 sits far below the unit floor that used to be applied; 100 far above.
+    for factor in (0.05, 100.0):
+        scaled = make_solver(factor)
+        for name in (
+            "node_features",
+            "edge_features",
+            "resource_features",
+            "node_resource_features",
+            "resource_row_properties",
+            "resource_term_properties",
+        ):
+            assert np.allclose(
+                getattr(reference, name), getattr(scaled, name), atol=1e-5
+            ), f"{name} is not invariant to a {factor}x unit change"
+        assert scaled.metadata["objective_scale"] == pytest.approx(
+            reference.metadata["objective_scale"], rel=1e-4
+        )
+        assert scaled.metadata["metric_skew"] == pytest.approx(
+            reference.metadata["metric_skew"], abs=1e-6
+        )
+        # The energy scale is the one quantity that must move with the unit.
+        assert scaled.metadata["objective_energy_scale"] == pytest.approx(
+            factor * reference.metadata["objective_energy_scale"], rel=1e-4
+        )

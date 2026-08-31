@@ -1,4 +1,5 @@
 #include "decoder.h"
+
 #include "kd_tree.h"
 
 #include <algorithm>
@@ -17,6 +18,32 @@ namespace {
 
 constexpr float EPS = 1.0e-6f;
 constexpr float FEASIBILITY_EPS = 1.0e-5f;
+
+// "Has everything `next` must wait for been served?", for either precedence
+// relation that has predecessors. `seen(node)` is supplied by the caller so
+// each site can answer from whatever record it keeps -- a visited array during
+// construction, an epoch stamp inside SRR -- exactly as precedence_admits
+// already expects. PAIRWISE reads its single matched predecessor; DAG reads
+// its whole predecessor list, which is the only structural difference between
+// them at admission time.
+template <typename Seen>
+bool precedence_prerequisites_met(const ResourceSpec &spec, int32_t next,
+                                  Seen &&seen) {
+  if (spec.relation == PrecedenceRelation::DAG) {
+    if (spec.predecessor_offsets.empty())
+      return true;
+    const size_t head = static_cast<size_t>(next);
+    for (int32_t at = spec.predecessor_offsets[head];
+         at < spec.predecessor_offsets[head + 1]; ++at) {
+      if (!seen(spec.predecessor_list[static_cast<size_t>(at)]))
+        return false;
+    }
+    return true;
+  }
+  const int32_t required =
+      spec.predecessor.empty() ? -1 : spec.predecessor[static_cast<size_t>(next)];
+  return required < 0 || seen(required);
+}
 constexpr int32_t SRR_STRING_CANDIDATES = 8;
 constexpr int32_t SRR_DIRECTED_CANDIDATES = 16;
 constexpr int32_t SEQUENCE_DISJOINT_LIMIT = 256;
@@ -318,6 +345,7 @@ resource_kernel_registry() {
       {ResourceOperator::PRIZE_QUOTA, "prize_quota",
        static_cast<int32_t>(FieldChannel::PRIZE_QUOTA)},
       {ResourceOperator::AFFINE_ACCUMULATOR, "affine_accumulator", -1},
+      {ResourceOperator::PRECEDENCE, "precedence", -1},
   }};
   return kernels;
 }
@@ -463,6 +491,33 @@ void Problem::validate() const {
       }
     }
   }
+  // Generic operators move a related pair together and refuse to cut between
+  // them, which assumes each node has at most one partner. Two rows claiming the
+  // same node would silently leave one of them unenforced by those operators.
+  std::vector<uint8_t> claimed(n, 0);
+  if (has(PICKUP_DELIVERY)) {
+    for (int32_t node = 0; node < n; ++node)
+      claimed[node] = delivery_of_pickup[node] >= 0 ||
+                              pickup_of_delivery[node] >= 0
+                          ? 1
+                          : 0;
+  }
+  for (const ResourceSpec &row : resources) {
+    if (row.op != ResourceOperator::PRECEDENCE ||
+        row.relation != PrecedenceRelation::PAIRWISE)
+      continue;
+    for (int32_t node = 0; node < n; ++node) {
+      const bool involved =
+          (!row.predecessor.empty() && row.predecessor[node] >= 0) ||
+          (!row.successor.empty() && row.successor[node] >= 0);
+      if (!involved)
+        continue;
+      if (claimed[node])
+        throw std::invalid_argument(
+            "a node may take part in one pairwise precedence relation only");
+      claimed[node] = 1;
+    }
+  }
   for (const ResourceSpec &resource : resources) {
     if (resource.name.empty())
       throw std::invalid_argument("resource name must not be empty");
@@ -470,12 +525,43 @@ void Problem::validate() const {
       throw std::invalid_argument(
           "resource algebra v1 currently requires state_dim == 1");
     }
+    if (!RoutingDecoder::tropical(resource) &&
+        !resource.join_values.empty()) {
+      throw std::invalid_argument(
+          "only a tropical semiring may declare a join operand; an arithmetic "
+          "row has no join to apply it to");
+    }
+    if (RoutingDecoder::tropical(resource) &&
+        resource.op != ResourceOperator::AFFINE_ACCUMULATOR) {
+      throw std::invalid_argument(
+          "only an affine row runs in a semiring; a precedence relation has no "
+          "accumulation to join against");
+    }
+    if (RoutingDecoder::tropical(resource) &&
+        !resource.optional_reset_nodes.empty()) {
+      throw std::invalid_argument(
+          "a tropical row cannot declare optional resets: a break's duration is "
+          "charged to another row, which the language cannot express yet");
+    }
+    for (const std::vector<float> *values :
+         {&resource.join_values, &resource.lower_values,
+          &resource.upper_values, &resource.departure_values}) {
+      if (!values->empty() && values->size() != n)
+        throw std::invalid_argument(
+            "resource join, bound, and departure arrays must have shape "
+            "(node_count,)");
+      for (float value : *values) {
+        if (std::isnan(value))
+          throw std::invalid_argument("resource algebra array must not be NaN");
+      }
+    }
     if (!std::isfinite(resource.initial) || !std::isfinite(resource.scale) ||
         resource.scale <= 0.0f || std::isnan(resource.lower) ||
         std::isnan(resource.upper) || resource.lower > resource.upper ||
         !std::isfinite(resource.edge_coefficient) ||
         !std::isfinite(resource.node_coefficient) ||
-        !std::isfinite(resource.reset_value)) {
+        !std::isfinite(resource.reset_value) ||
+        !finite_nonnegative(resource.optional_reset_duration)) {
       throw std::invalid_argument("invalid resource algebra scalar");
     }
     if (!resource.edge_values.empty() && resource.edge_values.size() != n * n)
@@ -487,6 +573,10 @@ void Problem::validate() const {
     if (!resource.reset_nodes.empty() && resource.reset_nodes.size() != n)
       throw std::invalid_argument(
           "resource reset flags must have shape (node_count,)");
+    if (!resource.optional_reset_nodes.empty() &&
+        resource.optional_reset_nodes.size() != n)
+      throw std::invalid_argument(
+          "optional resource reset flags must have shape (node_count,)");
     for (float value : resource.edge_values) {
       if (!std::isfinite(value))
         throw std::invalid_argument("resource edge values must be finite");
@@ -494,6 +584,128 @@ void Problem::validate() const {
     for (float value : resource.node_values) {
       if (!std::isfinite(value))
         throw std::invalid_argument("resource node values must be finite");
+    }
+    const ResourceTerm *gate_reference = nullptr;
+    for (const ResourceTerm &term : resource.terms) {
+      if (!std::isfinite(term.coefficient) || !std::isfinite(term.constant) ||
+          !std::isfinite(term.gate_sign))
+        throw std::invalid_argument("resource term scalar must be finite");
+      const size_t expected = term.source == TermSource::EDGE_ATTRIBUTE
+                                  ? n * n
+                                  : term.source == TermSource::NODE_ATTRIBUTE
+                                        ? n
+                                        : 0;
+      if (expected != 0 && term.values.size() != expected)
+        throw std::invalid_argument("resource term values have invalid shape");
+      if (!term.trigger_nodes.empty() && term.trigger_nodes.size() != n)
+        throw std::invalid_argument(
+            "resource term trigger flags must have shape (node_count,)");
+      if (!term.gate_values.empty() && term.gate_values.size() != n)
+        throw std::invalid_argument(
+            "resource term gate values must have shape (node_count,)");
+      if (term.operation == TermOperation::JOIN &&
+          resource.semiring == ResourceSemiring::ARITHMETIC)
+        throw std::invalid_argument(
+            "a join term requires a tropical semiring");
+      if (term.operation == TermOperation::JOIN &&
+          term.phase != TermPhase::BEFORE_BOUND)
+        throw std::invalid_argument(
+            "a join term must run before the bound");
+      if (term.operation == TermOperation::ASSIGN &&
+          term.phase != TermPhase::AFTER_BOUND)
+        throw std::invalid_argument(
+            "an assign term must run after the bound");
+      if (term.operation == TermOperation::CHECKPOINT &&
+          term.phase != TermPhase::AFTER_BOUND)
+        throw std::invalid_argument(
+            "a checkpoint term must run after the bound");
+      if (term.operation == TermOperation::RESTORE &&
+          (term.phase != TermPhase::BEFORE_BOUND ||
+           term.trigger != TermTrigger::BOUND_FAILURE ||
+           term.gate != TermGate::ALWAYS))
+        throw std::invalid_argument(
+            "a restore term must run before the bound, trigger on "
+            "bound_failure, and have no gate");
+      if (term.trigger == TermTrigger::BOUND_FAILURE &&
+          term.operation != TermOperation::RESTORE)
+        throw std::invalid_argument(
+            "bound_failure currently triggers only restore terms");
+      if (term.operation == TermOperation::ADD &&
+          term.phase == TermPhase::AFTER_BOUND &&
+          term.trigger != TermTrigger::ALWAYS)
+        throw std::invalid_argument(
+            "a triggered add term must run before the bound");
+      const bool selected_event =
+          term.trigger == TermTrigger::RESET_DEPARTURE ||
+          term.trigger == TermTrigger::RESET_ARRIVAL ||
+          term.trigger == TermTrigger::CHECKPOINT_ARRIVAL;
+      if (selected_event && !term.trigger_at_depot &&
+          term.trigger_nodes.empty())
+        throw std::invalid_argument(
+            "a reset/checkpoint trigger requires at_depot or at_nodes");
+      if (term.gate != TermGate::ALWAYS && term.gate_values.empty())
+        throw std::invalid_argument(
+            "a remainder-gated term requires gate values");
+      if (term.gate != TermGate::ALWAYS) {
+        if (gate_reference == nullptr) {
+          gate_reference = &term;
+        } else if (term.gate_sign != gate_reference->gate_sign ||
+                   term.gate_values != gate_reference->gate_values) {
+          throw std::invalid_argument(
+              "one resource may use one remainder gate attribute and sign");
+        }
+      }
+      for (float value : term.values) {
+        if (!std::isfinite(value))
+          throw std::invalid_argument("resource term values must be finite");
+      }
+    }
+    const auto selectors_overlap = [n, this](const ResourceTerm &left,
+                                             const ResourceTerm &right) {
+      if (left.trigger == TermTrigger::ALWAYS ||
+          right.trigger == TermTrigger::ALWAYS)
+        return true;
+      // Different event kinds can occur on the same transition (for example,
+      // depot departure and customer arrival), so conservatively treat them as
+      // overlapping state writes.
+      if (left.trigger != right.trigger)
+        return true;
+      if (left.trigger_at_depot && right.trigger_at_depot)
+        return true;
+      for (int32_t depot = 0; depot < depot_count; ++depot) {
+        if ((left.trigger_at_depot && !right.trigger_nodes.empty() &&
+             right.trigger_nodes[depot]) ||
+            (right.trigger_at_depot && !left.trigger_nodes.empty() &&
+             left.trigger_nodes[depot]))
+          return true;
+      }
+      for (size_t node = 0; node < n; ++node) {
+        if (!left.trigger_nodes.empty() && !right.trigger_nodes.empty() &&
+            left.trigger_nodes[node] && right.trigger_nodes[node])
+          return true;
+      }
+      return false;
+    };
+    for (size_t i = 0; i < resource.terms.size(); ++i) {
+      const ResourceTerm &left = resource.terms[i];
+      if (left.operation != TermOperation::ASSIGN &&
+          left.operation != TermOperation::CHECKPOINT)
+        continue;
+      for (size_t j = i + 1; j < resource.terms.size(); ++j) {
+        const ResourceTerm &right = resource.terms[j];
+        if (right.operation != left.operation ||
+            !selectors_overlap(left, right))
+          continue;
+        const bool complementary =
+            left.operation == TermOperation::ASSIGN &&
+            left.gate != TermGate::ALWAYS &&
+            right.gate != TermGate::ALWAYS && left.gate != right.gate &&
+            left.gate_sign == right.gate_sign &&
+            left.gate_values == right.gate_values;
+        if (!complementary)
+          throw std::invalid_argument(
+              "overlapping state-writing terms would depend on term order");
+      }
     }
   }
   for (int32_t node = 0; node < node_count; ++node) {
@@ -507,8 +719,15 @@ void Problem::validate() const {
 }
 
 void CandidateConfig::validate() const {
-  if (max_candidates <= 0 || max_candidates > 64) {
-    throw std::invalid_argument("max_candidates must be in [1, 64]");
+  // 64 is the geometric working point: on Euclidean instances the K nearest
+  // neighbours carry the structure, and holding K fixed is what lets one model
+  // transfer across instance sizes. Non-geometric classes (bin packing,
+  // multidimensional knapsack) have no meaningful nearest neighbour -- every
+  // pairwise distance is equal -- so a truncated neighbourhood would keep an
+  // arbitrary index-ordered subset and strand the rest. Those run complete
+  // graphs instead, which is why the bound is no longer the geometric K.
+  if (max_candidates <= 0 || max_candidates > 1024) {
+    throw std::invalid_argument("max_candidates must be in [1, 1024]");
   }
 }
 
@@ -544,37 +763,55 @@ std::vector<std::string> constraint_names(uint32_t constraints) {
 }
 
 std::vector<std::string> candidate_feature_names() {
-  return {"distance",          "capacity",       "time_window",
-          "route_limit",       "tour_limit",     "backhaul_order",
-          "pickup_delivery",   "prize_quota",    "incumbent_forward",
-          "incumbent_backward", "open_return"};
+  // The seven per-channel pressure slots that used to sit after `distance` are
+  // gone; they duplicated resource_features exactly and existed only for the
+  // compiled kernels. Every row is now read from resource_features.
+  return {"distance", "incumbent_forward", "incumbent_backward",
+          "objective_edge_term", "reverse_distance"};
 }
 
 std::vector<std::string> node_feature_names() {
+  // Demand, window bounds, and service time used to have slots here. They are
+  // per-node attributes of a resource, so they now live in
+  // node_resource_features indexed by row, where a declared resource's
+  // attributes sit alongside them under the same shared weights.
+  // prize and penalty used to sit right after is_depot. They are
+  // node terms of the DECLARED objective, so they now live in
+  // node_objective_features, read through the coefficient vector that says what
+  // each term weighs.
   return {"x",
           "y",
           "is_depot",
-          "linehaul_demand",
-          "backhaul_demand",
-          "prize",
-          "penalty",
-          "window_start",
-          "window_end",
-          "service_time",
-          "is_pickup",
-          "is_delivery",
           "incumbent_served",
           "route_position",
-          "forward_load",
-          "forward_time",
-          "forward_slack",
-          "open_pickups",
           "forward_distance",
           "backward_distance",
-          "backward_load",
-          "backward_time",
-          "backward_slack",
-          "backward_open_pickups"};
+          "mean_out_distance",
+          "mean_in_distance"};
+}
+
+const char *fast_path_name(FastPath fast_path) {
+  // Static storage on purpose: field_channel_names() returns by value, so
+  // returning .c_str() into it would dangle the moment the vector died.
+  switch (fast_path) {
+  case FastPath::NONE:
+    return "";
+  case FastPath::CAPACITY:
+    return "capacity";
+  case FastPath::TIME_WINDOW:
+    return "time_window";
+  case FastPath::ROUTE_LIMIT:
+    return "route_limit";
+  case FastPath::TOUR_LIMIT:
+    return "tour_limit";
+  case FastPath::BACKHAUL_ORDER:
+    return "backhaul_order";
+  case FastPath::PICKUP_DELIVERY:
+    return "pickup_delivery";
+  case FastPath::PRIZE_QUOTA:
+    return "prize_quota";
+  }
+  return "";
 }
 
 std::vector<std::string> field_channel_names() {
@@ -602,9 +839,18 @@ RoutingDecoder::RoutingDecoder(Problem problem, CandidateConfig candidate_config
     throw std::invalid_argument("beta must be non-negative");
   }
   build_constraint_kernel_set();
+  // Every scale is the instance's own magnitude guarded by EPS, never floored
+  // at one. A floor of one is only a no-op for instances that happen to measure
+  // more than a unit across: below it the division stops normalizing and the
+  // features carry raw magnitude instead, which made the whole asymmetric
+  // family (metric-closure distances shrink toward zero as node count grows)
+  // arrive at the model between one and four percent of the range its Euclidean
+  // counterpart uses, and made the same instance in different units encode
+  // differently. capacity_scale never had the floor; these now match it.
+  float distance_magnitude = 0.0f;
   for (float value : problem_.distance) {
     if (std::isfinite(value))
-      distance_scale_ = std::max(distance_scale_, value);
+      distance_magnitude = std::max(distance_magnitude, value);
   }
   if (problem_.distance.empty()) {
     float min_x = problem_.coordinates[0];
@@ -617,36 +863,58 @@ RoutingDecoder::RoutingDecoder(Problem problem, CandidateConfig candidate_config
       min_y = std::min(min_y, problem_.coordinates[2 * node + 1]);
       max_y = std::max(max_y, problem_.coordinates[2 * node + 1]);
     }
-    distance_scale_ =
-        std::max(distance_scale_, std::hypot(max_x - min_x, max_y - min_y));
+    distance_magnitude =
+        std::max(distance_magnitude, std::hypot(max_x - min_x, max_y - min_y));
   }
+  distance_scale_ = std::max(distance_magnitude, EPS);
+  float time_magnitude = 0.0f;
+  float prize_magnitude = 0.0f;
+  float penalty_magnitude = 0.0f;
   for (int32_t node = 0; node < problem_.node_count; ++node) {
     if (std::isfinite(problem_.tw_end[node]))
-      time_scale_ = std::max(time_scale_, problem_.tw_end[node]);
-    time_scale_ = std::max(time_scale_, problem_.service_time[node]);
-    prize_scale_ = std::max(prize_scale_, problem_.prize[node]);
-    penalty_scale_ = std::max(penalty_scale_, problem_.penalty[node]);
+      time_magnitude = std::max(time_magnitude, problem_.tw_end[node]);
+    time_magnitude = std::max(time_magnitude, problem_.service_time[node]);
+    prize_magnitude = std::max(prize_magnitude, problem_.prize[node]);
+    penalty_magnitude = std::max(penalty_magnitude, problem_.penalty[node]);
     pair_count_ += problem_.delivery_of_pickup[node] >= 0 ? 1 : 0;
   }
-  time_scale_ = std::max(time_scale_, distance_scale_);
-  reversal_safe_ =
-      (active_kernel_capabilities_ & KERNEL_REVERSAL_SENSITIVE) == 0;
-  for (int32_t from = 0;
-       !problem_.distance.empty() && reversal_safe_ &&
-       from < problem_.node_count;
-       ++from) {
-    for (int32_t to = from + 1; to < problem_.node_count; ++to) {
-      const float scale =
-          std::max({1.0f, problem_.dist(from, to), problem_.dist(to, from)});
-      if (std::abs(problem_.dist(from, to) - problem_.dist(to, from)) >
-          1.0e-5f * scale) {
-        reversal_safe_ = false;
-        break;
+  // Travel is charged in time units, so the time scale can never be smaller
+  // than the distance scale.
+  time_scale_ = std::max({time_magnitude, distance_scale_, EPS});
+  prize_scale_ = std::max(prize_magnitude, EPS);
+  penalty_scale_ = std::max(penalty_magnitude, EPS);
+  build_resource_registry();
+  // The metric scan runs to completion rather than breaking at the first
+  // asymmetric pair: the mean skew it accumulates is the graph-level regime
+  // signal the model conditions on, and a bit alone cannot convey degree. A
+  // coordinate-only instance is Euclidean, hence symmetric with zero skew, so
+  // the scan is skipped entirely there.
+  metric_symmetric_ = true;
+  metric_skew_ = 0.0f;
+  if (!problem_.distance.empty() && problem_.node_count > 1) {
+    double skew_total = 0.0;
+    int64_t pairs = 0;
+    for (int32_t from = 0; from < problem_.node_count; ++from) {
+      for (int32_t to = from + 1; to < problem_.node_count; ++to) {
+        const float forward = problem_.dist(from, to);
+        const float backward = problem_.dist(to, from);
+        const float scale = std::max({1.0f, forward, backward});
+        const float gap = std::abs(forward - backward);
+        if (gap > 1.0e-5f * scale)
+          metric_symmetric_ = false;
+        skew_total += gap;
+        ++pairs;
       }
     }
+    if (pairs > 0)
+      metric_skew_ = static_cast<float>(
+          skew_total / static_cast<double>(pairs) /
+          std::max(distance_scale_, EPS));
   }
-  build_resource_registry();
-  build_resource_descriptors();
+  reversal_safe_ =
+      (active_kernel_capabilities_ & KERNEL_REVERSAL_SENSITIVE) == 0 &&
+      metric_symmetric_;
+  build_resource_properties();
   build_candidate_graph({});
 }
 
@@ -668,19 +936,43 @@ void RoutingDecoder::build_resource_registry() {
   resources_.clear();
   active_resource_indices_.clear();
   scalar_resource_indices_.clear();
+  precedence_resource_indices_.clear();
+  declared_specs_valid_.clear();
+
   field_resource_index_.fill(-1);
+  static constexpr FastPath CHANNEL_FAST_PATH[FIELD_CHANNEL_COUNT] = {
+      FastPath::CAPACITY,       FastPath::TIME_WINDOW,
+      FastPath::ROUTE_LIMIT,    FastPath::TOUR_LIMIT,
+      FastPath::BACKHAUL_ORDER, FastPath::PICKUP_DELIVERY,
+      FastPath::PRIZE_QUOTA,
+  };
   const auto add_resource_row = [&](FieldChannel channel, ResourceOperator op,
                                     const char *name, bool active) {
-    ResourceSpec spec;
-    spec.name = name;
-    spec.active = active;
-    spec.op = op;
-    spec.scale = resource_scale(static_cast<int32_t>(channel));
+    ResourceSpec row;
+    row.name = name;
+    row.active = active;
+    row.op = op;
+    row.scale = resource_scale(static_cast<int32_t>(channel));
+    // Store the DECLARATION, not the kernel identity. The row used to keep its
+    // compiled operator and every consumer that wanted the algebra asked for a
+    // rewritten copy; the rewrite happens once, here, so a compiled row and an
+    // equivalent declared row are the same object apart from the tag below.
+    ResourceSpec spec = publish(row);
+    spec.terms = build_terms(spec);
+    spec.fast_path = CHANNEL_FAST_PATH[static_cast<int32_t>(channel)];
     const int32_t index = static_cast<int32_t>(resources_.size());
     resources_.push_back(std::move(spec));
     field_resource_index_[static_cast<int32_t>(channel)] = index;
   };
+  // One row per constraint the problem actually declares. Every field channel
+  // used to get a row here whether or not the problem used it, so the registry
+  // opened with the same seven rows in the same order for every instance and a
+  // row's position encoded which constraint it was. A TSP now has an empty
+  // registry rather than seven inactive rows, and an appended row's position
+  // depends on what else is present rather than on a fixed prefix.
   for (int32_t channel = 0; channel < FIELD_CHANNEL_COUNT; ++channel) {
+    if (active_field_channels_[channel] == 0)
+      continue;
     const ConstraintKernelSpec *kernel = field_channel_kernel(channel);
     if (kernel == nullptr)
       throw std::logic_error("missing field-channel kernel");
@@ -689,7 +981,7 @@ void RoutingDecoder::build_resource_registry() {
     if (resource_spec.field_channel != channel)
       throw std::logic_error("resource and field-channel registries disagree");
     add_resource_row(static_cast<FieldChannel>(channel), resource_spec.op,
-                     resource_spec.name, active_field_channels_[channel] != 0);
+                     resource_spec.name, true);
   }
 
   for (const ResourceSpec &spec : problem_.resources) {
@@ -699,13 +991,134 @@ void RoutingDecoder::build_resource_registry() {
                     })) {
       throw std::invalid_argument("duplicate resource name: " + spec.name);
     }
-    resources_.push_back(spec);
+    // A declared row is INTERPRETED (fast_path stays NONE), and that is a
+    // property of the kernels, not of the row. Each compiled kernel reads the
+    // problem fields it was written against -- problem_.capacity and
+    // problem_.demand, problem_.tw_end, problem_.pickup_of_delivery -- rather
+    // than the arrays on the row it executes. A declared row states the same
+    // algebra through its own arrays, so handing it to a kernel would silently
+    // enforce whatever those problem fields happen to hold (for a problem that
+    // does not declare the constraint, their defaults). Matching a row onto a
+    // kernel by its algebra is sound only once every kernel reads its own row;
+    // until then the tag belongs to the frontend that populated those fields.
+    ResourceSpec published = publish(spec);
+    published.terms = build_terms(published);
+    resources_.push_back(std::move(published));
+  }
+  // runtime_resource_scale reads the row, so every row must leave this function
+  // with the normalization it will be priced by. A precedence row counts
+  // unresolved obligations, which are integers in no declared unit; the scale
+  // switch used to return 1 for it whatever the row said, so pinning it here
+  // keeps that answer while making the row -- not the operator -- authoritative.
+  for (ResourceSpec &spec : resources_) {
+    if (spec.op == ResourceOperator::PRECEDENCE) {
+      // A matching or class order counts at most one obligation per node, so 1
+      // is the unit and the state is already on the scale trained rows sit on.
+      // A DAG counts up to one per ordered pair, so the same pin would publish
+      // a live state two orders of magnitude outside that range; its relation
+      // count is the unit, which makes the state the fraction outstanding.
+      spec.scale =
+          spec.relation == PrecedenceRelation::DAG
+              ? std::max(1.0f,
+                         static_cast<float>(spec.predecessor_list.size()))
+              : 1.0f;
+    }
+    if (!(spec.scale > 0.0f) || !std::isfinite(spec.scale))
+      throw std::invalid_argument("resource scale must be finite and positive: " +
+                                  spec.name);
   }
   for (int32_t index = 0; index < resource_count(); ++index) {
     if (resource(index).active) {
       active_resource_indices_.push_back(index);
-      if (resource(index).op == ResourceOperator::AFFINE_ACCUMULATOR)
+      // Interpreted rows only: a row its kernel executes has its running
+      // scalar maintained by that kernel, and advancing it here as well would
+      // apply the increment twice.
+      const bool interpreted = fast_path(index) == FastPath::NONE;
+      if (interpreted &&
+          resource(index).op == ResourceOperator::AFFINE_ACCUMULATOR)
         scalar_resource_indices_.push_back(index);
+      if (resource(index).op == ResourceOperator::PRECEDENCE) {
+        if (interpreted)
+          precedence_resource_indices_.push_back(index);
+        ResourceSpec &spec = resources_[index];
+        spec.relation_count =
+            spec.relation == PrecedenceRelation::PAIRWISE
+                ? static_cast<int32_t>(std::count_if(
+                      spec.successor.begin(), spec.successor.end(),
+                      [](int32_t value) { return value >= 0; }))
+            : spec.relation == PrecedenceRelation::DAG
+                ? static_cast<int32_t>(spec.predecessor_list.size())
+                : static_cast<int32_t>(std::count_if(
+                      spec.node_class.begin(), spec.node_class.end(),
+                      [](int32_t value) { return value > 0; }));
+      }
+      // A declared row publishes no hand-written capability entry, so its
+      // search capabilities come from its algebra. Compiled kernels keep their
+      // registry entry; test_resource_algebra_equivalence asserts the derived
+      // capabilities reproduce it for every declarable kernel, so the two
+      // sources agree wherever both exist.
+      active_kernel_capabilities_ |= derived_capabilities(resource(index));
+    }
+  }
+  // Split the active registry by who executes it. The cached-route-summary
+  // screening path describes exactly the compiled field channels; everything
+  // else runs through the declarative interpreter and has to be certified
+  // separately.
+  declared_resource_indices_.clear();
+  for (int32_t index : active_resource_indices_) {
+    bool backed_by_kernel = false;
+    for (int32_t channel = 0; channel < FIELD_CHANNEL_COUNT; ++channel)
+      backed_by_kernel |= field_resource_index_[channel] == index;
+    if (!backed_by_kernel)
+      declared_resource_indices_.push_back(index);
+  }
+  planned_screening_covers_registry_ = declared_resource_indices_.empty();
+  declared_specs_valid_.assign(resource_count(), 0);
+  for (int32_t index = 0; index < resource_count(); ++index) {
+    // Every consumer reads the *published* algebra, abstaining rows included.
+    // What escapes the language is always the extension rule -- a
+    // state-dependent reload, a cross-row duration, an exempt class -- and none
+    // of it is what these consume: the descriptor encodes the reset *form*, not
+    // its value; the pressure and the live-state feature are positions within
+    // the declared bounds. Gating them on exactness instead made the same
+    // channel mean opposite things on neighbouring variants (capacity read
+    // `remaining/cap` where it was declared and `served/cap` where it was not).
+    // `declared_specs_valid_` remains the exactness flag, and it is what
+    // `resource_declarations` publishes and the equivalence tests key on.
+    declared_specs_valid_[index] = algebra_is_exact(index) ? 1 : 0;
+  }
+  build_relation_index();
+}
+
+void RoutingDecoder::build_relation_index() {
+  // Every pairwise relation, read through the declaration its row publishes.
+  // The compiled pickup-delivery kernel publishes exactly the PRECEDENCE spec
+  // its hand-written branch used to supply, so folding it in here removes the
+  // last place a consumer asked which path executes a constraint.
+  const int32_t n = problem_.node_count;
+  relation_predecessor_.assign(n, -1);
+  relation_successor_.assign(n, -1);
+  for (int32_t index = 0; index < resource_count(); ++index) {
+    if (!resource(index).active)
+      continue;
+    const ResourceSpec &spec = resource(index);
+    if (spec.op != ResourceOperator::PRECEDENCE ||
+        spec.relation != PrecedenceRelation::PAIRWISE)
+      continue;
+    for (int32_t node = 0; node < n; ++node) {
+      const int32_t successor =
+          spec.successor.empty() ? -1 : spec.successor[node];
+      const int32_t predecessor =
+          spec.predecessor.empty() ? -1 : spec.predecessor[node];
+      // A solution-scoped relation lets its two nodes sit in different routes,
+      // so it must not restrict where a route may be cut; only route-scoped
+      // rows enter the partner/delta index the SRR cutter reads.
+      if (spec.scope != ResourceScope::ROUTE)
+        continue;
+      if (successor >= 0 && relation_successor_[node] < 0)
+        relation_successor_[node] = successor;
+      if (predecessor >= 0 && relation_predecessor_[node] < 0)
+        relation_predecessor_[node] = predecessor;
     }
   }
 }
@@ -714,94 +1127,834 @@ int32_t RoutingDecoder::field_resource_index(FieldChannel channel) const {
   return field_resource_index_[static_cast<int32_t>(channel)];
 }
 
+int32_t RoutingDecoder::channel_slot(FieldChannel channel) const {
+  const int32_t index = field_resource_index_[static_cast<int32_t>(channel)];
+  return index >= 0 ? index
+                    : resource_count() + static_cast<int32_t>(channel);
+}
+
+FastPath RoutingDecoder::fast_path(const ResourceSpec &spec) const {
+  return spec.fast_path;
+}
+
+FastPath RoutingDecoder::fast_path(int32_t resource_index) const {
+  return fast_path(resource(resource_index));
+}
+
+
+float &RoutingDecoder::slot(State &state, FieldChannel channel) const {
+  return state.resource_state[static_cast<size_t>(channel_slot(channel))];
+}
+
+float RoutingDecoder::slot(const State &state, FieldChannel channel) const {
+  return state.resource_state[static_cast<size_t>(channel_slot(channel))];
+}
+
 const ResourceSpec &RoutingDecoder::resource(int32_t index) const {
   if (index < 0 || index >= resource_count())
     throw std::out_of_range("resource index is out of range");
   return resources_[index];
 }
 
-void RoutingDecoder::build_resource_descriptors() {
-  resource_descriptors_.assign(
-      static_cast<size_t>(resource_count()) * RESOURCE_DESCRIPTOR_DIM, 0.0f);
+float RoutingDecoder::spec_lower(const ResourceSpec &spec, int32_t node) {
+  return spec.lower_values.empty()
+             ? spec.lower
+             : spec.lower_values[static_cast<size_t>(node)];
+}
+
+float RoutingDecoder::spec_upper(const ResourceSpec &spec, int32_t node) {
+  return spec.upper_values.empty()
+             ? spec.upper
+             : spec.upper_values[static_cast<size_t>(node)];
+}
+
+std::vector<ResourceTerm> RoutingDecoder::build_terms(
+    const ResourceSpec &spec) const {
+  // Named fields are only lowering shorthand.  Every executable effect leaves
+  // this function as an ordinary term with independent operation, phase,
+  // trigger and gate coordinates.
+  std::vector<ResourceTerm> terms = spec.terms;
+  const auto add = [&terms](ResourceTerm term) {
+    terms.push_back(std::move(term));
+  };
+  if (spec.edge_uses_distance) {
+    ResourceTerm term;
+    term.source = TermSource::DISTANCE;
+    term.operation = TermOperation::ADD;
+    term.phase = TermPhase::BEFORE_BOUND;
+    term.coefficient = spec.edge_coefficient;
+    add(std::move(term));
+  }
+  if (!spec.edge_values.empty()) {
+    ResourceTerm term;
+    term.source = TermSource::EDGE_ATTRIBUTE;
+    term.operation = TermOperation::ADD;
+    term.phase = TermPhase::BEFORE_BOUND;
+    term.coefficient = spec.edge_coefficient;
+    term.values = spec.edge_values;
+    add(std::move(term));
+  }
+  if (!spec.node_values.empty()) {
+    ResourceTerm term;
+    term.source = TermSource::NODE_ATTRIBUTE;
+    term.point = TermPoint::TO;
+    term.operation = TermOperation::ADD;
+    term.phase = TermPhase::BEFORE_BOUND;
+    term.coefficient = spec.node_coefficient;
+    term.values = spec.node_values;
+    add(std::move(term));
+  }
+  if (!spec.departure_values.empty()) {
+    ResourceTerm term;
+    term.source = TermSource::NODE_ATTRIBUTE;
+    term.point = TermPoint::TO;
+    term.operation = TermOperation::ADD;
+    term.phase = TermPhase::AFTER_BOUND;
+    term.coefficient = spec.departure_coefficient;
+    term.values = spec.departure_values;
+    add(std::move(term));
+  }
+  if (!spec.opening_values.empty()) {
+    // This is additive in the frozen behavior: it corrects a value installed
+    // on reset rather than replacing it.
+    ResourceTerm term;
+    term.source = TermSource::NODE_ATTRIBUTE;
+    term.point = TermPoint::TO;
+    term.operation = TermOperation::ADD;
+    term.phase = TermPhase::BEFORE_BOUND;
+    term.trigger = TermTrigger::RESET_DEPARTURE;
+    term.coefficient = spec.opening_coefficient;
+    term.values = spec.opening_values;
+    term.trigger_at_depot = spec.reset_at_depot;
+    term.trigger_nodes = spec.reset_nodes;
+    add(std::move(term));
+  }
+  if (!spec.join_values.empty()) {
+    ResourceTerm term;
+    term.source = TermSource::NODE_ATTRIBUTE;
+    term.point = TermPoint::TO;
+    term.operation = TermOperation::JOIN;
+    term.phase = TermPhase::BEFORE_BOUND;
+    term.values = spec.join_values;
+    add(std::move(term));
+  }
+  if (spec.reset_at_depot || !spec.reset_nodes.empty()) {
+    const auto reset_term = [&](float installed, TermGate gate) {
+      ResourceTerm term;
+      term.source = TermSource::CONSTANT;
+      term.operation = TermOperation::ASSIGN;
+      term.phase = TermPhase::AFTER_BOUND;
+      term.trigger = TermTrigger::RESET_ARRIVAL;
+      term.constant = installed;
+      term.trigger_at_depot = spec.reset_at_depot;
+      term.trigger_nodes = spec.reset_nodes;
+      term.gate = gate;
+      term.gate_values = spec.reset_guard_values;
+      term.gate_sign = spec.reset_guard_sign;
+      return term;
+    };
+    if (spec.reset_guard_values.empty()) {
+      add(reset_term(spec.reset_value, TermGate::ALWAYS));
+    } else {
+      add(reset_term(spec.reset_value, TermGate::REMAINDER_DEFAULT));
+      add(reset_term(spec.reset_otherwise,
+                     TermGate::REMAINDER_ALTERNATIVE));
+    }
+  }
+  // Route scope itself implies the depot initialization that used to live in
+  // an else branch of extend_declared.  An explicit depot reset supersedes it.
+  const bool has_depot_assign = std::any_of(
+      terms.begin(), terms.end(), [](const ResourceTerm &term) {
+        return term.operation == TermOperation::ASSIGN &&
+               term.trigger == TermTrigger::RESET_ARRIVAL &&
+               term.trigger_at_depot;
+      });
+  if (spec.scope == ResourceScope::ROUTE && !has_depot_assign) {
+    ResourceTerm term;
+    term.source = TermSource::CONSTANT;
+    term.operation = TermOperation::ASSIGN;
+    term.phase = TermPhase::AFTER_BOUND;
+    term.trigger = TermTrigger::RESET_ARRIVAL;
+    term.constant = spec.initial;
+    term.trigger_at_depot = true;
+    add(std::move(term));
+  }
+  if (!spec.optional_reset_nodes.empty()) {
+    ResourceTerm checkpoint;
+    checkpoint.source = TermSource::CONSTANT;
+    checkpoint.operation = TermOperation::CHECKPOINT;
+    checkpoint.phase = TermPhase::AFTER_BOUND;
+    checkpoint.trigger = TermTrigger::CHECKPOINT_ARRIVAL;
+    checkpoint.constant = spec.reset_value;
+    checkpoint.trigger_nodes = spec.optional_reset_nodes;
+    add(std::move(checkpoint));
+
+    ResourceTerm restore;
+    restore.operation = TermOperation::RESTORE;
+    restore.phase = TermPhase::BEFORE_BOUND;
+    restore.trigger = TermTrigger::BOUND_FAILURE;
+    add(std::move(restore));
+  }
+  return terms;
+}
+
+float RoutingDecoder::term_value(const ResourceTerm &term, int32_t from,
+                                 int32_t to) const {
+  float raw = 0.0f;
+  switch (term.source) {
+  case TermSource::CONSTANT:
+    raw = term.constant;
+    break;
+  case TermSource::DISTANCE:
+    raw = problem_.dist(from, to);
+    break;
+  case TermSource::EDGE_ATTRIBUTE:
+    raw = term.values[static_cast<size_t>(from) * problem_.node_count + to];
+    break;
+  case TermSource::NODE_ATTRIBUTE:
+    raw = term.values[static_cast<size_t>(
+        term.point == TermPoint::TO ? to : from)];
+    break;
+  }
+  return term.coefficient * raw;
+}
+
+double RoutingDecoder::node_term_total(const ResourceSpec &spec,
+                                       int32_t node) const {
+  // Node-sourced accumulation charged at one node, independent of the edge.
+  double total = 0.0;
+  for (const ResourceTerm &term : spec.terms) {
+    if (term.operation == TermOperation::ADD &&
+        term.phase == TermPhase::BEFORE_BOUND &&
+        term.trigger == TermTrigger::ALWAYS &&
+        term.source == TermSource::NODE_ATTRIBUTE)
+      total += term.coefficient * term.values[static_cast<size_t>(node)];
+  }
+  return total;
+}
+
+double RoutingDecoder::phase_total(const ResourceSpec &spec, TermPhase phase,
+                                   int32_t from, int32_t to) const {
+  double total = 0.0;
+  for (const ResourceTerm &term : spec.terms) {
+    if (term.operation == TermOperation::ADD && term.phase == phase &&
+        term.trigger == TermTrigger::ALWAYS)
+      total += term_value(term, from, to);
+  }
+  return total;
+}
+
+void RoutingDecoder::apply_add_terms(const ResourceSpec &spec, TermPhase phase,
+                                     int32_t from, int32_t to,
+                                     float &value) const {
+  value += static_cast<float>(phase_total(spec, phase, from, to));
+}
+
+bool RoutingDecoder::has_operation(const ResourceSpec &spec,
+                                   TermOperation operation) {
+  for (const ResourceTerm &term : spec.terms) {
+    if (term.operation == operation)
+      return true;
+  }
+  return false;
+}
+
+bool RoutingDecoder::term_event_matches(const ResourceTerm &term, int32_t from,
+                                        int32_t to, bool depot,
+                                        bool bound_failed) const {
+  switch (term.trigger) {
+  case TermTrigger::ALWAYS:
+    return true;
+  case TermTrigger::BOUND_FAILURE:
+    return bound_failed;
+  case TermTrigger::RESET_DEPARTURE:
+    return from >= 0 &&
+           ((from < problem_.depot_count && term.trigger_at_depot) ||
+            (!term.trigger_nodes.empty() && term.trigger_nodes[from]));
+  case TermTrigger::RESET_ARRIVAL:
+  case TermTrigger::CHECKPOINT_ARRIVAL:
+    return (depot && term.trigger_at_depot) ||
+           (to >= 0 && !term.trigger_nodes.empty() &&
+            term.trigger_nodes[to]);
+  }
+  return false;
+}
+
+bool RoutingDecoder::guarded_node(const ResourceSpec &spec, int32_t node) {
+  for (const ResourceTerm &term : spec.terms) {
+    if (term.gate == TermGate::ALWAYS || term.gate_values.empty())
+      continue;
+    const float value = term.gate_values[static_cast<size_t>(node)];
+    return term.gate_sign >= 0.0f ? value > FEASIBILITY_EPS
+                                  : value < -FEASIBILITY_EPS;
+  }
+  return false;
+}
+
+bool RoutingDecoder::opposing_node(const ResourceSpec &spec, int32_t node) {
+  for (const ResourceTerm &term : spec.terms) {
+    if (term.gate == TermGate::ALWAYS || term.gate_values.empty())
+      continue;
+    const float value = term.gate_values[static_cast<size_t>(node)];
+    // Zero matches neither side, preserving the compiled capacity convention.
+    return term.gate_sign >= 0.0f ? value < -FEASIBILITY_EPS
+                                  : value > FEASIBILITY_EPS;
+  }
+  return false;
+}
+
+std::vector<int32_t> RoutingDecoder::initial_reset_guards() const {
+  std::vector<int32_t> remaining(2 * resource_count(), 0);
+  for (int32_t index = 0; index < resource_count(); ++index) {
+    const ResourceSpec &spec = resource(index);
+    if (std::none_of(spec.terms.begin(), spec.terms.end(),
+                     [](const ResourceTerm &term) {
+                       return term.gate != TermGate::ALWAYS;
+                     }))
+      continue;
+    for (int32_t node = problem_.depot_count; node < problem_.node_count;
+         ++node) {
+      remaining[2 * index] += guarded_node(spec, node) ? 1 : 0;
+      remaining[2 * index + 1] += opposing_node(spec, node) ? 1 : 0;
+    }
+  }
+  return remaining;
+}
+
+void RoutingDecoder::consume_reset_guards(std::vector<int32_t> &remaining,
+                                          int32_t node) const {
+  if (remaining.empty())
+    return;
+  for (int32_t index = 0; index < resource_count(); ++index) {
+    const ResourceSpec &spec = resource(index);
+    if (guarded_node(spec, node))
+      --remaining[2 * index];
+    else if (opposing_node(spec, node))
+      --remaining[2 * index + 1];
+  }
+}
+
+bool RoutingDecoder::tropical(const ResourceSpec &spec) {
+  return spec.semiring != ResourceSemiring::ARITHMETIC;
+}
+
+float RoutingDecoder::join_identity(const ResourceSpec &spec) {
+  // The value that leaves the accumulation untouched under this row's join.
+  switch (spec.semiring) {
+  case ResourceSemiring::MAX_PLUS:
+    return -std::numeric_limits<float>::infinity();
+  case ResourceSemiring::MIN_PLUS:
+    return std::numeric_limits<float>::infinity();
+  case ResourceSemiring::ARITHMETIC:
+    break;
+  }
+  // Arithmetic has no join, so no operand can perturb it. Returning the max
+  // identity keeps any isfinite() test on the result reading "absent".
+  return -std::numeric_limits<float>::infinity();
+}
+
+float RoutingDecoder::spec_join_operand(const ResourceSpec &spec,
+                                        int32_t node) {
+  for (const ResourceTerm &term : spec.terms) {
+    if (term.operation != TermOperation::JOIN)
+      continue;
+    if (term.source == TermSource::CONSTANT)
+      return term.coefficient * term.constant;
+    if (term.source == TermSource::NODE_ATTRIBUTE)
+      return term.coefficient * term.values[static_cast<size_t>(node)];
+  }
+  return join_identity(spec);
+}
+
+float RoutingDecoder::join(const ResourceSpec &spec, float accumulated,
+                           float operand) {
+  switch (spec.semiring) {
+  case ResourceSemiring::MAX_PLUS:
+    return std::max(accumulated, operand);
+  case ResourceSemiring::MIN_PLUS:
+    return std::min(accumulated, operand);
+  case ResourceSemiring::ARITHMETIC:
+    break;
+  }
+  return accumulated;
+}
+
+// Search capabilities a row's algebra implies.
+//
+// These used to be written by hand next to each compiled kernel. Every property
+// they encode is readable off the declared row instead: where the state lives
+// (scope), and whether the extension is order-invariant. An extension is
+// order-invariant when it is a monotone affine sum -- reversing or reordering a
+// segment then moves the same total and the binding value is still at the end.
+// A tropical clamp destroys that (arrival relative to a window depends on when
+// you arrive), and so does a reset at an interior node (the reset point moves),
+// and so does a mixed-sign increment (the running extremum moves).
+uint32_t RoutingDecoder::derived_capabilities(const ResourceSpec &spec) {
+  uint32_t capabilities = spec.scope == ResourceScope::ROUTE
+                              ? KERNEL_ROUTE_STATE
+                              : KERNEL_SOLUTION_STATE;
+  const bool interior_reset = std::any_of(
+      spec.terms.begin(), spec.terms.end(), [](const ResourceTerm &term) {
+        return !term.trigger_nodes.empty() &&
+               (term.operation == TermOperation::ASSIGN ||
+                term.operation == TermOperation::CHECKPOINT);
+      });
+  bool any_positive = false;
+  bool any_negative = false;
+  for (const ResourceTerm &term : spec.terms) {
+    if (term.operation != TermOperation::ADD ||
+        term.phase != TermPhase::BEFORE_BOUND ||
+        term.trigger != TermTrigger::ALWAYS)
+      continue;
+    any_positive = any_positive || term.coefficient > 0.0f;
+    any_negative = any_negative || term.coefficient < 0.0f;
+  }
+  const bool mixed_sign = any_positive && any_negative;
+  if (tropical(spec) || interior_reset || mixed_sign)
+    capabilities |= KERNEL_ORDER_SENSITIVE | KERNEL_REVERSAL_SENSITIVE;
+  if (spec.op == ResourceOperator::PRECEDENCE) {
+    // A precedence relation is order-sensitive by definition, and a pairwise
+    // relation additionally ties two nodes together, which generic operators
+    // must respect when they cut a route.
+    capabilities |= KERNEL_ORDER_SENSITIVE | KERNEL_REVERSAL_SENSITIVE;
+    if (spec.relation == PrecedenceRelation::PAIRWISE)
+      capabilities |= KERNEL_RELATIONAL;
+  }
+  return capabilities;
+}
+
+// Declarative algebra published by a compiled kernel.
+//
+// A compiled kernel is an execution fast path, not a private semantics. Each
+// one that lies inside the declarative language publishes the resource row it
+// implements, and that row -- not a switch over the kernel enum -- is what the
+// descriptor is derived from and what tests replay to prove the fast path
+// equivalent. Kernels whose semantics fall outside the current language return
+// `declared = false` rather than a plausible-looking approximation:
+//   * time_windows    needs a tropical (affine + max) operator and per-node
+//                     bounds; the language has neither.
+//   * backhaul_order  and pickup_delivery are precedence relations over nodes,
+//                     not resource extension functions at all.
+// Whether the published algebra reproduces the compiled kernel exactly.
+//
+// A kernel that fails this abstains: `declared_algebra` returns the bare
+// registry row and `declared` is false, so the descriptor, the pressure, and
+// the live-state feature all fall back to the kernel's own path rather than
+// describe it with a row that is only nearly right. The node attributes are a
+// deliberate exception -- see node_resource_features_ -- because in every case
+// below it is the *extension rule* that escapes the language, never the
+// per-node quantities.
+bool RoutingDecoder::algebra_is_exact(int32_t resource_index) const {
+  // Keyed on the compiled kernel, not on the operator: a row's operator is now
+  // always a language operator, so it can no longer name the kernel whose
+  // domain is in question.
+  switch (resource(resource_index).fast_path) {
+  case FastPath::CAPACITY: {
+    // Both halves of the kernel are declared now: the state-dependent reload
+    // as a guarded reset, and the class-ordered opening load as an opening
+    // term (see publish()).
+    //
+    // What remains uncovered is a *declared* class-order row without the
+    // problem flag. publish() runs during the registry build, before precedence
+    // rows are indexed, so it cannot see one -- the opening term would be
+    // missing while opening_load applied the rule at runtime.
+    const bool signed_demand =
+        std::any_of(problem_.demand.begin(), problem_.demand.end(),
+                    [](float value) { return value < -FEASIBILITY_EPS; });
+    return !signed_demand || problem_.has(BACKHAUL_ORDER) || !class_ordered();
+  }
+  case FastPath::TIME_WINDOW:
+    // A driver break costs wall time, so a break taken by the driving-hours row
+    // delays every arrival. No operator expresses one row's reset incrementing
+    // another row's state.
+    return std::none_of(resources_.begin(), resources_.end(),
+                        [](const ResourceSpec &other) {
+                          return other.active &&
+                                 !other.optional_reset_nodes.empty();
+                        });
+  case FastPath::BACKHAUL_ORDER: {
+    // The kernel latches on demand < 0 but only blocks demand > 0, so a
+    // zero-demand customer is exempt from both. One non-decreasing class order
+    // cannot exempt a class: it would sit below the latch and above it at once.
+    for (int32_t node = problem_.depot_count; node < problem_.node_count;
+         ++node) {
+      if (std::abs(problem_.demand[node]) <= FEASIBILITY_EPS)
+        return false;
+    }
+    return true;
+  }
+  default:
+    return true;
+  }
+}
+
+ResourceSpec RoutingDecoder::published_algebra(int32_t resource_index) const {
+  // The row IS its declaration now: build_resource_registry rewrites a compiled
+  // kernel into the language once, at construction, instead of every consumer
+  // asking for a rewritten copy. Kept as an accessor because the exactness
+  // question below still has two different answers to report.
+  return resource(resource_index);
+}
+
+ResourceSpec RoutingDecoder::declared_algebra(int32_t resource_index,
+                                              bool *declared) const {
+  if (declared != nullptr)
+    *declared = algebra_is_exact(resource_index);
+  return resource(resource_index);
+}
+
+// The per-node term of a pairwise relation: +1 where a node opens an obligation
+// and -1 where it requires one. This is the same quantity open_relation_delta
+// reports, read off the row's own arrays rather than the global index, so it is
+// available while the registry is still being built. Publishing it as an
+// ordinary node term is what lets the relation reach the model through the
+// shared per-resource weights instead of two node columns named after it.
+static void publish_relation_node_term(prism::ResourceSpec &spec,
+                                       int32_t node_count) {
+  if (spec.relation == prism::PrecedenceRelation::DAG) {
+    // Same quantity as the pairwise case, counted with multiplicity: serving a
+    // node opens one obligation per successor and closes one per predecessor.
+    // The matching case is this with every degree restricted to one, so the
+    // descriptor reads one node term across both relations rather than two.
+    if (spec.predecessor_offsets.empty())
+      return;
+    spec.node_values.assign(static_cast<size_t>(node_count), 0.0f);
+    for (int32_t node = 0; node < node_count; ++node) {
+      const size_t index = static_cast<size_t>(node);
+      const float indegree =
+          static_cast<float>(spec.predecessor_offsets[index + 1] -
+                             spec.predecessor_offsets[index]);
+      const float outdegree =
+          spec.successor_count.empty()
+              ? 0.0f
+              : static_cast<float>(spec.successor_count[index]);
+      spec.node_values[node] = outdegree - indegree;
+    }
+    spec.node_coefficient = 1.0f;
+    return;
+  }
+  if (spec.relation != prism::PrecedenceRelation::PAIRWISE)
+    return;
+  if (spec.successor.empty() && spec.predecessor.empty())
+    return;
+  spec.node_values.assign(static_cast<size_t>(node_count), 0.0f);
+  for (int32_t node = 0; node < node_count; ++node) {
+    float delta = 0.0f;
+    if (!spec.successor.empty() && spec.successor[node] >= 0)
+      delta += 1.0f;
+    if (!spec.predecessor.empty() && spec.predecessor[node] >= 0)
+      delta -= 1.0f;
+    spec.node_values[node] = delta;
+  }
+  spec.node_coefficient = 1.0f;
+}
+
+ResourceSpec RoutingDecoder::publish(const ResourceSpec &row) const {
+  ResourceSpec spec = row;
+  switch (row.op) {
+  case ResourceOperator::AFFINE_ACCUMULATOR:
+    return spec;
+  case ResourceOperator::PRECEDENCE:
+    publish_relation_node_term(spec, problem_.node_count);
+    return spec;
+  case ResourceOperator::CAPACITY:
+    // Remaining load: what the vehicle can still take. This is the quantity the
+    // kernel itself carries, so the declaration and the fast path describe one
+    // number in one convention rather than two complementary ones.
+    spec.op = ResourceOperator::AFFINE_ACCUMULATOR;
+    spec.initial = problem_.capacity;
+    spec.node_values = problem_.demand;
+    spec.node_coefficient = -1.0f;
+    spec.lower = 0.0f;
+    spec.upper = problem_.capacity;
+    spec.reset_at_depot = true;
+    spec.reset_value = problem_.capacity;
+    // The kernel's reload is not a constant: a vehicle leaves the depot full
+    // while deliveries remain and empty once only pickups do (depot_reload).
+    // Declaring that as a guard is what lets a signed-demand capacity row
+    // reproduce the kernel instead of abstaining.
+    spec.reset_guard_values = problem_.demand;
+    spec.reset_guard_sign = 1.0f;
+    spec.reset_otherwise = 0.0f;
+    spec.scope = ResourceScope::ROUTE;
+    spec.bound_check = BoundCheck::TRANSITION;
+    // Class-ordered opening load: with a backhaul order active, a route that
+    // opens on a pickup starts empty rather than carrying the reload
+    // (opening_load). In this row's remaining-load convention that is the
+    // reload negated on exactly the pickups, applied as the route leaves the
+    // depot -- an ADD term before the bound on RESET_DEPARTURE. It deliberately
+    // is not
+    // an increment: the correction belongs to the reset, and pricing it as an
+    // edge cost would tell the model that reaching a pickup from a depot
+    // consumes a full vehicle.
+    //
+    // Keyed on the problem flag rather than class_ordered(), whose second
+    // branch reads precedence_resource_indices_ -- not yet populated when
+    // publish() runs during the registry build. algebra_is_exact keeps
+    // abstaining for the case that leaves uncovered.
+    if (problem_.has(BACKHAUL_ORDER)) {
+      spec.opening_coefficient = 1.0f;
+      spec.opening_values.assign(problem_.node_count, 0.0f);
+      for (int32_t node = problem_.depot_count; node < problem_.node_count;
+           ++node) {
+        if (problem_.demand[node] < -FEASIBILITY_EPS)
+          spec.opening_values[node] = -problem_.capacity;
+      }
+    }
+    break;
+  case ResourceOperator::ROUTE_LIMIT:
+    spec.op = ResourceOperator::AFFINE_ACCUMULATOR;
+    spec.initial = 0.0f;
+    spec.edge_uses_distance = true;
+    spec.edge_coefficient = 1.0f;
+    spec.upper = problem_.route_limit;
+    spec.reset_at_depot = true;
+    spec.reset_value = 0.0f;
+    spec.scope = ResourceScope::ROUTE;
+    spec.bound_check = BoundCheck::TRANSITION;
+    spec.horizon = BoundHorizon::RETURN;
+    break;
+  case ResourceOperator::TOUR_LIMIT:
+    spec.op = ResourceOperator::AFFINE_ACCUMULATOR;
+    spec.initial = 0.0f;
+    spec.edge_uses_distance = true;
+    spec.edge_coefficient = 1.0f;
+    spec.upper = problem_.tour_limit;
+    spec.reset_at_depot = true;
+    spec.reset_value = 0.0f;
+    // A tour budget is solution-scoped; the depot reset is what makes it
+    // coincide with the route budget on the single-route variants that use it.
+    spec.scope = ResourceScope::SOLUTION;
+    spec.bound_check = BoundCheck::TRANSITION;
+    spec.horizon = BoundHorizon::RETURN;
+    break;
+  case ResourceOperator::PRIZE_QUOTA:
+    // Prize accumulates across the whole solution and gates route closure.
+    // The compiled kernel additionally lets a route close once every customer
+    // has been visited, so an instance whose total prize cannot reach the quota
+    // stays feasible; the declarative bound has no way to say "and there is no
+    // more prize to collect", so the two differ only on such instances.
+    spec.op = ResourceOperator::AFFINE_ACCUMULATOR;
+    spec.initial = 0.0f;
+    spec.node_values = problem_.prize;
+    spec.node_coefficient = 1.0f;
+    spec.lower = problem_.prize_quota;
+    spec.scope = ResourceScope::SOLUTION;
+    spec.bound_check = BoundCheck::ROUTE_END;
+    break;
+  case ResourceOperator::TIME_WINDOW:
+    // Elapsed time: travel accumulates, arrival waits for the window to open,
+    // the window close is a per-node upper bound, and service delays departure
+    // without being tested against the arriving node's own window. The return
+    // leg must land inside the depot's window, hence the return horizon.
+    spec.op = ResourceOperator::AFFINE_ACCUMULATOR;
+    spec.semiring = ResourceSemiring::MAX_PLUS;
+    spec.initial = 0.0f;
+    spec.edge_uses_distance = true;
+    spec.edge_coefficient = 1.0f;
+    spec.join_values = problem_.tw_start;
+    spec.upper_values = problem_.tw_end;
+    spec.departure_values = problem_.service_time;
+    spec.departure_coefficient = 1.0f;
+    spec.reset_at_depot = true;
+    spec.reset_value = 0.0f;
+    spec.scope = ResourceScope::ROUTE;
+    spec.bound_check = BoundCheck::TRANSITION;
+    spec.horizon = BoundHorizon::RETURN;
+    break;
+  case ResourceOperator::BACKHAUL_ORDER:
+    // Linehaul before backhaul within a route is the two-class case of a
+    // non-decreasing class order. The compiled kernel uses two thresholds
+    // though; see algebra_is_exact for the zero-demand case it cannot cover.
+    spec.op = ResourceOperator::PRECEDENCE;
+    spec.relation = PrecedenceRelation::CLASS_ORDER;
+    spec.node_class.assign(problem_.node_count, 0);
+    for (int32_t node = problem_.depot_count; node < problem_.node_count; ++node)
+      spec.node_class[node] =
+          problem_.demand[node] > FEASIBILITY_EPS ? 0 : 1;
+    spec.relation_count = static_cast<int32_t>(
+        std::count_if(spec.node_class.begin(), spec.node_class.end(),
+                      [](int32_t value) { return value > 0; }));
+    spec.scope = ResourceScope::ROUTE;
+    break;
+  case ResourceOperator::PICKUP_DELIVERY:
+    // Each delivery requires its pickup first, and a route may not close while
+    // a pickup it served is undelivered.
+    spec.op = ResourceOperator::PRECEDENCE;
+    spec.relation = PrecedenceRelation::PAIRWISE;
+    spec.predecessor = problem_.pickup_of_delivery;
+    spec.successor = problem_.delivery_of_pickup;
+    spec.relation_count = static_cast<int32_t>(
+        std::count_if(spec.successor.begin(), spec.successor.end(),
+                      [](int32_t value) { return value >= 0; }));
+    spec.scope = ResourceScope::ROUTE;
+    publish_relation_node_term(spec, problem_.node_count);
+    break;
+  }
+  return spec;
+}
+
+void RoutingDecoder::build_resource_properties() {
+  resource_row_properties_.assign(
+      static_cast<size_t>(resource_count()) * RESOURCE_ROW_PROPERTY_DIM, 0.0f);
+  resource_term_properties_.clear();
+  resource_term_counts_.assign(resource_count(), 0);
   const auto squash = [](double value) {
     value = std::max(value, 0.0);
     return static_cast<float>(value / (1.0 + value));
   };
+  const auto sign_bit = [](double value) {
+    return value > 0.0 ? 1.0f : value < 0.0 ? 0.0f : 0.5f;
+  };
   for (int32_t index = 0; index < resource_count(); ++index) {
-    const ResourceSpec &spec = resources_[index];
-    float *descriptor = resource_descriptors_.data() +
-                        static_cast<size_t>(index) * RESOURCE_DESCRIPTOR_DIM;
-    switch (spec.op) {
-    case ResourceOperator::AFFINE_ACCUMULATOR:
-    case ResourceOperator::CAPACITY:
-    case ResourceOperator::ROUTE_LIMIT:
-    case ResourceOperator::TOUR_LIMIT:
-    case ResourceOperator::PRIZE_QUOTA:
-      descriptor[0] = 1.0f;
-      descriptor[20] = 1.0f;
-      break;
-    case ResourceOperator::TIME_WINDOW:
-      descriptor[1] = 1.0f;
-      descriptor[21] = 1.0f;
-      break;
-    case ResourceOperator::BACKHAUL_ORDER:
-      descriptor[2] = 1.0f;
-      descriptor[22] = 1.0f;
-      break;
-    case ResourceOperator::PICKUP_DELIVERY:
-      descriptor[3] = 1.0f;
-      descriptor[22] = 1.0f;
-      break;
+    const ResourceSpec &spec = resource(index);
+    float *row = resource_row_properties_.data() +
+                 static_cast<size_t>(index) * RESOURCE_ROW_PROPERTY_DIM;
+    // Independent properties of the row, not membership tests over an enum.
+    // Every complementary pair, every constant, and every property of a
+    // declaration the parser rejects has been removed: a dimension earns its
+    // place by being separately observable, so the encoding's width is a claim
+    // about the language rather than about the implementation.
+    const bool scalar = spec.op == ResourceOperator::AFFINE_ACCUMULATOR;
+    const bool relation = spec.op == ResourceOperator::PRECEDENCE;
+    // Carries state through an extension function, versus constraining the
+    // order nodes may be served in. A relation is the complement, so it needs
+    // no slot of its own; the relation form below is read only when this is 0.
+    row[0] = scalar;
+    // Relation form. Pairwise ties two nodes; the class order is its
+    // complement within a relation, so one bit separates the two.
+    row[1] = relation && spec.relation == PrecedenceRelation::PAIRWISE;
+    // Which sides of the bound are finite, and whether either varies by node.
+    row[2] = std::isfinite(spec.lower);
+    row[3] = std::isfinite(spec.upper);
+    row[4] = !spec.lower_values.empty() || !spec.upper_values.empty();
+    // How early admissibility is decided: an ordinal, not a one-hot.
+    // transition (1,1) < route end (0,1) < solution end (0,0), so the pair
+    // orders the check phases and a new phase falls between existing points.
+    row[5] = spec.bound_check == BoundCheck::TRANSITION;
+    row[6] = spec.bound_check != BoundCheck::SOLUTION_END;
+    // Whether the state resets at the depot. Solution scope is the complement.
+    row[7] = spec.scope == ResourceScope::ROUTE;
+    // How far past the transition the bound is projected: the return leg, and
+    // whether that projection is construction-only.
+    row[8] = spec.horizon == BoundHorizon::RETURN;
+    row[9] = spec.horizon == BoundHorizon::RETURN_CONSTRUCTION;
+    // Quantitative: state width, and the initial value split into magnitude
+    // and sign so a sign flip is not a large step in the same coordinate.
+    row[10] = squash(spec.state_dim);
+    row[11] = squash(std::abs(spec.initial) / spec.scale);
+    row[12] = sign_bit(spec.initial);
+    // Density of the declared relation, the order-constraint analogue of an
+    // increment magnitude: how much of the instance this relation constrains.
+    //
+    // A matching and a class order have at most one relation per node, so their
+    // relation count *is* that quantity. A DAG does not: it holds up to one
+    // relation per ordered pair, and dividing an O(n^2) count by n leaves the
+    // coordinate outside [0, 1] and off the scale every trained row sits on.
+    // Counting order-constrained nodes instead restores both, and reads the
+    // same way across all three relation forms. relation_count keeps the edge
+    // count, which is the right denominator for pressure and nothing else.
+    int32_t constrained = spec.relation_count;
+    if (spec.relation == PrecedenceRelation::DAG) {
+      constrained = 0;
+      for (size_t node = 0; node + 1 < spec.predecessor_offsets.size(); ++node) {
+        if (spec.predecessor_offsets[node + 1] > spec.predecessor_offsets[node])
+          ++constrained;
+      }
     }
-    const bool has_lower = std::isfinite(spec.lower) ||
-                           spec.op == ResourceOperator::PRIZE_QUOTA;
-    const bool has_upper = std::isfinite(spec.upper) ||
-                           spec.op == ResourceOperator::CAPACITY ||
-                           spec.op == ResourceOperator::TIME_WINDOW ||
-                           spec.op == ResourceOperator::ROUTE_LIMIT ||
-                           spec.op == ResourceOperator::TOUR_LIMIT;
-    descriptor[has_lower && has_upper ? 7 : has_lower ? 5 : has_upper ? 6 : 4] =
-        1.0f;
-    descriptor[8 + static_cast<int32_t>(spec.bound_check)] = 1.0f;
-    descriptor[11 + static_cast<int32_t>(spec.direction)] = 1.0f;
-    descriptor[14 + static_cast<int32_t>(spec.scope)] = 1.0f;
-    const bool event_reset = !spec.reset_nodes.empty();
-    descriptor[event_reset ? 19 : spec.reset_at_depot ? 18 : 17] = 1.0f;
-    descriptor[23] = !spec.node_values.empty() ? 1.0f : 0.0f;
-    descriptor[24] =
-        (spec.edge_uses_distance || !spec.edge_values.empty()) ? 1.0f : 0.0f;
-    descriptor[25] =
-        spec.op == ResourceOperator::PICKUP_DELIVERY ? 1.0f : 0.0f;
-    descriptor[26] = spec.edge_coefficient >= 0.0f &&
-                             spec.node_coefficient >= 0.0f
+    row[13] = relation && problem_.node_count > 0
+                  ? static_cast<float>(static_cast<double>(constrained) /
+                                       problem_.node_count)
+                  : 0.0f;
+    // Direction had two slots. Execution is forward-only and the parser
+    // rejects the others, so both were a constant: a property of a
+    // declaration that cannot exist is not a property.
+
+    resource_term_counts_[index] = static_cast<int32_t>(spec.terms.size());
+    for (const ResourceTerm &term : spec.terms) {
+      const size_t offset = resource_term_properties_.size();
+      resource_term_properties_.resize(offset + RESOURCE_TERM_PROPERTY_DIM,
+                                       0.0f);
+      float *property = resource_term_properties_.data() + offset;
+      // WHERE THE VALUE COMES FROM. Three independent facts, not a four-way
+      // membership test: a constant reads neither endpoint nor the pair, so it
+      // is the origin of this subspace rather than a slot.
+      property[0] = term.source == TermSource::NODE_ATTRIBUTE;
+      property[1] = term.source == TermSource::EDGE_ATTRIBUTE ||
+                    term.source == TermSource::DISTANCE;
+      // The metric is the one source that is intrinsic to the instance rather
+      // than a declared array, which is a real distinction: it is the only
+      // quantity a new problem always has.
+      property[2] = term.source == TermSource::DISTANCE;
+      property[3] = term.point == TermPoint::FROM;
+
+      // WHAT THE OPERATION DOES TO THE STATE. Algebraic characterization, so
+      // a future operation is a combination of these rather than a new slot.
+      const bool add = term.operation == TermOperation::ADD;
+      const bool join = term.operation == TermOperation::JOIN;
+      const bool assign = term.operation == TermOperation::ASSIGN;
+      const bool checkpoint = term.operation == TermOperation::CHECKPOINT;
+      const bool restore = term.operation == TermOperation::RESTORE;
+      // Linear in the incoming state (x -> x + c).
+      property[4] = add;
+      // Discards the incoming state rather than combining with it.
+      property[5] = assign || restore;
+      // Applying it twice is applying it once.
+      property[6] = join || assign || checkpoint || restore;
+      // Reads or writes the shadow copy rather than the live value; the only
+      // axis on which a checkpoint differs from a join, and a restore from an
+      // assignment.
+      property[7] = checkpoint || restore;
+      // Which way a join moves the value. Ordinal rather than a pair of flags:
+      // min is 0, max is 1, and no join sits between them, so a further
+      // semiring is a value on this axis and not a new one.
+      property[8] = !join ? 0.5f
+                    : spec.semiring == ResourceSemiring::MAX_PLUS ? 1.0f
+                    : spec.semiring == ResourceSemiring::MIN_PLUS ? 0.0f
+                                                                  : 0.5f;
+
+      // WHEN IT ACTS. Phase relative to the admissibility test, then three
+      // independent facts about the trigger. `RESET_ARRIVAL` and
+      // `CHECKPOINT_ARRIVAL` need no slot: they are conditional, not
+      // failure-driven, not departure-side, and the operation axis above
+      // already separates a checkpoint from a reset.
+      property[9] = term.phase == TermPhase::AFTER_BOUND;
+      property[10] = term.trigger != TermTrigger::ALWAYS;
+      property[11] = term.trigger == TermTrigger::BOUND_FAILURE;
+      property[12] = term.trigger == TermTrigger::RESET_DEPARTURE;
+      // Where it fires: at any depot, or at declared nodes.
+      property[13] = term.trigger_at_depot;
+      property[14] = !term.trigger_nodes.empty();
+
+      // WHETHER A PREDICATE OVER THE UNSERVED REMAINDER SUPPRESSES IT.
+      property[15] = term.gate != TermGate::ALWAYS;
+      // Signed polarity in one coordinate: which side of the remainder the
+      // gate selects, zero when ungated.
+      property[16] = term.gate == TermGate::ALWAYS ? 0.5f
+                     : term.gate == TermGate::REMAINDER_ALTERNATIVE
                          ? 1.0f
                          : 0.0f;
-    descriptor[27] = spec.edge_coefficient <= 0.0f &&
-                             spec.node_coefficient <= 0.0f
-                         ? 1.0f
-                         : 0.0f;
-    descriptor[28] = squash(spec.state_dim);
-    // Slot 29 used to compare spec.scale with distance_scale_. That ratio is
-    // not semantic for resources with unrelated units (capacity/distance,
-    // time/distance, battery/distance) and made the network sensitive to a
-    // harmless change of physical units. Keep the reserved slot neutral; the
-    // normalized magnitude below carries scale-free quantitative information.
-    descriptor[29] = 0.0f;
-    double magnitude = 0.0;
-    if (spec.edge_uses_distance)
-      magnitude += std::abs(spec.edge_coefficient) * distance_scale_;
-    for (float value : spec.edge_values)
-      magnitude += std::abs(value * spec.edge_coefficient);
-    for (float value : spec.node_values)
-      magnitude += std::abs(value * spec.node_coefficient);
-    const size_t count = spec.edge_values.size() + spec.node_values.size() +
-                         (spec.edge_uses_distance ? 1 : 0);
-    descriptor[30] = squash(count ? magnitude / count / spec.scale : 0.0);
-    const double events =
-        std::count(spec.reset_nodes.begin(), spec.reset_nodes.end(), uint8_t{1});
-    descriptor[31] = problem_.node_count > 0
-                         ? static_cast<float>(events / problem_.node_count)
-                         : 0.0f;
+      property[17] = sign_bit(term.gate_sign);
+      double magnitude = 0.0;
+      size_t count = 0;
+      if (term.source == TermSource::DISTANCE) {
+        magnitude = std::abs(term.coefficient) * distance_scale_;
+        count = 1;
+      } else if (term.source == TermSource::CONSTANT) {
+        magnitude = std::abs(term.coefficient * term.constant);
+        count = 1;
+      } else {
+        for (float value : term.values)
+          magnitude += std::abs(term.coefficient * value);
+        count = term.values.size();
+      }
+      // HOW LARGE IT IS, split from its direction so a sign flip is not a
+      // large step along the magnitude axis.
+      property[18] = squash(count ? magnitude / count / spec.scale : 0.0);
+      // The coefficient's direction. Kept apart from the gate sign above:
+      // folding them would conflate two unrelated polarities.
+      property[19] = sign_bit(term.coefficient);
+    }
   }
 }
 
@@ -841,22 +1994,31 @@ bool RoutingDecoder::field_channel_active(int32_t channel) const {
 
 float RoutingDecoder::objective_edge_cost(int32_t from, int32_t to) const {
   const float travel = problem_.dist(from, to);
+  const ObjectiveSpec &obj = problem_.objective;
   if (to < problem_.depot_count)
-    // The return-to-depot leg is charged its real travel for closed routes and
-    // is genuinely free for open routes -- exactly matching the true objective
-    // accumulated in transition()/finish(). Charging it for open routes used to
-    // hide a phantom cost in the ranking energy that the learned field had to
-    // counteract, making guidance net-harmful on open variants. The
-    // fragmentation this previously guarded against (free returns making the
-    // depot the cheapest move at every step) is now handled structurally in
-    // select_next(), which drops depot options while a customer can still
-    // legally extend the open route.
-    return problem_.open_route ? 0.0f : travel;
+    // The return-to-depot leg is charged through the declared travel term for
+    // closed routes and is genuinely free for open routes -- exactly matching
+    // the true objective accumulated in transition()/finish(). Charging it for
+    // open routes used to hide a phantom cost in the ranking energy that the
+    // learned field had to counteract, making guidance net-harmful on open
+    // variants. The fragmentation this previously guarded against (free returns
+    // making the depot the cheapest move at every step) is now handled
+    // structurally in select_next(), which drops depot options while a customer
+    // can still legally extend the open route.
+    //
+    // It used to charge raw travel here, which is the declared term only when
+    // the objective happens to be plain minimized distance. A prize objective
+    // declares no travel term at all (distance_coeff == 0, sense == -1), so raw
+    // travel put a cost on the depot leg that the objective does not contain and
+    // that no positive rescale of the coefficients could move.
+    return problem_.open_route
+               ? 0.0f
+               : obj.sense * obj.distance_coeff * travel +
+                     obj.distance_regularizer * travel / distance_scale_;
   // Marginal change to the (minimization-normalized) objective from traversing
   // into `to`: it adds `travel`, collects `prize[to]`, and removes `penalty[to]`
   // from the unvisited set. The regularizer is a scale-relative travel tie-break
   // for node-only objectives that would otherwise leave many edges tied.
-  const ObjectiveSpec &obj = problem_.objective;
   return obj.sense * (obj.distance_coeff * travel +
                       obj.visit_coeff * problem_.prize[to] -
                       obj.miss_coeff * problem_.penalty[to]) +
@@ -894,26 +2056,13 @@ std::vector<float> RoutingDecoder::resource_scales() const {
 }
 
 float RoutingDecoder::runtime_resource_scale(int32_t resource_index) const {
-  const ResourceSpec &spec = resource(resource_index);
-  switch (spec.op) {
-  case ResourceOperator::CAPACITY:
-    return resource_scale(static_cast<int32_t>(FieldChannel::CAPACITY));
-  case ResourceOperator::TIME_WINDOW:
-    return resource_scale(static_cast<int32_t>(FieldChannel::TIME_WINDOW));
-  case ResourceOperator::ROUTE_LIMIT:
-    return resource_scale(static_cast<int32_t>(FieldChannel::ROUTE_LIMIT));
-  case ResourceOperator::TOUR_LIMIT:
-    return resource_scale(static_cast<int32_t>(FieldChannel::TOUR_LIMIT));
-  case ResourceOperator::BACKHAUL_ORDER:
-    return resource_scale(static_cast<int32_t>(FieldChannel::BACKHAUL_ORDER));
-  case ResourceOperator::PICKUP_DELIVERY:
-    return resource_scale(static_cast<int32_t>(FieldChannel::PICKUP_DELIVERY));
-  case ResourceOperator::PRIZE_QUOTA:
-    return resource_scale(static_cast<int32_t>(FieldChannel::PRIZE_QUOTA));
-  case ResourceOperator::AFFINE_ACCUMULATOR:
-    return std::max(spec.scale, EPS);
-  }
-  return 1.0f;
+  // Every row carries its own normalization. An op->channel switch used to sit
+  // here, so a compiled kernel's scale came from its channel while a declared
+  // row's came from the row; the two answers had to be kept in agreement by
+  // hand, and a row whose operator matched a compiled kernel could not choose
+  // its own units. build_resource_registry now resolves the scale once, into
+  // the row, whichever path produced it.
+  return std::max(resource(resource_index).scale, EPS);
 }
 
 float RoutingDecoder::objective_scale() const {
@@ -932,8 +2081,15 @@ float RoutingDecoder::objective_scale() const {
   }
   if (count == 0)
     return 0.0f;
-  const double ratio =
-      (total / static_cast<double>(count)) / std::max(distance_scale_, EPS);
+  // Normalize by the objective's own energy scale, not by a distance scale:
+  // objective_edge_cost mixes travel with prize and penalty terms, so dividing
+  // it by a length made the ratio depend on the unit the instance happened to
+  // be written in and on a positive rescale of the coefficients, neither of
+  // which changes the problem. Against the row-centered RMS of the same
+  // quantity the ratio is dimensionless -- it reports how offset-dominated the
+  // objective is, which is what the field can actually use.
+  const double ratio = (total / static_cast<double>(count)) /
+                       std::max<double>(objective_energy_scale_, EPS);
   // ratio / (1 + ratio) squashes [0, inf) into [0, 1) without a hard clamp.
   return static_cast<float>(ratio / (1.0 + ratio));
 }
@@ -1038,65 +2194,206 @@ float RoutingDecoder::analytic_resource_pressure(int32_t from, int32_t to,
 
 float RoutingDecoder::runtime_resource_pressure(int32_t from, int32_t to,
                                                 int32_t resource_index) const {
-  const ResourceSpec &spec = resource(resource_index);
+  // A kernel that publishes a declaration is priced from that declaration, so
+  // the pressure the model sees does not depend on which execution path a
+  // constraint happens to take. Only a kernel outside the language keeps its
+  // hand-written per-channel formula.
+  return resource_pressure_of(resource(resource_index), from, to);
+}
+
+float RoutingDecoder::compiled_pressure_of(const ResourceSpec &spec,
+                                           int32_t from, int32_t to) const {
+  // The kernel's own hand-written per-channel formula, selected by which kernel
+  // runs the row. resource_pressure_of reads the row's algebra instead; the two
+  // must agree, which is what test_published_pressure_matches_the_compiled_kernel
+  // checks.
   if (!spec.active)
     return 0.0f;
-  switch (spec.op) {
-  case ResourceOperator::CAPACITY:
+  switch (spec.fast_path) {
+  case FastPath::NONE:
+    return resource_pressure_of(spec, from, to);
+  case FastPath::CAPACITY:
+  case FastPath::TIME_WINDOW:
+  case FastPath::ROUTE_LIMIT:
+  case FastPath::TOUR_LIMIT:
+  case FastPath::BACKHAUL_ORDER:
+  case FastPath::PICKUP_DELIVERY:
+  case FastPath::PRIZE_QUOTA:
     return analytic_resource_pressure(
-        from, to, static_cast<int32_t>(FieldChannel::CAPACITY));
-  case ResourceOperator::TIME_WINDOW:
-    return analytic_resource_pressure(
-        from, to, static_cast<int32_t>(FieldChannel::TIME_WINDOW));
-  case ResourceOperator::ROUTE_LIMIT:
-    return analytic_resource_pressure(
-        from, to, static_cast<int32_t>(FieldChannel::ROUTE_LIMIT));
-  case ResourceOperator::TOUR_LIMIT:
-    return analytic_resource_pressure(
-        from, to, static_cast<int32_t>(FieldChannel::TOUR_LIMIT));
-  case ResourceOperator::BACKHAUL_ORDER:
-    return analytic_resource_pressure(
-        from, to, static_cast<int32_t>(FieldChannel::BACKHAUL_ORDER));
-  case ResourceOperator::PICKUP_DELIVERY:
-    return analytic_resource_pressure(
-        from, to, static_cast<int32_t>(FieldChannel::PICKUP_DELIVERY));
-  case ResourceOperator::PRIZE_QUOTA:
-    return analytic_resource_pressure(
-        from, to, static_cast<int32_t>(FieldChannel::PRIZE_QUOTA));
-  case ResourceOperator::AFFINE_ACCUMULATOR: {
-    double delta = 0.0;
-    if (spec.edge_uses_distance)
-      delta += spec.edge_coefficient * problem_.dist(from, to);
-    if (!spec.edge_values.empty())
-      delta += spec.edge_coefficient *
-               spec.edge_values[static_cast<size_t>(from) *
-                                    problem_.node_count +
-                                to];
-    if (!spec.node_values.empty())
-      delta += spec.node_coefficient * spec.node_values[to];
-    // Pressure is the bound-worsening magnitude in physical units. Lower-bound
-    // resources (battery remaining) worsen on negative extension; upper-bound
-    // accumulators worsen on positive extension.
-    if (std::isfinite(spec.lower) && !std::isfinite(spec.upper))
-      return static_cast<float>(std::max(-delta, 0.0));
-    return static_cast<float>(std::max(delta, 0.0));
-  }
+        from, to, static_cast<int32_t>(spec.fast_path) - 1);
   }
   return 0.0f;
 }
 
-float RoutingDecoder::candidate_resource_relevance(
-    int32_t from, int32_t to, int32_t resource_index) const {
-  const ResourceSpec &spec = resource(resource_index);
+float RoutingDecoder::compiled_resource_pressure(int32_t from, int32_t to,
+                                                 int32_t resource_index) const {
+  // The registry row's own pricing, bypassing its published declaration. This
+  // is the reference the declaration has to reproduce: a published row that
+  // prices differently from the kernel it replaces is a silent feature-level
+  // divergence that solve-level equivalence cannot see, because both sides of
+  // that comparison read the same published algebra.
+  return compiled_pressure_of(resource(resource_index), from, to);
+}
+
+std::vector<float> RoutingDecoder::compiled_resource_pressures() const {
+  std::vector<float> result(static_cast<size_t>(edge_count()) *
+                                resource_count(),
+                            0.0f);
+  for (int32_t from = 0; from < problem_.node_count; ++from) {
+    for (int32_t edge = edge_offsets_[from]; edge < edge_offsets_[from + 1];
+         ++edge) {
+      for (int32_t index = 0; index < resource_count(); ++index) {
+        result[static_cast<size_t>(edge) * resource_count() + index] =
+            compiled_resource_pressure(from, edge_to_[edge], index);
+      }
+    }
+  }
+  return result;
+}
+
+float RoutingDecoder::resource_pressure_of(const ResourceSpec &spec,
+                                           int32_t from, int32_t to) const {
   if (!spec.active)
     return 0.0f;
-  float relevance = runtime_resource_pressure(from, to, resource_index) /
-                    std::max(runtime_resource_scale(resource_index), EPS);
-  const bool resets = (to < problem_.depot_count && spec.reset_at_depot) ||
-                      (!spec.reset_nodes.empty() && spec.reset_nodes[to]);
-  if (resets)
-    relevance = std::max(relevance, 1.0f);
-  return relevance;
+  switch (spec.op) {
+  case ResourceOperator::PRECEDENCE: {
+    // Precedence pressure is the share of the row's relations an edge puts in
+    // the wrong order: entering a successor whose predecessor is not the node
+    // we came from, or descending to an earlier class. Both are read off the
+    // row's own arrays rather than from a per-channel formula. What counts as
+    // one relation differs by relation kind, so the denominator does too.
+    if (spec.relation == PrecedenceRelation::PAIRWISE) {
+      // One relation per pair, which is what relation_count counts here.
+      const float share = 1.0f / std::max(spec.relation_count, 1);
+      const int32_t required =
+          spec.predecessor.empty() ? -1
+                                   : spec.predecessor[static_cast<size_t>(to)];
+      return required >= 0 && required != from ? share : 0.0f;
+    }
+    if (spec.relation == PrecedenceRelation::DAG) {
+      // Same share per relation, counted with multiplicity: an arc into a node
+      // with many outstanding predecessors is under more pressure than one into
+      // a node with a single predecessor, which the matching case cannot show.
+      if (spec.predecessor_offsets.empty())
+        return 0.0f;
+      const float share = 1.0f / std::max(spec.relation_count, 1);
+      const size_t head = static_cast<size_t>(to);
+      float pending = 0.0f;
+      for (int32_t at = spec.predecessor_offsets[head];
+           at < spec.predecessor_offsets[head + 1]; ++at) {
+        if (spec.predecessor_list[static_cast<size_t>(at)] != from)
+          pending += 1.0f;
+      }
+      return pending * share;
+    }
+    if (spec.node_class.empty())
+      return 0.0f;
+    // A route-scoped class order resets at the depot, so entering one ends the
+    // ordering rather than taking part in it. Without this the depot's class
+    // (zero, the lowest, because published_algebra only classifies customers)
+    // made every backhaul->depot arc read as a descent -- pressure on the
+    // ordinary way a backhaul route closes, and on nothing the kernel prices.
+    if (spec.scope == ResourceScope::ROUTE && to < problem_.depot_count)
+      return 0.0f;
+    // Every classified node takes part in a class order: a linehaul is as much
+    // a party to "linehaul before backhaul" as a backhaul is. relation_count
+    // counts only the nonzero classes, which is the right quantity for the
+    // descriptor (it reports how much of the instance is constrained) but the
+    // wrong one here -- it would scale this pressure with the instance's
+    // composition, reading one misordered arc twenty times larger at a five
+    // percent backhaul share than at sixty, for the identical violation.
+    const float share = 1.0f / std::max(problem_.customer_count(), 1);
+    return spec.node_class[static_cast<size_t>(from)] >
+                   spec.node_class[static_cast<size_t>(to)]
+               ? share
+               : 0.0f;
+  }
+  case ResourceOperator::AFFINE_ACCUMULATOR: {
+    if (tropical(spec)) {
+    // Tropical pressure: how far the transition pushes outside the row's window
+    // in either direction -- arriving before the target opens (wait) or after it
+    // closes (warp). Every term is read off this row's own clamp, bound, and
+    // departure fields, so it is the same quantity the hand-written time-window
+    // formula computed, without a per-channel case.
+    // Edge-sourced accumulation only: a node term is the arrival's own charge,
+    // not the travel between the pair.
+    double travel = 0.0;
+    for (const ResourceTerm &term : spec.terms) {
+      if (term.operation == TermOperation::ADD &&
+          term.phase == TermPhase::BEFORE_BOUND &&
+          term.trigger == TermTrigger::ALWAYS &&
+          term.source != TermSource::NODE_ATTRIBUTE)
+        travel += term_value(term, from, to);
+    }
+    // The departure charge is levied at the node being left.
+    const double departure = phase_total(spec, TermPhase::AFTER_BOUND, from, from);
+    const auto floor_at = [&](int32_t node) {
+      const float value = spec_join_operand(spec, node);
+      return std::isfinite(value) ? static_cast<double>(value) : 0.0;
+    };
+    const double wait =
+        std::isfinite(spec_upper(spec, from))
+            ? std::max(floor_at(to) - spec_upper(spec, from) - departure -
+                           travel,
+                       0.0)
+            : 0.0;
+    const double warp =
+        std::isfinite(spec_upper(spec, to))
+            ? std::max(floor_at(from) + departure + travel -
+                           spec_upper(spec, to),
+                       0.0)
+            : 0.0;
+    return static_cast<float>(wait + warp);
+    }
+    // Arithmetic semiring: the pressure is the plain signed increment measured
+    // against whichever bounds the row declares.
+    // Only unconditional ADD terms before the bound price an edge. An opening correction or a
+    // departure term is not what traversing this edge costs, and reading them
+    // here is exactly the mistake that made a depot-to-pickup edge look like it
+    // consumed a whole vehicle.
+    const double delta = phase_total(spec, TermPhase::BEFORE_BOUND, from, to);
+    // A declared horizon commits the depot return leg as well, so the pressure
+    // an edge exerts includes it. Without this a row declaring
+    // `horizon: return` reports half the pressure of the compiled route- and
+    // tour-limit kernels it is otherwise equivalent to.
+    double horizon_leg = 0.0;
+    if (spec.horizon != BoundHorizon::TRANSITION && !problem_.open_route &&
+        problem_.depot_count > 0) {
+      horizon_leg = std::numeric_limits<double>::infinity();
+      for (int32_t depot = 0; depot < problem_.depot_count; ++depot) {
+        double leg = 0.0;
+        for (const ResourceTerm &term : spec.terms) {
+          if (term.operation == TermOperation::ADD &&
+              term.phase == TermPhase::BEFORE_BOUND &&
+              term.trigger == TermTrigger::ALWAYS &&
+              term.source != TermSource::NODE_ATTRIBUTE)
+            leg += term_value(term, to, depot);
+        }
+        horizon_leg = std::min(horizon_leg, std::abs(leg));
+      }
+    }
+    // Pressure is the bound-worsening magnitude in physical units, summed over
+    // whichever bounds the row actually declares. A two-sided row (capacity:
+    // 0 <= load <= cap) worsens in BOTH directions -- a linehaul consumes
+    // toward the floor, a backhaul fills toward the ceiling -- so selecting a
+    // single branch by which bound happens to be finite silently zeroed the
+    // linehaul side on every pure-capacity variant. The floor term depends on
+    // what the bound means: a terminal requirement (a prize quota, tested when
+    // the route ends) is priced by how much of it this edge leaves unmet, while
+    // an invariant floor (a battery that must never run out) is priced by how
+    // far this edge descends. The two coincide wherever the floor is zero.
+    double pressure = 0.0;
+    if (std::isfinite(spec_upper(spec, to)))
+      pressure += std::max(delta, 0.0);
+    const double floor_bound = spec_lower(spec, to);
+    if (std::isfinite(floor_bound))
+      pressure += spec.bound_check == BoundCheck::ROUTE_END
+                      ? std::max(floor_bound - delta, 0.0)
+                      : std::max(-delta, 0.0);
+    return static_cast<float>(pressure + horizon_leg);
+  }
+  }
+  return 0.0f;
 }
 
 void RoutingDecoder::validate_guidance(const float *edge_field,
@@ -1176,46 +2473,22 @@ std::vector<float> RoutingDecoder::live_state_features(const State &state) const
   const auto unit = [](double value) {
     return static_cast<float>(std::clamp(value, 0.0, 1.0));
   };
-  const double route_scale =
-      std::isfinite(problem_.route_limit)
-          ? std::max<double>(problem_.route_limit, EPS)
-          : distance_scale_;
-  const double tour_scale =
-      std::isfinite(problem_.tour_limit)
-          ? std::max<double>(problem_.tour_limit, EPS)
-          : time_scale_;
   std::vector<float> result(resource_count(), 0.0f);
   for (int32_t index = 0; index < resource_count(); ++index) {
     if (!resource(index).active)
       continue;
-    switch (resource(index).op) {
-    case ResourceOperator::CAPACITY:
-      result[index] = unit(1.0 - state.load / std::max(problem_.capacity, EPS));
-      break;
-    case ResourceOperator::TIME_WINDOW:
-      result[index] = unit(state.current_time / time_scale_);
-      break;
-    case ResourceOperator::ROUTE_LIMIT:
-      result[index] = unit(state.route_distance / route_scale);
-      break;
-    case ResourceOperator::TOUR_LIMIT:
-      result[index] = unit(state.route_distance / tour_scale);
-      break;
-    case ResourceOperator::BACKHAUL_ORDER:
-      result[index] = state.route_has_backhaul ? 1.0f : 0.0f;
-      break;
-    case ResourceOperator::PICKUP_DELIVERY:
-      result[index] = unit(static_cast<double>(state.open_pickups) /
-                           std::max(pair_count_, 1));
-      break;
-    case ResourceOperator::PRIZE_QUOTA:
-      result[index] = unit(1.0 - state.collected_prize /
-                                     std::max(problem_.prize_quota, EPS));
-      break;
-    case ResourceOperator::AFFINE_ACCUMULATOR:
-      result[index] = resource_state_feature(state, index);
-      break;
-    }
+    // A row that publishes a declaration is read through that declaration: its
+    // state is mirrored into the generic vector, so the feature the model sees
+    // does not depend on which path executes the constraint.
+    // One path: the row's own declaration. A per-channel switch used to sit
+    // here as a fallback for compiled kernels, reachable only before the
+    // registry was built; a row now arrives already stating its algebra.
+    const ResourceSpec &spec = resource(index);
+    result[index] =
+        spec.op == ResourceOperator::PRECEDENCE
+            ? unit(static_cast<double>(state.resource_state[index]) /
+                   std::max(spec.relation_count, 1))
+            : resource_state_feature(state, index);
   }
   return result;
 }
@@ -1224,14 +2497,15 @@ float RoutingDecoder::resource_state_feature(const State &state,
                                              int32_t resource_index) const {
   const ResourceSpec &spec = resource(resource_index);
   const float value = state.resource_state[resource_index];
-  if (std::isfinite(spec.lower) && std::isfinite(spec.upper))
-    return std::clamp((value - spec.lower) /
-                          std::max(spec.upper - spec.lower, EPS),
+  const float lower = spec_lower(spec, state.current);
+  const float upper = spec_upper(spec, state.current);
+  if (std::isfinite(lower) && std::isfinite(upper))
+    return std::clamp((value - lower) / std::max(upper - lower, EPS), 0.0f,
+                      1.0f);
+  if (std::isfinite(lower))
+    return std::clamp(1.0f - (value - lower) / runtime_resource_scale(resource_index),
                       0.0f, 1.0f);
-  if (std::isfinite(spec.lower))
-    return std::clamp(1.0f - (value - spec.lower) / runtime_resource_scale(resource_index),
-                      0.0f, 1.0f);
-  if (std::isfinite(spec.upper))
+  if (std::isfinite(upper))
     return std::clamp(value / runtime_resource_scale(resource_index), 0.0f, 1.0f);
   return std::clamp(std::abs(value) / runtime_resource_scale(resource_index),
                     0.0f, 1.0f);
@@ -1292,9 +2566,11 @@ void RoutingDecoder::record_decision(RolloutTrace *trace, int32_t current,
                                      const std::vector<int32_t> &valid_indices,
                                      int32_t chosen_index, bool stochastic,
                                      float log_probability,
-                                     const float *live_state) const {
-  if (trace == nullptr || chosen_index < 0 || live_state == nullptr)
+                                     const std::vector<float> &live_state) const {
+  if (trace == nullptr || chosen_index < 0)
     return;
+  if (static_cast<int32_t>(live_state.size()) != live_state_feature_count())
+    throw std::logic_error("live state must have one value per registry row");
   trace->current_nodes.push_back(current);
   trace->valid_indices.insert(trace->valid_indices.end(), valid_indices.begin(),
                               valid_indices.end());
@@ -1303,8 +2579,8 @@ void RoutingDecoder::record_decision(RolloutTrace *trace, int32_t current,
   trace->chosen_indices.push_back(chosen_index);
   trace->stochastic.push_back(stochastic ? 1 : 0);
   trace->log_probabilities.push_back(log_probability);
-  trace->live_state.insert(trace->live_state.end(), live_state,
-                           live_state + live_state_feature_count());
+  trace->live_state.insert(trace->live_state.end(), live_state.begin(),
+                           live_state.end());
 }
 
 void RoutingDecoder::record_feasibility_labels(RolloutTrace *trace,
@@ -1424,31 +2700,6 @@ void RoutingDecoder::build_candidate_graph(const std::vector<int32_t> &incumbent
     kd_tree = std::make_unique<KDTree2D>(problem_.coordinates);
   }
 
-  // Effective per-resource candidate allocation, constant across source nodes.
-  // The schema-derived candidate_resource_relevance is the deterministic,
-  // variant-agnostic admission rule: when the learned quota policy has installed
-  // fractions we honor them, otherwise we synthesize a uniform equal-share over
-  // active resources (plus an implicit geometric slot, mirroring the learned
-  // head's softmax structure). This keeps a newly declared resource covered with
-  // no per-variant tuning. GEOMETRIC mode drops resource channels entirely.
-  std::vector<float> effective_quotas;
-  if (candidate_config_.candidate_mode == CandidateMode::SCHEMA) {
-    if (!candidate_resource_quotas_.empty()) {
-      effective_quotas = candidate_resource_quotas_;
-    } else {
-      int32_t active = 0;
-      for (const ResourceSpec &spec : resources_)
-        active += spec.active ? 1 : 0;
-      if (active > 0) {
-        effective_quotas.assign(resource_count(), 0.0f);
-        const float share = 1.0f / static_cast<float>(active + 1);
-        for (int32_t index = 0; index < resource_count(); ++index)
-          if (resources_[index].active)
-            effective_quotas[index] = share;
-      }
-    }
-  }
-
   std::vector<std::vector<int32_t>> rows(n);
   std::vector<int32_t> included_at(n, -1);
   for (int32_t from = 0; from < n; ++from) {
@@ -1473,46 +2724,6 @@ void RoutingDecoder::build_candidate_graph(const std::vector<int32_t> &incumbent
     }
 
     const int32_t target = std::max(k, static_cast<int32_t>(rows[from].size()));
-    const int32_t allocatable = target - static_cast<int32_t>(rows[from].size());
-    if (!effective_quotas.empty() && allocatable > 0) {
-      for (int32_t resource_index = 0; resource_index < resource_count();
-           ++resource_index) {
-        const int32_t quota = std::min(
-            allocatable,
-            static_cast<int32_t>(std::floor(
-                effective_quotas[resource_index] * allocatable)));
-        if (quota <= 0 || !resource(resource_index).active)
-          continue;
-        std::vector<int32_t> ranked;
-        ranked.reserve(n - 1);
-        for (int32_t to = 0; to < n; ++to) {
-          if (to != from && included_at[to] != from)
-            ranked.push_back(to);
-        }
-        std::sort(ranked.begin(), ranked.end(), [&](int32_t lhs, int32_t rhs) {
-          const float lhs_score =
-              candidate_resource_relevance(from, lhs, resource_index);
-          const float rhs_score =
-              candidate_resource_relevance(from, rhs, resource_index);
-          if (lhs_score != rhs_score)
-            return lhs_score > rhs_score;
-          const float lhs_distance = problem_.dist(from, lhs);
-          const float rhs_distance = problem_.dist(from, rhs);
-          return lhs_distance == rhs_distance ? lhs < rhs
-                                              : lhs_distance < rhs_distance;
-        });
-        int32_t admitted = 0;
-        for (int32_t to : ranked) {
-          if (candidate_resource_relevance(from, to, resource_index) <= 0.0f)
-            break;
-          admitted += add(to) ? 1 : 0;
-          if (admitted >= quota || static_cast<int32_t>(rows[from].size()) >= target)
-            break;
-        }
-        if (static_cast<int32_t>(rows[from].size()) >= target)
-          break;
-      }
-    }
     const int32_t query_count =
         std::min(n - 1, target + problem_.depot_count);
     const std::vector<int32_t> nearest =
@@ -1573,9 +2784,18 @@ void RoutingDecoder::build_candidate_graph(const std::vector<int32_t> &incumbent
                            channel] =
             runtime_resource_pressure(from, to, channel);
         const ResourceSpec &spec = resource(channel);
-        const bool reset =
-            (to < problem_.depot_count && spec.reset_at_depot) ||
-            (!spec.reset_nodes.empty() && spec.reset_nodes[to]);
+        const bool reset = std::any_of(
+            spec.terms.begin(), spec.terms.end(), [&](const ResourceTerm &term) {
+              if (term.trigger == TermTrigger::RESET_DEPARTURE)
+                return term_event_matches(term, from, to,
+                                          to < problem_.depot_count, false);
+              if (term.trigger == TermTrigger::RESET_ARRIVAL)
+                return term_event_matches(term, from, to,
+                                          to < problem_.depot_count, false);
+              return term.operation == TermOperation::CHECKPOINT &&
+                     from >= 0 && !term.trigger_nodes.empty() &&
+                     term.trigger_nodes[from];
+            });
         resource_events_[static_cast<size_t>(edge) * resource_count() +
                          channel] = reset ? 1.0f : 0.0f;
       }
@@ -1611,14 +2831,210 @@ void RoutingDecoder::build_candidate_graph(const std::vector<int32_t> &incumbent
   ++graph_version_;
 }
 
+void RoutingDecoder::build_incumbent_suffix_state() {
+  // Reverse counterpart of the forward incumbent replay: for every resource at
+  // once, how much of that row the REMAINING route still spends. Walking the
+  // incumbent backwards accumulates each row's own declared increment -- node
+  // term plus outgoing edge term, or the open-relation delta for a precedence
+  // row -- so a declared row gets the quantity the hand-written backward_load /
+  // backward_time / backward_open_pickups slots only ever gave three compiled
+  // kernels. A route-scoped row resets at its depot, so each node reports its
+  // own route's remainder rather than the whole tour's.
+  //
+  // Replaying transition() in reverse would not do: resources are not
+  // symmetric (a time window read backwards is not a time window), whereas the
+  // accumulated increment is well defined in either direction.
+  const int32_t n = problem_.node_count;
+  incumbent_suffix_state_.assign(static_cast<size_t>(n) * resource_count(),
+                                 0.0f);
+  incumbent_suffix_features_.assign(
+      static_cast<size_t>(n) * resource_count() *
+          RESOURCE_SUFFIX_FEATURE_COUNT,
+      0.0f);
+  if (incumbent_route_.empty())
+    return;
+  const auto unit = [](double value) {
+    return static_cast<float>(std::clamp(value, 0.0, 1.0));
+  };
+  // Resolved once per row, not once per (position, row): published_algebra
+  // returns by value and reassigns several node-sized vectors, so calling it
+  // inside the walk deep-copied the whole spec route_length times over. It
+  // depends only on the registry row and the problem, neither of which moves
+  // during the walk, so hoisting it is an exact no-op.
+  std::vector<ResourceSpec> specs(resource_count());
+  for (int32_t index = 0; index < resource_count(); ++index) {
+    if (resource(index).active)
+      specs[index] = resource(index);
+  }
+  std::vector<double> running(resource_count(), 0.0);
+  std::vector<std::array<double, RESOURCE_SUFFIX_FEATURE_COUNT>>
+      running_features(resource_count());
+  for (auto &parts : running_features)
+    parts.fill(0.0);
+  for (int32_t position = static_cast<int32_t>(incumbent_route_.size()) - 1;
+       position >= 0; --position) {
+    const int32_t node = incumbent_route_[position];
+    const int32_t next =
+        position + 1 < static_cast<int32_t>(incumbent_route_.size())
+            ? incumbent_route_[position + 1]
+            : -1;
+    const bool at_depot = node < problem_.depot_count;
+    for (int32_t index = 0; index < resource_count(); ++index) {
+      if (!resource(index).active)
+        continue;
+      const ResourceSpec &spec = specs[index];
+      const double scale = std::max<double>(spec.scale, EPS);
+      double increment = 0.0;
+      double departure = 0.0;
+      if (spec.op == ResourceOperator::PRECEDENCE) {
+        increment = static_cast<double>(open_relation_delta(node));
+      } else {
+        increment += node_term_total(spec, node);
+        if (next >= 0) {
+          for (const ResourceTerm &term : spec.terms) {
+            if (term.operation == TermOperation::ADD &&
+                term.phase == TermPhase::BEFORE_BOUND &&
+                term.trigger == TermTrigger::ALWAYS &&
+                term.source != TermSource::NODE_ATTRIBUTE)
+              increment += term_value(term, node, next);
+          }
+        }
+        // A departure term is charged by transition() after serving this node.
+        // Omitting it made a time-window suffix contain travel but none of the
+        // remaining service time.  Keep it separate as well as in the total so
+        // a shared encoder can recover either statistic without knowing that the
+        // row happens to be a time window.
+        departure = phase_total(spec, TermPhase::AFTER_BOUND, node, node);
+        increment += departure;
+      }
+      const double total = running[index] + increment;
+      incumbent_suffix_state_[static_cast<size_t>(node) * resource_count() +
+                              index] = unit(std::abs(total) / scale);
+      auto &parts = running_features[index];
+      parts[static_cast<int32_t>(ResourceSuffixFeature::POSITIVE_TOTAL)] +=
+          std::max(increment, 0.0);
+      parts[static_cast<int32_t>(ResourceSuffixFeature::NEGATIVE_TOTAL)] +=
+          std::max(-increment, 0.0);
+      parts[static_cast<int32_t>(
+          ResourceSuffixFeature::POSITIVE_DEPARTURE)] +=
+          std::max(departure, 0.0);
+      parts[static_cast<int32_t>(
+          ResourceSuffixFeature::NEGATIVE_DEPARTURE)] +=
+          std::max(-departure, 0.0);
+      float *published = incumbent_suffix_features_.data() +
+                         (static_cast<size_t>(node) * resource_count() + index) *
+                             RESOURCE_SUFFIX_FEATURE_COUNT;
+      for (int32_t feature = 0; feature < RESOURCE_SUFFIX_FEATURE_COUNT;
+           ++feature)
+        published[feature] = unit(parts[feature] / scale);
+      // Going backwards, a depot is the START of the route just accumulated, so
+      // the reset applies after it is reported.
+      const bool reset = at_depot && std::any_of(
+          spec.terms.begin(), spec.terms.end(), [](const ResourceTerm &term) {
+            return term.operation == TermOperation::ASSIGN &&
+                   term.trigger == TermTrigger::RESET_ARRIVAL &&
+                   term.trigger_at_depot;
+          });
+      running[index] = reset ? 0.0 : total;
+      if (reset)
+        parts.fill(0.0);
+    }
+  }
+}
+
 void RoutingDecoder::build_model_features() {
   const int32_t n = problem_.node_count;
   const auto unit = [](double value) {
     return static_cast<float>(std::clamp(value, 0.0, 1.0));
   };
   node_features_.assign(static_cast<size_t>(n) * NODE_FEATURE_COUNT, 0.0f);
+  // Per-node, per-resource attributes from each row's published algebra. This
+  // reads published_algebra rather than declared_algebra on purpose: where a
+  // kernel abstains it is the extension rule that escapes the language (a
+  // state-dependent reload, a cross-row duration, an exempt class), never the
+  // per-node quantities, so the attributes here stay exact even when the row
+  // as a whole is not publishable.
+  node_resource_features_.assign(
+      static_cast<size_t>(n) * resource_count() * NODE_RESOURCE_FEATURE_COUNT,
+      0.0f);
+  for (int32_t index = 0; index < resource_count(); ++index) {
+    if (!resource(index).active)
+      continue;
+    const ResourceSpec &spec = resource(index);
+    const double scale = std::max<double>(spec.scale, EPS);
+    // Highest declared class, so the rank below is a position in [0, 1] rather
+    // than a raw label whose meaning would change with the number of classes.
+    int32_t top_class = 0;
+    for (int32_t value : spec.node_class)
+      top_class = std::max(top_class, value);
+    for (int32_t node = 0; node < n; ++node) {
+      float *slot = node_resource_features_.data() +
+                    (static_cast<size_t>(node) * resource_count() + index) *
+                        NODE_RESOURCE_FEATURE_COUNT;
+      const double increment = node_term_total(spec, node);
+      slot[0] = unit(std::max(increment, 0.0) / scale);
+      slot[1] = unit(std::max(-increment, 0.0) / scale);
+      slot[2] = 0.0f;
+      for (const ResourceTerm &term : spec.terms) {
+        if (term.operation == TermOperation::JOIN) {
+          slot[2] = unit(term_value(term, node, node) / scale);
+          break;
+        }
+      }
+      // The binding side of the bound, normalized. An unbounded row reports 1,
+      // matching how an infinite window end has always been encoded.
+      const float upper = spec_upper(spec, node);
+      const float lower = spec_lower(spec, node);
+      slot[3] = std::isfinite(upper)  ? unit(upper / scale)
+                : std::isfinite(lower) ? unit(lower / scale)
+                                       : 1.0f;
+      slot[4] = !std::any_of(spec.terms.begin(), spec.terms.end(),
+                             [](const ResourceTerm &term) {
+                               return term.operation == TermOperation::ADD &&
+                                      term.phase == TermPhase::AFTER_BOUND;
+                             })
+                    ? 0.0f
+                    : unit(phase_total(spec, TermPhase::AFTER_BOUND, node, node) /
+                           scale);
+      // Rank within whatever order this row declares. A class order reports the
+      // node's class; a pairwise relation reports which side of the pair the
+      // node sits on, which is the two-element case of the same thing. Zero
+      // means "this row declares no order here", so a node that takes part in
+      // no relation stays distinguishable from the lowest class.
+      float rank = 0.0f;
+      if (!spec.node_class.empty()) {
+        rank = static_cast<float>(spec.node_class[node] + 1) /
+               static_cast<float>(top_class + 1);
+      } else if (!spec.successor.empty() || !spec.predecessor.empty()) {
+        const bool opens = !spec.successor.empty() && spec.successor[node] >= 0;
+        const bool requires_partner =
+            !spec.predecessor.empty() && spec.predecessor[node] >= 0;
+        // Three positions rather than two, because a chain's middle node both
+        // opens an obligation and requires one. Its NET increment is zero --
+        // correctly, it adds one and closes one -- so slots 0 and 1 alone
+        // cannot tell it from a node in no relation at all. Ordering the
+        // positions head < middle < tail keeps this a rank rather than a
+        // category, and makes (opens, requires) recoverable from it.
+        const int32_t position =
+            (opens && requires_partner) ? 2 : (opens ? 1 : 3);
+        if (opens || requires_partner)
+          rank = static_cast<float>(position) / 3.0f;
+      }
+      slot[5] = unit(rank);
+    }
+  }
   incumbent_live_state_.assign(
       static_cast<size_t>(n) * resource_count(), 0.0f);
+  incumbent_suffix_state_.assign(
+      static_cast<size_t>(n) * resource_count(), 0.0f);
+  incumbent_transition_features_.assign(
+      static_cast<size_t>(edge_count()) * resource_count() *
+          RESOURCE_TRANSITION_FEATURE_COUNT,
+      0.0f);
+  incumbent_transition_feature_mask_.assign(
+      static_cast<size_t>(edge_count()) * resource_count(), 0);
+  node_objective_features_.assign(
+      static_cast<size_t>(n) * OBJECTIVE_NODE_TERM_COUNT, 0.0f);
 
   float min_x = 0.0f;
   float min_y = 0.0f;
@@ -1636,14 +3052,7 @@ void RoutingDecoder::build_model_features() {
     }
     coordinate_scale = std::max({max_x - min_x, max_y - min_y, EPS});
   }
-  const float capacity_scale = std::max(problem_.capacity, EPS);
-  const float route_scale =
-      resource_scale(static_cast<int32_t>(FieldChannel::ROUTE_LIMIT));
-  const float tour_scale =
-      resource_scale(static_cast<int32_t>(FieldChannel::TOUR_LIMIT));
-  int32_t pair_count = 0;
   for (int32_t node = 0; node < n; ++node) {
-    pair_count += problem_.delivery_of_pickup[node] >= 0 ? 1 : 0;
     float *features = node_features_.data() +
                       static_cast<size_t>(node) * NODE_FEATURE_COUNT;
     if (!problem_.coordinates.empty()) {
@@ -1653,32 +3062,26 @@ void RoutingDecoder::build_model_features() {
                          coordinate_scale);
     }
     features[2] = node < problem_.depot_count ? 1.0f : 0.0f;
-    features[3] = unit(std::max(problem_.demand[node], 0.0f) / capacity_scale);
-    features[4] = unit(std::max(-problem_.demand[node], 0.0f) / capacity_scale);
-    features[5] = unit(problem_.prize[node] / prize_scale_);
-    features[6] = unit(problem_.penalty[node] / penalty_scale_);
-    features[7] = unit(problem_.tw_start[node] / time_scale_);
-    features[8] = std::isfinite(problem_.tw_end[node])
-                      ? unit(problem_.tw_end[node] / time_scale_)
-                      : 1.0f;
-    features[9] = unit(problem_.service_time[node] / time_scale_);
-    features[10] = problem_.delivery_of_pickup[node] >= 0 ? 1.0f : 0.0f;
-    features[11] = problem_.pickup_of_delivery[node] >= 0 ? 1.0f : 0.0f;
+    // opens_relation / requires_relation used to sit here. A pairwise row now
+    // publishes the same information as its node term, so it arrives through
+    // node_resource_features under the shared per-resource weights -- and a
+    // class-ordered row, which these two columns never described at all, is
+    // covered by the same slot.
+    float *objective = node_objective_features_.data() +
+                       static_cast<size_t>(node) * OBJECTIVE_NODE_TERM_COUNT;
+    objective[0] = unit(problem_.prize[node] / prize_scale_);
+    objective[1] = unit(problem_.penalty[node] / penalty_scale_);
   }
 
-  double cumulative_prize = 0.0;
   const auto scan_route = [&](const std::vector<int32_t> &nodes,
                               int32_t depot) {
     if (nodes.empty())
       return;
-    bool has_linehaul = false;
-    for (int32_t node : nodes)
-      has_linehaul |= problem_.demand[node] > FEASIBILITY_EPS;
-    float load = has_linehaul ? problem_.capacity : 0.0f;
+    // Only the clock and the running distance are still needed here: the load
+    // and open-pair counters they used to feed are written per resource by the
+    // incumbent replay and build_incumbent_suffix_state.
     float time = 0.0f;
     float distance = 0.0f;
-    int32_t open = 0;
-    bool backhaul = false;
     int32_t previous = depot >= 0 ? depot : nodes.front();
     for (size_t index = 0; index < nodes.size(); ++index) {
       const int32_t node = nodes[index];
@@ -1687,78 +3090,35 @@ void RoutingDecoder::build_model_features() {
         distance += travel;
         time = std::max(time + travel, problem_.tw_start[node]);
       }
-      load -= problem_.demand[node];
-      backhaul |= problem_.demand[node] < -FEASIBILITY_EPS;
-      cumulative_prize += problem_.prize[node];
-      if (problem_.delivery_of_pickup[node] >= 0)
-        ++open;
-      if (problem_.pickup_of_delivery[node] >= 0)
-        --open;
       float *features = node_features_.data() +
                         static_cast<size_t>(node) * NODE_FEATURE_COUNT;
-      features[12] = 1.0f;
-      features[13] = nodes.size() == 1
+      features[3] = 1.0f;
+      features[4] = nodes.size() == 1
                          ? 0.0f
                          : unit(static_cast<double>(index) /
                                 static_cast<double>(nodes.size() - 1));
-      features[14] = unit(load / capacity_scale);
-      features[15] = unit(time / time_scale_);
-      features[16] = std::isfinite(problem_.tw_end[node])
-                         ? unit((problem_.tw_end[node] - time) / time_scale_)
-                         : 1.0f;
-      features[17] = unit(static_cast<double>(std::max(open, 0)) /
-                          std::max(pair_count, 1));
-      features[18] = unit(distance / distance_scale_);
+      features[5] = unit(distance / distance_scale_);
+      // Load, clock, slack and open-pair counters used to be written here, one
+      // slot per constraint. They are written per resource instead, by the
+      // incumbent replay (forward) and build_incumbent_suffix_state (reverse),
+      // so a declared row is described the same way a compiled one is.
       const float state_time = time + problem_.service_time[node];
-      float *live = incumbent_live_state_.data() +
-                    static_cast<size_t>(node) * resource_count();
-      const auto set_field_resource = [&](FieldChannel channel, float value) {
-        const int32_t slot = field_resource_index(channel);
-        if (slot >= 0)
-          live[slot] = value;
-      };
-      set_field_resource(FieldChannel::CAPACITY, 1.0f - features[14]);
-      set_field_resource(FieldChannel::TIME_WINDOW, unit(state_time / time_scale_));
-      set_field_resource(FieldChannel::ROUTE_LIMIT, unit(distance / route_scale));
-      set_field_resource(FieldChannel::TOUR_LIMIT, unit(distance / tour_scale));
-      set_field_resource(FieldChannel::BACKHAUL_ORDER, backhaul ? 1.0f : 0.0f);
-      set_field_resource(FieldChannel::PICKUP_DELIVERY, features[17]);
-      set_field_resource(FieldChannel::PRIZE_QUOTA,
-                    unit(1.0 - cumulative_prize /
-                                   std::max<double>(problem_.prize_quota, EPS)));
       time = state_time;
       previous = node;
     }
     float backward = depot >= 0 && !problem_.open_route
                          ? problem_.dist(nodes.back(), depot)
                          : 0.0f;
-    float suffix_load = 0.0f;
-    float suffix_time = backward;
-    float suffix_slack = 1.0f;
-    int32_t suffix_open = 0;
     for (int32_t index = static_cast<int32_t>(nodes.size()) - 1; index >= 0;
          --index) {
       const int32_t node = nodes[index];
       float *features = node_features_.data() +
                         static_cast<size_t>(node) * NODE_FEATURE_COUNT;
-      features[19] = unit(backward / distance_scale_);
-      suffix_load += std::abs(problem_.demand[node]);
-      suffix_time += problem_.service_time[node];
-      suffix_slack = std::min(suffix_slack, features[16]);
-      if (problem_.pickup_of_delivery[node] >= 0)
-        ++suffix_open;
-      if (problem_.delivery_of_pickup[node] >= 0)
-        suffix_open = std::max(suffix_open - 1, 0);
-      features[20] = unit(suffix_load / capacity_scale);
-      features[21] = unit(suffix_time / time_scale_);
-      features[22] = unit(suffix_slack);
-      features[23] = unit(static_cast<double>(suffix_open) /
-                          std::max(pair_count, 1));
-      if (index > 0) {
-        const float travel = problem_.dist(nodes[index - 1], node);
-        backward += travel;
-        suffix_time += travel;
-      }
+      features[6] = unit(backward / distance_scale_);
+      // The per-constraint suffix counters that used to be written here are now
+      // build_incumbent_suffix_state's job, for every resource at once.
+      if (index > 0)
+        backward += problem_.dist(nodes[index - 1], node);
     }
   };
 
@@ -1782,6 +3142,139 @@ void RoutingDecoder::build_model_features() {
       }
     }
     State replay = initial_state(incumbent_route_.front());
+    const auto store_transition_features = [&](const State &prefix) {
+      const int32_t from = prefix.current;
+      if (from < 0 || from >= n)
+        return;
+      for (int32_t edge = edge_offsets_[from]; edge < edge_offsets_[from + 1];
+           ++edge) {
+        const int32_t next = edge_to_[edge];
+        const bool depot = next < problem_.depot_count;
+        for (int32_t resource_index = 0; resource_index < resource_count();
+             ++resource_index) {
+          const ResourceSpec &spec = resource(resource_index);
+          if (!spec.active)
+            continue;
+          const size_t row = static_cast<size_t>(edge) * resource_count() +
+                             resource_index;
+          incumbent_transition_feature_mask_[row] = 1;
+          float *feature = incumbent_transition_features_.data() +
+                           row * RESOURCE_TRANSITION_FEATURE_COUNT;
+
+          bool feasible = true;
+          float next_value = prefix.resource_state[resource_index];
+          float signed_margin = 1.0f;
+          if (spec.op == ResourceOperator::PRECEDENCE) {
+            const bool predecessor_served = precedence_prerequisites_met(
+                spec, next, [&](int32_t node) {
+                  return prefix.visited[static_cast<size_t>(node)] != 0;
+                });
+            feasible = precedence_admits(spec, next, depot, next_value,
+                                          predecessor_served);
+            next_value = precedence_next_state(spec, next, depot, next_value);
+            signed_margin = feasible ? 1.0f : -1.0f;
+          } else {
+            float since_rest = has_operation(spec, TermOperation::CHECKPOINT)
+                                   ? prefix.resource_since_rest[resource_index]
+                                   : next_value;
+            feasible = extend_declared(
+                spec, from, next, prefix.route_depot, false,
+                prefix.reset_guard_remaining, resource_index,
+                next_value, since_rest, nullptr, nullptr, &signed_margin);
+            signed_margin = std::clamp(
+                signed_margin /
+                    std::max(runtime_resource_scale(resource_index), EPS),
+                -1.0f, 1.0f);
+          }
+
+          // The declaration supplies the transferable margin, but a compiled
+          // executor remains authoritative for its post-state and legality.
+          // Usually the two are identical. The override matters precisely on
+          // the few semantics outside the declaration language (for example a
+          // backhaul capacity reload or a driver break affecting the clock),
+          // and preserves the direct signal the v6 named columns carried.
+          const FastPath executor = fast_path(spec);
+          if (executor != FastPath::NONE) {
+            feasible = resource_transition_feasible(
+                prefix, next, resource_index, nullptr, false);
+            const float travel = problem_.dist(from, next);
+            switch (executor) {
+            case FastPath::CAPACITY:
+              next_value = depot ? depot_reload(prefix)
+                                 : opening_load(prefix, next) -
+                                       problem_.demand[next];
+              break;
+            case FastPath::TIME_WINDOW:
+              next_value = depot
+                               ? 0.0f
+                               : std::max(slot(prefix, FieldChannel::TIME_WINDOW) +
+                                              transition_break_duration(prefix,
+                                                                        next) +
+                                              travel,
+                                          problem_.tw_start[next]) +
+                                     problem_.service_time[next];
+              break;
+            case FastPath::ROUTE_LIMIT:
+              next_value = depot ? 0.0f
+                                 : slot(prefix, FieldChannel::ROUTE_LIMIT) +
+                                       travel;
+              break;
+            case FastPath::TOUR_LIMIT:
+              next_value = depot ? 0.0f
+                                 : slot(prefix, FieldChannel::TOUR_LIMIT) +
+                                       travel;
+              break;
+            case FastPath::BACKHAUL_ORDER:
+              next_value = depot
+                               ? 0.0f
+                               : (slot(prefix, FieldChannel::BACKHAUL_ORDER) >
+                                          FEASIBILITY_EPS ||
+                                      problem_.demand[next] < -FEASIBILITY_EPS
+                                      ? 1.0f
+                                      : 0.0f);
+              break;
+            case FastPath::PICKUP_DELIVERY:
+              next_value = slot(prefix, FieldChannel::PICKUP_DELIVERY);
+              if (!depot) {
+                if (problem_.delivery_of_pickup[next] >= 0)
+                  next_value += 1.0f;
+                if (problem_.pickup_of_delivery[next] >= 0)
+                  next_value -= 1.0f;
+              }
+              break;
+            case FastPath::PRIZE_QUOTA:
+              next_value = slot(prefix, FieldChannel::PRIZE_QUOTA) +
+                           (depot ? 0.0f : problem_.prize[next]);
+              break;
+            case FastPath::NONE:
+              break;
+            }
+          }
+
+          float next_state = 0.0f;
+          if (spec.op == ResourceOperator::PRECEDENCE) {
+            next_state = std::clamp(
+                next_value / static_cast<float>(std::max(spec.relation_count, 1)),
+                0.0f, 1.0f);
+          } else {
+            State projected = prefix;
+            projected.current = next;
+            projected.resource_state[resource_index] = next_value;
+            next_state = resource_state_feature(projected, resource_index);
+          }
+          // Keep the sign tied to the authoritative admissibility result even
+          // at the numerical boundary where a tiny tolerance decides legality.
+          if (feasible && signed_margin < 0.0f)
+            signed_margin = 0.0f;
+          if (!feasible && signed_margin >= 0.0f)
+            signed_margin = -std::max(FEASIBILITY_EPS, signed_margin);
+          feature[static_cast<int32_t>(
+              ResourceTransitionFeature::NEXT_STATE)] = next_state;
+          feature[static_cast<int32_t>(
+              ResourceTransitionFeature::SIGNED_MARGIN)] = signed_margin;
+        }
+      }
+    };
     const auto store_replay = [&](int32_t node) {
       const std::vector<float> live = live_state_features(replay);
       if (node >= 0 && node < n && !live.empty())
@@ -1790,13 +3283,16 @@ void RoutingDecoder::build_model_features() {
                       static_cast<size_t>(node) * resource_count());
     };
     store_replay(replay.current);
+    store_transition_features(replay);
     for (size_t index = 1; index < incumbent_route_.size(); ++index) {
       std::string error;
       if (!transition(replay, incumbent_route_[index], error))
         break;
       store_replay(replay.current);
+      store_transition_features(replay);
     }
   }
+  build_incumbent_suffix_state();
 
   // Reference counts make incremental removal robust when a depot edge occurs
   // in more than one route. Screening only needs the zero/nonzero predicate.
@@ -1818,6 +3314,16 @@ void RoutingDecoder::build_model_features() {
                             0.0f);
   edge_features_.assign(static_cast<size_t>(edge_count()) * EDGE_FEATURE_COUNT,
                         0.0f);
+  // Per-node in/out distance profiles over the candidate rows. On an
+  // asymmetric instance the x/y slots are empty (there are no coordinates), so
+  // these two carry the only node-level positional signal the model gets, and
+  // their difference is the node's own asymmetry. On a Euclidean instance they
+  // coincide and vary monotonically with remoteness from the candidate
+  // neighbourhood's centre, so the slots stay meaningful rather than dead.
+  std::vector<double> out_distance_total(n, 0.0);
+  std::vector<double> in_distance_total(n, 0.0);
+  std::vector<int32_t> out_degree(n, 0);
+  std::vector<int32_t> in_degree(n, 0);
   for (int32_t from = 0; from < n; ++from) {
     for (int32_t edge = edge_offsets_[from]; edge < edge_offsets_[from + 1];
          ++edge) {
@@ -1834,24 +3340,51 @@ void RoutingDecoder::build_model_features() {
       float *features = edge_features_.data() +
                         static_cast<size_t>(edge) * EDGE_FEATURE_COUNT;
       features[0] = unit(problem_.dist(from, to) / distance_scale_);
-      for (int32_t channel = 0; channel < FIELD_CHANNEL_COUNT; ++channel) {
-        const int32_t slot = field_resource_index(
-            static_cast<FieldChannel>(channel));
-        features[1 + channel] = slot >= 0 ? resources[slot] : 0.0f;
-      }
-      features[8] = incumbent_edges[edge] ? 1.0f : 0.0f;
-      features[9] = reverse_incumbent_edges[edge] ? 1.0f : 0.0f;
-      // Structural openness lever: on an open route the arrival-at-depot leg is
-      // genuinely free in the true objective, yet objective_edge_cost still
-      // charges its travel (to avoid greedy fragmenting the route into one
-      // customer per trip). Expose exactly that waived return distance on the
-      // depot-incident edges so the field can learn to discount them. This is
-      // problem-geometric (independent of any incumbent) and stays zero for
-      // closed routes, where the return leg is legitimately charged.
-      features[10] = problem_.open_route && to < problem_.depot_count
-                         ? features[0]
-                         : 0.0f;
+      // The seven per-channel pressure slots that sat here were a verbatim copy
+      // of the first seven columns of `resources`, which the model already
+      // reads per resource. Only the compiled kernels ever had one.
+      features[1] = incumbent_edges[edge] ? 1.0f : 0.0f;
+      features[2] = reverse_incumbent_edges[edge] ? 1.0f : 0.0f;
+      // The reverse leg's cost, which slot 0 cannot carry and which the reverse
+      // arc may never deliver: candidate rows are ranked per source, so (j, i)
+      // is often absent while (i, j) is present. Always defined -- the metric
+      // is queryable in both directions regardless of the candidate set --
+      // and it collapses onto slot 0 on symmetric instances.
+      features[4] = unit(problem_.dist(to, from) / distance_scale_);
+      const double travel = problem_.dist(from, to);
+      out_distance_total[from] += travel;
+      ++out_degree[from];
+      in_distance_total[to] += travel;
+      ++in_degree[to];
+      // The DECLARED objective's edge term, the counterpart of the node terms
+      // in node_objective_features. A waived open-route return leg used to be
+      // spelled out here as its own column, which was a hard-coded special case
+      // for one route structure; the objective already says the leg is free, so
+      // the model reads that rather than a flag. Squashed about 0.5 because the
+      // term is signed (a prize objective's edge cost can be negative) and
+      // unbounded, and divided by the energy scale so a positive rescale of the
+      // coefficients leaves it unchanged -- the same equivariance the token's
+      // coefficient encoding keeps.
+      const double objective_term =
+          objective_edge_cost(from, to) /
+          std::max<double>(objective_energy_scale_, EPS);
+      features[3] = unit(0.5 + 0.5 * objective_term /
+                                   (1.0 + std::abs(objective_term)));
     }
+  }
+  for (int32_t node = 0; node < n; ++node) {
+    float *features = node_features_.data() +
+                      static_cast<size_t>(node) * NODE_FEATURE_COUNT;
+    features[7] = out_degree[node] > 0
+                       ? unit(out_distance_total[node] /
+                              static_cast<double>(out_degree[node]) /
+                              distance_scale_)
+                       : 0.0f;
+    features[8] = in_degree[node] > 0
+                       ? unit(in_distance_total[node] /
+                              static_cast<double>(in_degree[node]) /
+                              distance_scale_)
+                       : 0.0f;
   }
 }
 
@@ -1878,10 +3411,18 @@ RoutingDecoder::State RoutingDecoder::initial_state(int32_t start_node) const {
   state.current = start_node;
   state.start_node = start_node;
   state.route.push_back(start_node);
-  state.load = problem_.capacity;
-  state.resource_state.resize(resource_count(), 0.0f);
-  for (int32_t index = 0; index < resource_count(); ++index)
-    state.resource_state[index] = resource(index).initial;
+  // The slot accessors index resource_state, so it has to exist before any of
+  // them is touched -- including the scratch tail an undeclared compiled
+  // channel writes to.
+  state.resource_state.assign(state_slot_count(), 0.0f);
+  state.resource_since_rest.assign(state_slot_count(), 0.0f);
+  state.reset_guard_remaining = initial_reset_guards();
+  for (int32_t index = 0; index < resource_count(); ++index) {
+    const float initial = resource(index).initial;
+    state.resource_state[index] = initial;
+    state.resource_since_rest[index] = initial;
+  }
+  slot(state, FieldChannel::CAPACITY) = problem_.capacity;
 
   if (problem_.depot_count == 0) {
     if (start_node < 0 || start_node >= problem_.node_count) {
@@ -1893,14 +3434,15 @@ RoutingDecoder::State RoutingDecoder::initial_state(int32_t start_node) const {
         problem_.demand[start_node] > FEASIBILITY_EPS ? 1 : 0;
     state.unvisited_backhauls -=
         problem_.demand[start_node] < -FEASIBILITY_EPS ? 1 : 0;
-    state.collected_prize = problem_.prize[start_node];
+    consume_reset_guards(state.reset_guard_remaining, start_node);
+    slot(state, FieldChannel::PRIZE_QUOTA) = problem_.prize[start_node];
   } else {
     if (start_node < 0 || start_node >= problem_.depot_count) {
       throw std::invalid_argument("a depot problem must start at a depot");
     }
     state.route_depot = start_node;
     state.at_depot = true;
-    state.load = depot_reload(state);
+    slot(state, FieldChannel::CAPACITY) = depot_reload(state);
   }
   return state;
 }
@@ -1909,89 +3451,127 @@ bool RoutingDecoder::resource_transition_feasible(const State &state,
                                                    int32_t next,
                                                    int32_t resource_index,
                                                    float *next_value,
-                                                   bool force_route_end) const {
+                                                   bool force_route_end,
+                                                   bool *optional_reset_taken,
+                                                   float *next_since_rest) const {
   const ResourceSpec &spec = resource(resource_index);
+  if (optional_reset_taken != nullptr)
+    *optional_reset_taken = false;
   if (!spec.active)
     return true;
   const bool depot = next < problem_.depot_count;
   const bool customer = !depot;
   const float travel = problem_.dist(state.current, next);
-  switch (spec.op) {
-  case ResourceOperator::CAPACITY:
+  // Dispatch on WHO EXECUTES the row, not on what it is. These branches used to
+  // be selected by spec.op, which meant a declared row stating the same algebra
+  // could never reach them and a compiled row could never be interpreted.
+  switch (fast_path(spec)) {
+  case FastPath::CAPACITY: {
     if (!customer)
       return true;
-    return state.load - problem_.demand[next] >= -FEASIBILITY_EPS &&
-           state.load - problem_.demand[next] <=
-               problem_.capacity + FEASIBILITY_EPS;
-  case ResourceOperator::TIME_WINDOW: {
+    const float load = opening_load(state, next);
+    return load - problem_.demand[next] >= -FEASIBILITY_EPS &&
+           load - problem_.demand[next] <= problem_.capacity + FEASIBILITY_EPS;
+  }
+  case FastPath::TIME_WINDOW: {
+    const float break_duration = transition_break_duration(state, next);
     if (force_route_end)
-      return state.current_time + travel <=
+      return slot(state, FieldChannel::TIME_WINDOW) + break_duration + travel <=
              problem_.tw_end[next] + FEASIBILITY_EPS;
     if (!customer)
       return true;
     const float arrival =
-        std::max(state.current_time + travel, problem_.tw_start[next]);
+        std::max(slot(state, FieldChannel::TIME_WINDOW) + break_duration + travel,
+                 problem_.tw_start[next]);
     if (arrival > problem_.tw_end[next] + FEASIBILITY_EPS)
       return false;
-    return problem_.open_route ||
-           arrival + problem_.service_time[next] +
-                   problem_.dist(next, state.route_depot) <=
-               problem_.tw_end[state.route_depot] + FEASIBILITY_EPS;
+    if (problem_.open_route)
+      return true;
+    State projected = state;
+    projected.current = next;
+    slot(projected, FieldChannel::TIME_WINDOW) = arrival + problem_.service_time[next];
+    for (int32_t index : scalar_resource_indices_) {
+      float value = projected.resource_state[index];
+      float rest = projected.resource_since_rest[index];
+      if (!resource_transition_feasible(state, next, index, &value, false,
+                                        nullptr, &rest))
+        return false;
+      projected.resource_state[index] = value;
+      projected.resource_since_rest[index] = rest;
+    }
+    const float return_break =
+        transition_break_duration(projected, state.route_depot);
+    return slot(projected, FieldChannel::TIME_WINDOW) + return_break +
+               problem_.dist(next, state.route_depot) <=
+           problem_.tw_end[state.route_depot] + FEASIBILITY_EPS;
   }
-  case ResourceOperator::ROUTE_LIMIT: {
+  case FastPath::ROUTE_LIMIT: {
     if (!customer && !force_route_end)
       return true;
-    float required = state.route_distance + travel;
+    float required = slot(state, FieldChannel::ROUTE_LIMIT) + travel;
     if (customer && !problem_.open_route)
       required += problem_.dist(next, state.route_depot);
     return required <= problem_.route_limit + FEASIBILITY_EPS;
   }
-  case ResourceOperator::TOUR_LIMIT:
+  case FastPath::TOUR_LIMIT:
     if (!customer && !force_route_end)
       return true;
-    return state.route_distance + travel +
+    return slot(state, FieldChannel::TOUR_LIMIT) + travel +
                (customer ? problem_.dist(next, state.route_depot) : 0.0f) <=
            problem_.tour_limit + FEASIBILITY_EPS;
-  case ResourceOperator::BACKHAUL_ORDER:
-    return !customer || !state.route_has_backhaul ||
+  case FastPath::BACKHAUL_ORDER:
+    return !customer || !slot(state, FieldChannel::BACKHAUL_ORDER) ||
            problem_.demand[next] <= FEASIBILITY_EPS;
-  case ResourceOperator::PICKUP_DELIVERY:
+  case FastPath::PICKUP_DELIVERY:
     if (depot)
-      return state.open_pickups == 0;
+      return slot(state, FieldChannel::PICKUP_DELIVERY) == 0;
     return problem_.pickup_of_delivery[next] < 0 ||
            state.visited[problem_.pickup_of_delivery[next]];
-  case ResourceOperator::PRIZE_QUOTA:
+  case FastPath::PRIZE_QUOTA:
     return customer ||
-           state.collected_prize + FEASIBILITY_EPS >= problem_.prize_quota ||
+           slot(state, FieldChannel::PRIZE_QUOTA) + FEASIBILITY_EPS >= problem_.prize_quota ||
            state.visited_customers >= problem_.customer_count();
-  case ResourceOperator::AFFINE_ACCUMULATOR:
+  case FastPath::NONE:
     break;
   }
 
-  float value = state.resource_state[resource_index];
-  const bool event_reset = !spec.reset_nodes.empty() && spec.reset_nodes[next];
-  if (spec.edge_uses_distance)
-    value += spec.edge_coefficient * travel;
-  if (!spec.edge_values.empty()) {
-    value += spec.edge_coefficient *
-             spec.edge_values[static_cast<size_t>(state.current) *
-                                  problem_.node_count +
-                              next];
+  // Interpreted: read the row's own algebra.
+  if (spec.op == ResourceOperator::PRECEDENCE) {
+    return precedence_admits(
+        spec, next, depot, state.resource_state[resource_index],
+        precedence_prerequisites_met(spec, next, [&](int32_t node) {
+          return state.visited[static_cast<size_t>(node)] != 0;
+        }));
   }
-  if (!spec.node_values.empty())
-    value += spec.node_coefficient * spec.node_values[next];
-  const bool check = spec.bound_check == BoundCheck::TRANSITION ||
-                     ((depot || force_route_end) &&
-                      spec.bound_check == BoundCheck::ROUTE_END);
-  const bool feasible = !check || (value >= spec.lower - FEASIBILITY_EPS &&
-                                   value <= spec.upper + FEASIBILITY_EPS);
-  if ((depot && spec.reset_at_depot) || event_reset)
-    value = spec.reset_value;
-  else if (depot && spec.scope == ResourceScope::ROUTE)
-    value = spec.initial;
+
+  float value = state.resource_state[resource_index];
+  float rest = has_operation(spec, TermOperation::CHECKPOINT)
+                   ? state.resource_since_rest[resource_index]
+                   : value;
+  const bool feasible =
+      extend_declared(spec, state.current, next, state.route_depot,
+                      force_route_end,
+                      state.reset_guard_remaining, resource_index,
+                      value, rest, optional_reset_taken);
   if (next_value != nullptr)
     *next_value = value;
+  if (next_since_rest != nullptr)
+    *next_since_rest = rest;
   return feasible;
+}
+
+float RoutingDecoder::transition_break_duration(const State &state,
+                                                 int32_t next) const {
+  float duration = 0.0f;
+  for (int32_t index : scalar_resource_indices_) {
+    bool reset_taken = false;
+    if (resource_transition_feasible(state, next, index, nullptr, false,
+                                     &reset_taken) &&
+        reset_taken) {
+      duration += resource(index).optional_reset_duration;
+    }
+  }
+  return duration;
 }
 
 bool RoutingDecoder::resource_terminal_feasible(const State &state,
@@ -1999,20 +3579,39 @@ bool RoutingDecoder::resource_terminal_feasible(const State &state,
   const ResourceSpec &spec = resource(resource_index);
   if (!spec.active)
     return true;
-  switch (spec.op) {
-  case ResourceOperator::PICKUP_DELIVERY:
-    return state.open_pickups == 0;
-  case ResourceOperator::AFFINE_ACCUMULATOR:
-    if (spec.bound_check == BoundCheck::SOLUTION_END ||
-        spec.bound_check == BoundCheck::ROUTE_END) {
-      const float value = state.resource_state[resource_index];
-      return value >= spec.lower - FEASIBILITY_EPS &&
-             value <= spec.upper + FEASIBILITY_EPS;
-    }
+  if (fast_path(spec) == FastPath::PICKUP_DELIVERY)
+    return slot(state, FieldChannel::PICKUP_DELIVERY) == 0;
+  if (fast_path(spec) != FastPath::NONE)
     return true;
-  default:
-    return true;
+  if (spec.op == ResourceOperator::PRECEDENCE)
+    return spec.relation == PrecedenceRelation::CLASS_ORDER ||
+           state.resource_state[resource_index] <= FEASIBILITY_EPS;
+  if (spec.bound_check == BoundCheck::SOLUTION_END ||
+      spec.bound_check == BoundCheck::ROUTE_END) {
+    const float value = state.resource_state[resource_index];
+    return value >= spec_lower(spec, state.current) - FEASIBILITY_EPS &&
+           value <= spec_upper(spec, state.current) + FEASIBILITY_EPS;
   }
+  return true;
+}
+
+bool RoutingDecoder::class_ordered() const {
+  if (problem_.has(BACKHAUL_ORDER))
+    return true;
+  for (int32_t index : precedence_resource_indices_) {
+    if (resource(index).relation == PrecedenceRelation::CLASS_ORDER)
+      return true;
+  }
+  return false;
+}
+
+float RoutingDecoder::opening_load(const State &state, int32_t next) const {
+  if (state.at_depot && class_ordered() &&
+      next >= problem_.depot_count &&
+      problem_.demand[next] < -FEASIBILITY_EPS) {
+    return 0.0f;
+  }
+  return slot(state, FieldChannel::CAPACITY);
 }
 
 float RoutingDecoder::depot_reload(const State &state) const {
@@ -2024,44 +3623,323 @@ float RoutingDecoder::depot_reload(const State &state) const {
   return state.unvisited_backhauls > 0 ? 0.0f : problem_.capacity;
 }
 
+float RoutingDecoder::return_horizon_slack(const ResourceSpec &spec,
+                                           int32_t next, int32_t depot,
+                                           float arrival_value,
+                                           const std::vector<int32_t> &remaining,
+                                           int32_t resource_index) const {
+  // Slack of `spec`'s bound after the depot return leg is appended to the
+  // arrival state at `next`. Positive means the bound still holds once the
+  // vehicle drives home. Both bounds are projected; an infinite bound
+  // contributes infinite slack, so the finite side decides.
+  //
+  // If `next` itself resets the accumulator on departure (a charger or a
+  // rest-eligible node), the return leg begins from the reset value. Arrival
+  // resets are already reflected in `arrival_value`; the optional departure
+  // reset of a break node is not, so account for it here.
+  const auto gate_matches = [&](const ResourceTerm &term) {
+    if (term.gate == TermGate::ALWAYS)
+      return true;
+    const size_t slot = static_cast<size_t>(2 * resource_index);
+    const bool alternative = slot + 1 < remaining.size() &&
+                             remaining[slot] == 0 &&
+                             remaining[slot + 1] > 0;
+    return term.gate == TermGate::REMAINDER_ALTERNATIVE ? alternative
+                                                        : !alternative;
+  };
+  float leg = arrival_value;
+  for (const ResourceTerm &term : spec.terms) {
+    const bool starts_new_leg =
+        term.operation == TermOperation::CHECKPOINT ||
+        term.operation == TermOperation::ASSIGN;
+    if (!starts_new_leg || !gate_matches(term) ||
+        !term_event_matches(term, next, next, false, false))
+      continue;
+    leg = term_value(term, next, next);
+  }
+  // The whole accumulation over the return edge: edge-sourced terms priced on
+  // (next, depot), node-sourced terms charged at the depot, exactly as an
+  // ordinary transition would.
+  apply_add_terms(spec, TermPhase::BEFORE_BOUND, next, depot, leg);
+  for (const ResourceTerm &term : spec.terms) {
+    if (term.operation == TermOperation::JOIN &&
+        term.phase == TermPhase::BEFORE_BOUND &&
+        term.trigger == TermTrigger::ALWAYS)
+      leg = join(spec, leg, term_value(term, next, depot));
+  }
+  return std::min(leg - spec_lower(spec, depot), spec_upper(spec, depot) - leg);
+}
+
+int32_t RoutingDecoder::relation_partner(int32_t node,
+                                         bool *node_is_predecessor) const {
+  const auto answer = [&](int32_t partner, bool predecessor) {
+    if (node_is_predecessor != nullptr)
+      *node_is_predecessor = predecessor;
+    return partner;
+  };
+  if (relation_successor_.empty())
+    return answer(-1, false);
+  if (relation_successor_[node] >= 0)
+    return answer(relation_successor_[node], true);
+  if (relation_predecessor_[node] >= 0)
+    return answer(relation_predecessor_[node], false);
+  return answer(-1, false);
+}
+
+int32_t RoutingDecoder::open_relation_delta(int32_t node) const {
+  // Net change in unresolved pairwise obligations when `node` is served. The
+  // SRR piece cutter may only split a route where this prefix is zero, so a
+  // declared pairwise relation constrains the move set exactly as the compiled
+  // pickup-delivery kernel always has.
+  int32_t delta = 0;
+  if (relation_successor_.empty())
+    return delta;
+  // The index already excludes solution-scoped relations, which permit their
+  // two nodes to sit in different routes and so must not restrict where a route
+  // may be cut.
+  if (relation_successor_[node] >= 0)
+    ++delta;
+  if (relation_predecessor_[node] >= 0)
+    --delta;
+  return delta;
+}
+
+int32_t RoutingDecoder::precedence_required(const ResourceSpec &spec,
+                                            int32_t next) {
+  if (spec.relation != PrecedenceRelation::PAIRWISE || spec.predecessor.empty())
+    return -1;
+  return spec.predecessor[static_cast<size_t>(next)];
+}
+
+bool RoutingDecoder::precedence_admits(const ResourceSpec &spec, int32_t next,
+                                       bool depot, float state_value,
+                                       bool predecessor_served) {
+  const bool route_scoped = spec.scope == ResourceScope::ROUTE;
+  switch (spec.relation) {
+  case PrecedenceRelation::PAIRWISE:
+    // A route-scoped relation must be resolved before the route closes, which
+    // is what confines a pair to one route. A solution-scoped one only requires
+    // the predecessor to come first somewhere, so the depot always admits and
+    // the obligation survives to the terminal check.
+    if (depot)
+      return !route_scoped || state_value <= FEASIBILITY_EPS;
+    return predecessor_served;
+  case PrecedenceRelation::CLASS_ORDER:
+    // Classes are served in non-decreasing order; a route-scoped row restarts
+    // the order at each depot, a solution-scoped one carries it across routes.
+    if (depot || spec.node_class.empty())
+      return true;
+    return static_cast<float>(spec.node_class[static_cast<size_t>(next)]) >=
+           state_value - FEASIBILITY_EPS;
+  case PrecedenceRelation::DAG:
+    // The whole relation is enforced here: a node is admitted only once every
+    // predecessor is served, so a route that reaches the end has satisfied it
+    // edge by edge. The depot opens and closes routes and takes part in no
+    // ordering, so it always admits.
+    return depot || predecessor_served;
+  }
+  return true;
+}
+
+float RoutingDecoder::precedence_next_state(const ResourceSpec &spec,
+                                            int32_t next, bool depot,
+                                            float state_value) {
+  const bool route_scoped = spec.scope == ResourceScope::ROUTE;
+  switch (spec.relation) {
+  case PrecedenceRelation::PAIRWISE: {
+    if (depot)
+      return route_scoped ? 0.0f : state_value;
+    float open = state_value;
+    if (!spec.successor.empty() &&
+        spec.successor[static_cast<size_t>(next)] >= 0)
+      open += 1.0f;
+    if (!spec.predecessor.empty() &&
+        spec.predecessor[static_cast<size_t>(next)] >= 0)
+      open -= 1.0f;
+    return open;
+  }
+  case PrecedenceRelation::CLASS_ORDER:
+    if (depot)
+      return route_scoped ? 0.0f : state_value;
+    return spec.node_class.empty()
+               ? state_value
+               : std::max(state_value,
+                          static_cast<float>(
+                              spec.node_class[static_cast<size_t>(next)]));
+  case PrecedenceRelation::DAG: {
+    // Unresolved obligations remaining: every relation whose head is still
+    // unserved. Serving a node discharges exactly its in-degree, so the counter
+    // reaches zero once every node has been served -- the same "no obligation
+    // outstanding" reading the pairwise counter has, and the same terminal test.
+    if (depot || spec.predecessor_offsets.empty())
+      return state_value;
+    const size_t head = static_cast<size_t>(next);
+    const float indegree =
+        static_cast<float>(spec.predecessor_offsets[head + 1] -
+                           spec.predecessor_offsets[head]);
+    return state_value - indegree;
+  }
+  }
+  return state_value;
+}
+
+bool RoutingDecoder::extend_declared(const ResourceSpec &spec, int32_t from,
+                                     int32_t next, int32_t route_depot,
+                                     bool force_route_end,
+                                     const std::vector<int32_t> &remaining,
+                                     int32_t resource_index,
+                                     float &value, float &rest,
+                                     bool *break_taken, float *bounded_value,
+                                     float *admissibility_margin) const {
+  const bool depot = next < problem_.depot_count;
+  const auto gate_matches = [&](const ResourceTerm &term) {
+    if (term.gate == TermGate::ALWAYS)
+      return true;
+    const size_t slot = static_cast<size_t>(2 * resource_index);
+    const bool alternative = slot + 1 < remaining.size() &&
+                             remaining[slot] == 0 &&
+                             remaining[slot + 1] > 0;
+    return term.gate == TermGate::REMAINDER_ALTERNATIVE ? alternative
+                                                        : !alternative;
+  };
+  double triggered_add = 0.0;
+  for (const ResourceTerm &term : spec.terms) {
+    if (term.operation != TermOperation::ADD ||
+        term.phase != TermPhase::BEFORE_BOUND ||
+        term.trigger == TermTrigger::ALWAYS ||
+        !term_event_matches(term, from, next, depot, false) ||
+        !gate_matches(term))
+      continue;
+    triggered_add += term_value(term, from, next);
+  }
+  value += static_cast<float>(triggered_add);
+  rest += static_cast<float>(triggered_add);
+  const float previous_rest = rest;
+  apply_add_terms(spec, TermPhase::BEFORE_BOUND, from, next, value);
+  if (!has_operation(spec, TermOperation::CHECKPOINT)) {
+    rest = value;
+  } else {
+    rest = previous_rest;
+    apply_add_terms(spec, TermPhase::BEFORE_BOUND, from, next, rest);
+  }
+  // The row's join against this node's operand -- under max_plus, arrival may
+  // not precede the node's floor, i.e. the vehicle waits. Applied before the
+  // bound so the bound tests the true arrival, and before the departure term so
+  // a service time is charged on top of the wait. Inert for an arithmetic row
+  // and for any row that declares no operand.
+  for (const ResourceTerm &term : spec.terms) {
+    if (term.operation != TermOperation::JOIN ||
+        term.phase != TermPhase::BEFORE_BOUND ||
+        !term_event_matches(term, from, next, depot, false) ||
+        !gate_matches(term))
+      continue;
+    const float operand = term_value(term, from, next);
+    value = join(spec, value, operand);
+    rest = join(spec, rest, operand);
+  }
+  const bool check = spec.bound_check == BoundCheck::TRANSITION ||
+                     ((depot || force_route_end) &&
+                      spec.bound_check == BoundCheck::ROUTE_END);
+  const float lower = spec_lower(spec, next);
+  const float upper = spec_upper(spec, next);
+  bool feasible = !check || (value >= lower - FEASIBILITY_EPS &&
+                             value <= upper + FEASIBILITY_EPS);
+  bool taken = false;
+  if (!feasible && std::isfinite(upper) && value > upper + FEASIBILITY_EPS) {
+    for (const ResourceTerm &term : spec.terms) {
+      if (term.operation != TermOperation::RESTORE ||
+          !term_event_matches(term, from, next, depot, true) ||
+          rest > upper + FEASIBILITY_EPS)
+        continue;
+      value = rest;
+      taken = true;
+      feasible = !check || (value >= lower - FEASIBILITY_EPS &&
+                            value <= upper + FEASIBILITY_EPS);
+      break;
+    }
+  }
+  if (break_taken != nullptr)
+    *break_taken = taken;
+  // The bounded arrival value, before the departure term and before any reset:
+  // this is the quantity the bound was tested against and the one a tightness
+  // report should read.
+  if (bounded_value != nullptr)
+    *bounded_value = value;
+  float margin = std::numeric_limits<float>::infinity();
+  if (check) {
+    if (std::isfinite(lower))
+      margin = std::min(margin, value - lower);
+    if (std::isfinite(upper))
+      margin = std::min(margin, upper - value);
+  }
+  // Arm optional checkpoints before post-bound additions so service/departure
+  // terms are charged after the restored base, exactly like the frozen path.
+  for (const ResourceTerm &term : spec.terms) {
+    if (term.operation == TermOperation::CHECKPOINT &&
+        term_event_matches(term, from, next, depot, false) &&
+        gate_matches(term))
+      rest = term_value(term, from, next);
+  }
+  apply_add_terms(spec, TermPhase::AFTER_BOUND, from, next, value);
+  apply_add_terms(spec, TermPhase::AFTER_BOUND, from, next, rest);
+  // `horizon: return` projects the bound one depot leg further. It is a sound
+  // necessary condition for a row that cannot be replenished mid-route, and it
+  // is what the compiled route- and tour-limit kernels have always enforced.
+  if (feasible && spec.horizon == BoundHorizon::RETURN && !depot &&
+      !problem_.open_route && route_depot >= 0 &&
+      spec.bound_check != BoundCheck::SOLUTION_END) {
+    const float return_margin = return_horizon_slack(
+        spec, next, route_depot, value, remaining, resource_index);
+    margin = std::min(margin, return_margin);
+    feasible = return_margin >= -FEASIBILITY_EPS;
+  }
+  if (admissibility_margin != nullptr)
+    *admissibility_margin = std::isfinite(margin) ? margin : spec.scale;
+  for (const ResourceTerm &term : spec.terms) {
+    if (term.operation != TermOperation::ASSIGN ||
+        !term_event_matches(term, from, next, depot, false) ||
+        !gate_matches(term))
+      continue;
+    value = term_value(term, from, next);
+    rest = value;
+  }
+  return feasible;
+}
+
 bool RoutingDecoder::construction_return_reachable(const State &state,
                                                    int32_t next) const {
-  // Construction-only stranding guard for depot-resetting consumables (battery,
-  // fuel, ...). The per-transition bound only certifies that `next` is reachable
-  // on arrival, not that any onward move remains -- so greedy construction can
-  // drive to a far customer and then reach neither the depot nor another
-  // customer. Because every customer is feasible as a depot singleton, requiring
-  // the depot to stay reachable after the move keeps a feasible completion
-  // available (return, reset, serve the rest) and never blocks legitimate
-  // progress: the current node was itself entered under this guard, so its own
-  // depot leg is still affordable and the depot fallback is always present.
-  if (next < problem_.depot_count)
+  // Construction-time stranding guard for rows declaring
+  // `horizon: return_construction`. The per-transition bound only certifies
+  // that `next` is reachable on arrival, not that any onward move remains -- so
+  // greedy construction can drive to a far customer and then reach neither the
+  // depot nor another customer. Because every customer is feasible as a depot
+  // singleton, requiring the depot to stay reachable after the move keeps a
+  // feasible completion available (return, reset, serve the rest) and never
+  // blocks legitimate progress. It is deliberately *not* a feasibility
+  // condition: a resource that resets at interior nodes may reach the depot
+  // through a charger or rest stop, so a closed route that fails this
+  // projection can still be valid. Rows needing the sound, always-enforced
+  // version declare `horizon: return` instead, which is checked in
+  // resource_transition_feasible.
+  if (next < problem_.depot_count || problem_.depot_count == 0 ||
+      problem_.open_route)
     return true;
   for (int32_t index : active_resource_indices_) {
     const ResourceSpec &spec = resource(index);
-    if (spec.op != ResourceOperator::AFFINE_ACCUMULATOR || !spec.reset_at_depot)
-      continue;
-    const bool consumes = spec.edge_uses_distance || !spec.edge_values.empty();
-    if (!consumes || !std::isfinite(spec.lower))
+    if (spec.horizon != BoundHorizon::RETURN_CONSTRUCTION)
       continue;
     // Post-arrival (post-reset) resource value at `next`.
     float value = state.resource_state[index];
     if (!resource_transition_feasible(state, next, index, &value))
       return false;
     // Cheapest depot return leg keeps the guard least restrictive under
-    // multiple depots; a reset node (charger) departs at reset_value.
+    // multiple depots.
     float best_slack = -std::numeric_limits<float>::infinity();
-    for (int32_t depot = 0; depot < problem_.depot_count; ++depot) {
-      float leg = value;
-      if (spec.edge_uses_distance)
-        leg += spec.edge_coefficient * problem_.dist(next, depot);
-      if (!spec.edge_values.empty())
-        leg += spec.edge_coefficient *
-               spec.edge_values[static_cast<size_t>(next) *
-                                    problem_.node_count +
-                                depot];
-      best_slack = std::max(best_slack, leg - spec.lower);
-    }
+    for (int32_t depot = 0; depot < problem_.depot_count; ++depot)
+      best_slack = std::max(
+          best_slack,
+          return_horizon_slack(spec, next, depot, value,
+                               state.reset_guard_remaining, index));
     if (best_slack < -FEASIBILITY_EPS)
       return false;
   }
@@ -2122,12 +4000,20 @@ bool RoutingDecoder::transition(State &state, int32_t next,
   if (find_edge(state.current, next) < 0) {
     ++state.off_graph_edges;
   }
+  const float break_duration = transition_break_duration(state, next);
   for (int32_t index : scalar_resource_indices_) {
     float value = state.resource_state[index];
-    (void)resource_transition_feasible(state, next, index, &value);
+    float rest = state.resource_since_rest[index];
+    (void)resource_transition_feasible(state, next, index, &value, false,
+                                       nullptr, &rest);
     state.resource_state[index] = value;
+    state.resource_since_rest[index] = rest;
   }
-
+  for (int32_t index : precedence_resource_indices_) {
+    state.resource_state[index] = precedence_next_state(
+        resource(index), next, next < problem_.depot_count,
+        state.resource_state[index]);
+  }
   if (next < problem_.depot_count) {
     if (!problem_.open_route) {
       state.distance += problem_.dist(state.current, state.route_depot);
@@ -2136,28 +4022,31 @@ bool RoutingDecoder::transition(State &state, int32_t next,
     state.current = next;
     state.route_depot = next;
     state.at_depot = true;
-    state.route_has_backhaul = false;
-    state.route_distance = 0.0f;
-    state.current_time = 0.0f;
-    state.load = depot_reload(state);
+    slot(state, FieldChannel::BACKHAUL_ORDER) = false;
+    slot(state, FieldChannel::ROUTE_LIMIT) = 0.0f;
+    slot(state, FieldChannel::TOUR_LIMIT) = 0.0f;
+    slot(state, FieldChannel::TIME_WINDOW) = 0.0f;
+    slot(state, FieldChannel::CAPACITY) = depot_reload(state);
     return true;
   }
 
   const float edge = problem_.dist(state.current, next);
   state.distance += edge;
-  state.route_distance += edge;
-  state.current_time =
-      std::max(state.current_time + edge, problem_.tw_start[next]) +
+  slot(state, FieldChannel::ROUTE_LIMIT) += edge;
+  slot(state, FieldChannel::TOUR_LIMIT) += edge;
+  slot(state, FieldChannel::TIME_WINDOW) =
+      std::max(slot(state, FieldChannel::TIME_WINDOW) + break_duration + edge,
+               problem_.tw_start[next]) +
       problem_.service_time[next];
-  state.load -= problem_.demand[next];
+  slot(state, FieldChannel::CAPACITY) = opening_load(state, next) - problem_.demand[next];
   if (problem_.demand[next] < -FEASIBILITY_EPS) {
-    state.route_has_backhaul = true;
+    slot(state, FieldChannel::BACKHAUL_ORDER) = true;
   }
   if (problem_.delivery_of_pickup[next] >= 0) {
-    ++state.open_pickups;
+    slot(state, FieldChannel::PICKUP_DELIVERY) += 1.0f;
   }
   if (problem_.pickup_of_delivery[next] >= 0) {
-    --state.open_pickups;
+    slot(state, FieldChannel::PICKUP_DELIVERY) -= 1.0f;
   }
   state.current = next;
   state.at_depot = false;
@@ -2166,8 +4055,9 @@ bool RoutingDecoder::transition(State &state, int32_t next,
       problem_.demand[next] > FEASIBILITY_EPS ? 1 : 0;
   state.unvisited_backhauls -=
       problem_.demand[next] < -FEASIBILITY_EPS ? 1 : 0;
+  consume_reset_guards(state.reset_guard_remaining, next);
   ++state.visited_customers;
-  state.collected_prize += problem_.prize[next];
+  slot(state, FieldChannel::PRIZE_QUOTA) += problem_.prize[next];
   state.route.push_back(next);
   return true;
 }
@@ -2205,18 +4095,19 @@ bool RoutingDecoder::feasible_after_lookahead_transition(
   const int32_t current = state.current;
   const int32_t route_depot = state.route_depot;
   const int32_t visited_customers = state.visited_customers;
-  const int32_t open_pickups = state.open_pickups;
   const int32_t unvisited_linehauls = state.unvisited_linehauls;
   const int32_t unvisited_backhauls = state.unvisited_backhauls;
   const bool at_depot = state.at_depot;
-  const bool route_has_backhaul = state.route_has_backhaul;
-  const float load = state.load;
-  const float route_distance = state.route_distance;
-  const float current_time = state.current_time;
   const float distance = state.distance;
-  const float collected_prize = state.collected_prize;
   const int32_t off_graph_edges = state.off_graph_edges;
+  // Every compiled quantity lives in resource_state, so restoring the vector
+  // restores all of them. Seven individual save/restore pairs used to sit
+  // alongside this copy and were already dead -- the vector assignment below
+  // ran last and overwrote each one.
   const std::vector<float> resource_state = state.resource_state;
+  const std::vector<float> resource_since_rest = state.resource_since_rest;
+  const std::vector<int32_t> reset_guard_remaining =
+      state.reset_guard_remaining;
 
   std::string error;
   const bool transitioned = transition(state, next, error);
@@ -2227,18 +4118,14 @@ bool RoutingDecoder::feasible_after_lookahead_transition(
   state.current = current;
   state.route_depot = route_depot;
   state.visited_customers = visited_customers;
-  state.open_pickups = open_pickups;
   state.unvisited_linehauls = unvisited_linehauls;
   state.unvisited_backhauls = unvisited_backhauls;
   state.at_depot = at_depot;
-  state.route_has_backhaul = route_has_backhaul;
-  state.load = load;
-  state.route_distance = route_distance;
-  state.current_time = current_time;
   state.distance = distance;
-  state.collected_prize = collected_prize;
   state.off_graph_edges = off_graph_edges;
   state.resource_state = resource_state;
+  state.resource_since_rest = resource_since_rest;
+  state.reset_guard_remaining = reset_guard_remaining;
   return feasible;
 }
 
@@ -2275,12 +4162,15 @@ Solution RoutingDecoder::finish(State state) const {
         problem_.depot_count == 0 ? state.start_node : state.route_depot;
     for (int32_t index : active_resource_indices_) {
       float value = state.resource_state[index];
-      if (!resource_transition_feasible(state, end, index, &value, true)) {
+      float rest = state.resource_since_rest[index];
+      if (!resource_transition_feasible(state, end, index, &value, true,
+                                        nullptr, &rest)) {
         solution.error = "closing resource bound failed: " +
                          resource(index).name;
         return solution;
       }
       state.resource_state[index] = value;
+      state.resource_since_rest[index] = rest;
     }
   }
   for (int32_t index : active_resource_indices_) {
@@ -2309,7 +4199,7 @@ Solution RoutingDecoder::finish(State state) const {
     }
   }
   solution.distance = state.distance;
-  solution.collected_prize = state.collected_prize;
+  solution.collected_prize = slot(state, FieldChannel::PRIZE_QUOTA);
   solution.off_graph_edges = state.off_graph_edges;
   solution.objective = problem_.objective.report(
       solution.distance, solution.collected_prize, solution.missed_penalty);
@@ -2400,7 +4290,7 @@ int32_t RoutingDecoder::select_next(State &state,
                             double log_probability) {
     record_decision(trace, state.current, valid_indices,
                     pool[index].local_index, stochastic,
-                    static_cast<float>(log_probability), live_state.data());
+                    static_cast<float>(log_probability), live_state);
     return pool[index].node;
   };
   if (pool.size() == 1) {
@@ -2617,6 +4507,14 @@ RoutingDecoder::changed_scope(const std::vector<int32_t> &source,
 
 bool RoutingDecoder::reversal_safe() const { return reversal_safe_; }
 
+bool RoutingDecoder::metric_symmetric() const { return metric_symmetric_; }
+
+float RoutingDecoder::metric_skew() const { return metric_skew_; }
+
+bool RoutingDecoder::relational() const {
+  return (active_kernel_capabilities_ & KERNEL_RELATIONAL) != 0;
+}
+
 Solution RoutingDecoder::scope_restricted_refine(
     Solution solution, const std::vector<int32_t> &initial_scope,
     const float *edge_field, const float *edge_additive,
@@ -2814,12 +4712,12 @@ Solution RoutingDecoder::scope_restricted_refine(
   const auto relocate_pair = [&](const std::vector<int32_t> &route,
                                  int32_t pair_node, int32_t after,
                                  std::vector<int32_t> &trial) -> bool {
-    int32_t pickup = pair_node;
-    int32_t delivery = problem_.delivery_of_pickup[pair_node];
-    if (delivery < 0) {
-      pickup = problem_.pickup_of_delivery[pair_node];
-      delivery = pair_node;
-    }
+    bool is_predecessor = false;
+    const int32_t partner = relation_partner(pair_node, &is_predecessor);
+    if (partner < 0)
+      return false;
+    const int32_t pickup = is_predecessor ? pair_node : partner;
+    const int32_t delivery = is_predecessor ? partner : pair_node;
     if (pickup < problem_.depot_count || delivery < problem_.depot_count ||
         after == pickup || after == delivery)
       return false;
@@ -3219,12 +5117,8 @@ Solution RoutingDecoder::scope_restricted_refine(
         const int32_t node = route.sequence.nodes[local];
         node_route[node] = route_id;
         node_local[node] = local;
-        if (local > 0) {
-          if (problem_.delivery_of_pickup[node] >= 0)
-            ++open;
-          if (problem_.pickup_of_delivery[node] >= 0)
-            --open;
-        }
+        if (local > 0)
+          open += open_relation_delta(node);
         route.open_pickups.push_back(open);
       }
       cached_routes.push_back(std::move(route));
@@ -3265,10 +5159,7 @@ Solution RoutingDecoder::scope_restricted_refine(
           const int32_t node = route.sequence.nodes[local];
           node_route[node] = route_id;
           node_local[node] = local;
-          if (problem_.delivery_of_pickup[node] >= 0)
-            ++open;
-          if (problem_.pickup_of_delivery[node] >= 0)
-            --open;
+          open += open_relation_delta(node);
           route.open_pickups.push_back(open);
         }
         cached_routes.push_back(std::move(route));
@@ -3402,7 +5293,7 @@ Solution RoutingDecoder::scope_restricted_refine(
   };
   const auto planned_pickup_metrics = [&](const PlannedRoute &plan) {
     PickupMetrics result;
-    if (!problem_.has(PICKUP_DELIVERY))
+    if (!relational())
       return result;
     if (pickup_epoch == std::numeric_limits<int32_t>::max()) {
       std::fill(pickup_seen.begin(), pickup_seen.end(), 0);
@@ -3413,8 +5304,10 @@ Solution RoutingDecoder::scope_restricted_refine(
     int32_t open = 0;
     bool first = true;
     const auto visit = [&](int32_t node) {
-      const int32_t delivery = problem_.delivery_of_pickup[node];
-      const int32_t pickup = problem_.pickup_of_delivery[node];
+      bool is_predecessor = false;
+      const int32_t partner = relation_partner(node, &is_predecessor);
+      const int32_t delivery = is_predecessor ? partner : -1;
+      const int32_t pickup = is_predecessor ? -1 : partner;
       // Depot-free evaluation treats the first route token as the already
       // visited start node: its pickup identity is visible to later deliveries,
       // but it does not itself change the open-pair counters.
@@ -3546,7 +5439,7 @@ Solution RoutingDecoder::scope_restricted_refine(
     return full.time_warp <= FEASIBILITY_EPS;
   };
   const auto pickup_closed = [&](const SequencePiece &piece) {
-    if (!problem_.has(PICKUP_DELIVERY) || piece.singleton >= 0)
+    if (!relational() || piece.singleton >= 0)
       return true;
     const CachedRoute &route = cached_routes[piece.route];
     return route.open_pickups[piece.begin] == 0 &&
@@ -3567,6 +5460,11 @@ Solution RoutingDecoder::scope_restricted_refine(
   const bool planned_commit_certificate = true;
   std::vector<int32_t> structure_seen(problem_.node_count, 0);
   int32_t structure_epoch = 0;
+  // Trial-local record of what a candidate route has already served, so a
+  // declared precedence row can be certified without allocating per trial.
+  std::vector<int32_t> precedence_seen(
+      precedence_resource_indices_.empty() ? 0 : problem_.node_count, 0);
+  int32_t precedence_epoch = 0;
   const auto route_structure_certificate =
       [&](const std::vector<int32_t> &trial) {
         if (trial.empty())
@@ -3616,45 +5514,58 @@ Solution RoutingDecoder::scope_restricted_refine(
       };
   const auto runtime_resource_certificate =
       [&](const std::vector<int32_t> &trial) {
-        if (resource_count() == FIELD_CHANNEL_COUNT)
+        if (declared_resource_indices_.empty())
           return true;
+        if (!precedence_resource_indices_.empty()) {
+          if (precedence_epoch == std::numeric_limits<int32_t>::max()) {
+            std::fill(precedence_seen.begin(), precedence_seen.end(), 0);
+            precedence_epoch = 1;
+          } else {
+            ++precedence_epoch;
+          }
+          precedence_seen[trial.front()] = precedence_epoch;
+        }
         std::vector<float> algebra(resource_count(), 0.0f);
-        for (int32_t index = FIELD_CHANNEL_COUNT; index < resource_count();
-             ++index)
+        std::vector<float> algebra_rest(resource_count(), 0.0f);
+        // A guarded reset reads what the route still has left to serve, so
+        // this replay has to track it too; the construction path keeps the
+        // same count in State.
+        std::vector<int32_t> algebra_guards = initial_reset_guards();
+        for (int32_t index : declared_resource_indices_) {
           algebra[index] = resource(index).initial;
+          algebra_rest[index] = resource(index).initial;
+        }
         int32_t current = trial.front();
         int32_t route_depot = problem_.depot_count > 0 ? current : -1;
         bool at_depot = problem_.depot_count > 0;
         const auto extend = [&](int32_t next, bool force_route_end) {
           const bool depot = next < problem_.depot_count;
-          for (int32_t index = FIELD_CHANNEL_COUNT; index < resource_count();
-               ++index) {
+          for (int32_t index : declared_resource_indices_) {
             const ResourceSpec &spec = resource(index);
             float value = algebra[index];
-            const bool event_reset =
-                !spec.reset_nodes.empty() && spec.reset_nodes[next];
-            if (spec.edge_uses_distance)
-              value += spec.edge_coefficient * problem_.dist(current, next);
-            if (!spec.edge_values.empty())
-              value += spec.edge_coefficient *
-                       spec.edge_values[static_cast<size_t>(current) *
-                                            problem_.node_count +
-                                        next];
-            if (!spec.node_values.empty())
-              value += spec.node_coefficient * spec.node_values[next];
-            const bool check =
-                spec.bound_check == BoundCheck::TRANSITION ||
-                ((depot || force_route_end) &&
-                 spec.bound_check == BoundCheck::ROUTE_END);
-            if (check && (value < spec.lower - FEASIBILITY_EPS ||
-                          value > spec.upper + FEASIBILITY_EPS))
+            float rest = algebra_rest[index];
+            if (spec.op == ResourceOperator::PRECEDENCE) {
+              const bool served = precedence_prerequisites_met(
+                  spec, next, [&](int32_t node) {
+                    return precedence_seen[static_cast<size_t>(node)] ==
+                           precedence_epoch;
+                  });
+              if (!precedence_admits(spec, next, depot, value, served))
+                return false;
+              algebra[index] = precedence_next_state(spec, next, depot, value);
+              continue;
+            }
+            if (!extend_declared(spec, current, next, route_depot,
+                                 force_route_end,
+                                 algebra_guards, index,
+                                 value, rest))
               return false;
-            if ((depot && spec.reset_at_depot) || event_reset)
-              value = spec.reset_value;
-            else if (depot && spec.scope == ResourceScope::ROUTE)
-              value = spec.initial;
             algebra[index] = value;
+            algebra_rest[index] = rest;
           }
+          consume_reset_guards(algebra_guards, next);
+          if (!precedence_resource_indices_.empty())
+            precedence_seen[static_cast<size_t>(next)] = precedence_epoch;
           current = next;
           if (depot) {
             route_depot = next;
@@ -3675,12 +5586,18 @@ Solution RoutingDecoder::scope_restricted_refine(
           if (!extend(end, true))
             return false;
         }
-        for (int32_t index = FIELD_CHANNEL_COUNT; index < resource_count();
-             ++index) {
+        for (int32_t index : precedence_resource_indices_) {
+          if (resource(index).relation == PrecedenceRelation::PAIRWISE &&
+              algebra[index] > FEASIBILITY_EPS)
+            return false;
+        }
+        for (int32_t index : declared_resource_indices_) {
           const ResourceSpec &spec = resource(index);
+          // Resolve the bound at the node the state ends on: a per-node bound
+          // must agree with resource_terminal_feasible, which construction uses.
           if (spec.bound_check == BoundCheck::SOLUTION_END &&
-              (algebra[index] < spec.lower - FEASIBILITY_EPS ||
-               algebra[index] > spec.upper + FEASIBILITY_EPS))
+              (algebra[index] < spec_lower(spec, current) - FEASIBILITY_EPS ||
+               algebra[index] > spec_upper(spec, current) + FEASIBILITY_EPS))
             return false;
         }
         return true;
@@ -3725,19 +5642,23 @@ Solution RoutingDecoder::scope_restricted_refine(
   ResourceEvaluation current_resource;
   if (trace != nullptr)
     current_resource = evaluate_resources(solution.route);
+  // One label per registry row. This was a FIELD_CHANNEL_COUNT array while
+  // ResourceEvaluation was already registry-wide, so the label silently
+  // truncated to the seven compiled channels: an appended row got no resource
+  // supervision at all, and the width disagreed with the field head's, which is
+  // what made the auxiliary resource loss unable to consume a declared row.
   const auto screening_delta = [&](const ResourceEvaluation &candidate) {
-    std::array<float, FIELD_CHANNEL_COUNT> delta{};
-    for (int32_t channel = 0; channel < FIELD_CHANNEL_COUNT; ++channel) {
-      delta[channel] = std::clamp(
-          candidate.binding[channel] - current_resource.binding[channel] +
-              candidate.violation[channel],
+    std::vector<float> delta(static_cast<size_t>(resource_count()), 0.0f);
+    for (int32_t index = 0; index < resource_count(); ++index) {
+      delta[index] = std::clamp(
+          candidate.binding[index] - current_resource.binding[index] +
+              candidate.violation[index],
           0.0f, 1.0f);
     }
     return delta;
   };
   const auto append_screening_edge = [&]
-      (int32_t from, int32_t to,
-       const std::array<float, FIELD_CHANNEL_COUNT> &delta) {
+      (int32_t from, int32_t to, const std::vector<float> &delta) {
     if (trace == nullptr ||
         trace->screened_edges.size() >= MAX_SCREENING_LABELS) {
       return;
@@ -3889,45 +5810,38 @@ Solution RoutingDecoder::scope_restricted_refine(
     }
 
     ResourceEvaluation result;
-    result.violation.assign(FIELD_CHANNEL_COUNT, 0.0f);
-    result.binding.assign(FIELD_CHANNEL_COUNT, 0.0f);
-    result.violation[static_cast<int32_t>(FieldChannel::CAPACITY)] =
-        static_cast<float>(capacity_excess / capacity_scale);
-    result.violation[static_cast<int32_t>(FieldChannel::TIME_WINDOW)] =
-        static_cast<float>(time_warp / time_scale);
-    result.violation[static_cast<int32_t>(FieldChannel::ROUTE_LIMIT)] =
-        static_cast<float>(route_excess / route_scale);
-    result.violation[static_cast<int32_t>(FieldChannel::TOUR_LIMIT)] =
-        static_cast<float>(tour_excess / tour_scale);
-    result.violation[static_cast<int32_t>(FieldChannel::BACKHAUL_ORDER)] = 0.0f;
-    result.violation[static_cast<int32_t>(FieldChannel::PICKUP_DELIVERY)] =
-        static_cast<float>(pickup_violations / pickup_scale);
-    result.violation[static_cast<int32_t>(FieldChannel::PRIZE_QUOTA)] =
-        static_cast<float>(
-            std::max(problem_.prize_quota - prize, 0.0) / quota_scale);
-
-    result.binding[static_cast<int32_t>(FieldChannel::CAPACITY)] =
-        static_cast<float>(std::clamp(capacity_binding, 0.0, 1.0));
-    result.binding[static_cast<int32_t>(FieldChannel::TIME_WINDOW)] =
-        static_cast<float>(std::clamp(time_binding, 0.0, 1.0));
-    result.binding[static_cast<int32_t>(FieldChannel::ROUTE_LIMIT)] =
-        static_cast<float>(std::clamp(max_route_ratio, 0.0, 1.0));
-    result.binding[static_cast<int32_t>(FieldChannel::TOUR_LIMIT)] =
-        static_cast<float>(std::clamp(max_tour_ratio, 0.0, 1.0));
-    result.binding[static_cast<int32_t>(FieldChannel::BACKHAUL_ORDER)] =
-        backhauls > 0 ? 1.0f : 0.0f;
-    result.binding[static_cast<int32_t>(FieldChannel::PICKUP_DELIVERY)] =
-        static_cast<float>(std::clamp(max_pickup_binding, 0.0, 1.0));
-    result.binding[static_cast<int32_t>(FieldChannel::PRIZE_QUOTA)] =
-        problem_.has(PRIZE_QUOTA)
-            ? static_cast<float>(std::clamp(prize / quota_scale, 0.0, 1.0))
-            : 0.0f;
-    for (int32_t channel = 0; channel < FIELD_CHANNEL_COUNT; ++channel) {
-      if (!field_channel_active(channel)) {
-        result.violation[channel] = 0.0f;
-        result.binding[channel] = 0.0f;
-      } else if (result.violation[channel] > FEASIBILITY_EPS) {
-        result.binding[channel] = 1.0f;
+    // Registry-indexed, matching evaluate_resources and the field head. A row a
+    // compiled kernel does not back has no entry to write here, which is why
+    // this fast path abstains for such a row rather than reporting a zero it
+    // never checked (see planned_screening_covers_registry_ above).
+    result.violation.assign(resource_count(), 0.0f);
+    result.binding.assign(resource_count(), 0.0f);
+    const auto write = [&](FieldChannel channel, double violation,
+                           double binding) {
+      const int32_t index = field_resource_index(channel);
+      if (index < 0)
+        return;
+      result.violation[index] = static_cast<float>(violation);
+      result.binding[index] = static_cast<float>(std::clamp(binding, 0.0, 1.0));
+    };
+    write(FieldChannel::CAPACITY, capacity_excess / capacity_scale,
+          capacity_binding);
+    write(FieldChannel::TIME_WINDOW, time_warp / time_scale, time_binding);
+    write(FieldChannel::ROUTE_LIMIT, route_excess / route_scale,
+          max_route_ratio);
+    write(FieldChannel::TOUR_LIMIT, tour_excess / tour_scale, max_tour_ratio);
+    write(FieldChannel::BACKHAUL_ORDER, 0.0, backhauls > 0 ? 1.0 : 0.0);
+    write(FieldChannel::PICKUP_DELIVERY, pickup_violations / pickup_scale,
+          max_pickup_binding);
+    write(FieldChannel::PRIZE_QUOTA,
+          std::max(problem_.prize_quota - prize, 0.0) / quota_scale,
+          problem_.has(PRIZE_QUOTA) ? prize / quota_scale : 0.0);
+    for (int32_t index = 0; index < resource_count(); ++index) {
+      if (!resource(index).active) {
+        result.violation[index] = 0.0f;
+        result.binding[index] = 0.0f;
+      } else if (result.violation[index] > FEASIBILITY_EPS) {
+        result.binding[index] = 1.0f;
       }
     }
     result.structurally_valid = true;
@@ -4011,12 +5925,8 @@ Solution RoutingDecoder::scope_restricted_refine(
     for (int32_t local = 0;
          local < static_cast<int32_t>(route.sequence.nodes.size()); ++local) {
       const int32_t node = route.sequence.nodes[local];
-      if (route.depot >= 0 || local > 0) {
-        if (problem_.delivery_of_pickup[node] >= 0)
-          ++open;
-        if (problem_.pickup_of_delivery[node] >= 0)
-          --open;
-      }
+      if (route.depot >= 0 || local > 0)
+        open += open_relation_delta(node);
       route.open_pickups.push_back(open);
       positive_load +=
           std::max(static_cast<double>(problem_.demand[node]), 0.0);
@@ -4218,8 +6128,7 @@ Solution RoutingDecoder::scope_restricted_refine(
       total_backhauls += route.resources.backhaul_count;
       const uint64_t version = ++route_rank_versions[slot];
       for (int32_t rank = 0; rank < ROUTE_RANK_COUNT; ++rank) {
-        if (rank == PICKUP_BINDING_RANK &&
-            !problem_.has(PICKUP_DELIVERY))
+        if (rank == PICKUP_BINDING_RANK && !relational())
           continue;
         ranked_routes[rank].push(
             {rank_value(route.resources, static_cast<RouteRank>(rank)), slot,
@@ -4375,8 +6284,7 @@ Solution RoutingDecoder::scope_restricted_refine(
       total_backhauls += route.resources.backhaul_count;
       const uint64_t version = route_rank_versions[slot];
       for (int32_t rank = 0; rank < ROUTE_RANK_COUNT; ++rank) {
-        if (rank == PICKUP_BINDING_RANK &&
-            !problem_.has(PICKUP_DELIVERY))
+        if (rank == PICKUP_BINDING_RANK && !relational())
           continue;
         ranked_routes[rank].push(
             {rank_value(route.resources, static_cast<RouteRank>(rank)), slot,
@@ -4530,9 +6438,13 @@ Solution RoutingDecoder::scope_restricted_refine(
     }
     const std::vector<int32_t> incremental_node_local = node_local;
     const std::vector<int32_t> incremental_edges = incumbent_edges;
-    std::array<double, ROUTE_RANK_COUNT> incremental_rank_max{};
+    // Sized from the rank array itself, not from ROUTE_RANK_COUNT. The
+    // verification loop at the end of this block iterates ranked_routes, so the
+    // two must agree by construction; while they were written independently a
+    // single added rank wrote past the end of this array and smashed the stack.
+    std::vector<double> incremental_rank_max(ranked_routes.size(), 0.0);
     const std::array<int32_t, 2> no_affected{-1, -1};
-    for (int32_t rank = 0; rank < ROUTE_RANK_COUNT; ++rank) {
+    for (size_t rank = 0; rank < ranked_routes.size(); ++rank) {
       incremental_rank_max[rank] = unaffected_rank(
           static_cast<RouteRank>(rank), no_affected, 0, 0.0);
     }
@@ -4804,7 +6716,7 @@ Solution RoutingDecoder::scope_restricted_refine(
               if (!expected.structurally_valid) {
                 ++trace->screening_verification_failures;
               } else {
-                for (int32_t channel = 0; channel < FIELD_CHANNEL_COUNT;
+                for (int32_t channel = 0; channel < resource_count();
                      ++channel) {
                   const float binding_error = std::abs(
                       expected.binding[channel] -
@@ -4826,7 +6738,8 @@ Solution RoutingDecoder::scope_restricted_refine(
             if (trace != nullptr &&
                 trace->screened_edges.size() < MAX_SCREENING_LABELS &&
                 !structurally_invalid_plan) {
-              if (planned_resource.has_value()) {
+              if (planned_resource.has_value() &&
+                  planned_screening_covers_registry_) {
                 record_planned_screening(plans, *planned_resource);
               } else {
                 std::vector<int32_t> trial;
@@ -4880,11 +6793,18 @@ Solution RoutingDecoder::scope_restricted_refine(
           }
           bool planned_resources_feasible = planned_resource.has_value();
           if (planned_resources_feasible) {
+            // violation is registry-indexed; a compiled channel reaches its own
+            // row through field_resource_index rather than by sharing its
+            // ordinal with it.
             for (int32_t channel = 0; channel < FIELD_CHANNEL_COUNT;
                  ++channel) {
-              if (planned_resource->violation[channel] >
+              const int32_t index = field_resource_index(
+                  static_cast<FieldChannel>(channel));
+              if (index < 0)
+                continue;
+              if (planned_resource->violation[index] >
                   FEASIBILITY_EPS /
-                      std::max(resource_scale(channel), EPS)) {
+                      std::max(runtime_resource_scale(index), EPS)) {
                 planned_resources_feasible = false;
                 break;
               }
@@ -4910,9 +6830,16 @@ Solution RoutingDecoder::scope_restricted_refine(
             ++full_evaluations;
             candidate = evaluate(trial);
           }
-          if (planned_resource.has_value()) {
+          if (planned_resource.has_value() &&
+              planned_screening_covers_registry_) {
             record_planned_screening(plans, *planned_resource);
           } else {
+            // A row the planned summaries do not describe would be labelled
+            // "unstressed" here purely because nothing looked at it. Replay the
+            // route instead: as a certificate the planned evaluation is still
+            // sound (runtime_resource_certificate checks the rows it omits),
+            // but as supervision a silent zero is a wrong label, not a missing
+            // one.
             record_screening(candidate);
           }
           if (!candidate.feasible)
@@ -5026,11 +6953,8 @@ Solution RoutingDecoder::scope_restricted_refine(
       const int32_t rhs_route = node_route[rhs];
       if (lhs_route < 0 || rhs_route < 0 || lhs == rhs)
         return;
-      if (problem_.has(PICKUP_DELIVERY) &&
-          (problem_.delivery_of_pickup[lhs] >= 0 ||
-           problem_.pickup_of_delivery[lhs] >= 0 ||
-           problem_.delivery_of_pickup[rhs] >= 0 ||
-           problem_.pickup_of_delivery[rhs] >= 0)) {
+      if (relational() &&
+          (relation_partner(lhs) >= 0 || relation_partner(rhs) >= 0)) {
         return;
       }
       const int32_t lhs_position = node_local[lhs];
@@ -5110,7 +7034,7 @@ Solution RoutingDecoder::scope_restricted_refine(
         return;
       const int32_t lhs_cut = node_local[lhs] + 1;
       const int32_t rhs_cut = node_local[rhs] + 1;
-      if (problem_.has(PICKUP_DELIVERY) &&
+      if (relational() &&
           (cached_routes[lhs_route].open_pickups[lhs_cut] != 0 ||
            cached_routes[rhs_route].open_pickups[rhs_cut] != 0)) {
         return;
@@ -5180,9 +7104,7 @@ Solution RoutingDecoder::scope_restricted_refine(
       const int32_t route = node_route[node];
       if (route < 0)
         return;
-      if (problem_.has(PICKUP_DELIVERY) &&
-          (problem_.delivery_of_pickup[node] >= 0 ||
-           problem_.pickup_of_delivery[node] >= 0)) {
+      if (relational() && relation_partner(node) >= 0) {
         return;
       }
       const int32_t position = node_local[node];
@@ -5239,12 +7161,12 @@ Solution RoutingDecoder::scope_restricted_refine(
     };
     const auto consider_relocate_pair_plan = [&](int32_t pair_node,
                                                   int32_t after) {
-      int32_t pickup = pair_node;
-      int32_t delivery = problem_.delivery_of_pickup[pair_node];
-      if (delivery < 0) {
-        pickup = problem_.pickup_of_delivery[pair_node];
-        delivery = pair_node;
-      }
+      bool is_predecessor = false;
+      const int32_t partner = relation_partner(pair_node, &is_predecessor);
+      if (partner < 0)
+        return;
+      const int32_t pickup = is_predecessor ? pair_node : partner;
+      const int32_t delivery = is_predecessor ? partner : pair_node;
       if (pickup < problem_.depot_count || delivery < problem_.depot_count ||
           after == pickup || after == delivery)
         return;
@@ -5418,7 +7340,7 @@ Solution RoutingDecoder::scope_restricted_refine(
             consider_exchange_plan(anchor, length, candidate_node, length);
           }
         }
-        if (problem_.has(PICKUP_DELIVERY)) {
+        if (relational()) {
           consider_relocate_pair_plan(anchor, candidate_node);
           consider_relocate_pair_plan(candidate_node, anchor);
         }
@@ -5592,8 +7514,7 @@ Solution RoutingDecoder::perturb(uint64_t rollout_seed, const float *edge_field,
           std::log(std::max(total, static_cast<double>(EPS)));
       record_decision(trace, current, valid_indices, choice.local_index,
                       valid_indices.size() > 1,
-                      static_cast<float>(log_probability),
-                      live_state.data());
+                      static_cast<float>(log_probability), live_state);
       valid_indices.erase(valid_indices.begin());
       std::vector<int32_t> lengths;
       for (int32_t length = 1; length <= search_config_.or_opt_max_segment;
@@ -5710,6 +7631,13 @@ std::vector<Solution> RoutingDecoder::sample(const float *edge_field,
                     coupler_bias, objective_residual, edge_risk, risk_penalty);
   std::vector<Solution> solutions(n_rollouts_);
   std::vector<RolloutTrace> rollout_traces(trace == nullptr ? 0 : n_rollouts_);
+  // The per-row verification counter is sized by the registry, so it has to be
+  // allocated where the registry is known rather than by the struct's default
+  // member initializer.
+  for (RolloutTrace &rollout : rollout_traces) {
+    rollout.screening_verification_failures_by_channel.assign(
+        static_cast<size_t>(resource_count()), 0);
+  }
   const uint64_t generation_seed = splitmix64(seed_ ^ generation_++);
   const int32_t thread_count = std::min(n_rollouts_, omp_get_max_threads());
 #pragma omp parallel for schedule(static) num_threads(thread_count)
@@ -5730,6 +7658,8 @@ std::vector<Solution> RoutingDecoder::sample(const float *edge_field,
     *trace = DecisionTrace{};
     trace->starts.reserve(n_rollouts_ + 1);
     trace->starts.push_back(0);
+    trace->screening_verification_failures_by_channel.assign(
+        static_cast<size_t>(resource_count()), 0);
     trace->valid_offsets.push_back(0);
     for (RolloutTrace &rollout : rollout_traces) {
       trace->current_nodes.insert(trace->current_nodes.end(),
@@ -5771,7 +7701,14 @@ std::vector<Solution> RoutingDecoder::sample(const float *edge_field,
           rollout.screening_fallback_evaluations;
       trace->screening_verification_failures +=
           rollout.screening_verification_failures;
-      for (int32_t channel = 0; channel < FIELD_CHANNEL_COUNT; ++channel) {
+      if (trace->screening_verification_failures_by_channel.size() <
+          rollout.screening_verification_failures_by_channel.size()) {
+        trace->screening_verification_failures_by_channel.resize(
+            rollout.screening_verification_failures_by_channel.size(), 0);
+      }
+      for (size_t channel = 0;
+           channel < rollout.screening_verification_failures_by_channel.size();
+           ++channel) {
         trace->screening_verification_failures_by_channel[channel] +=
             rollout.screening_verification_failures_by_channel[channel];
       }
@@ -5900,23 +7837,6 @@ void RoutingDecoder::set_incumbent(const std::vector<int32_t> &route) {
   }
 }
 
-void RoutingDecoder::set_candidate_resource_quotas(
-    const std::vector<float> &quotas) {
-  if (quotas.size() != static_cast<size_t>(resource_count()))
-    throw std::invalid_argument(
-        "candidate resource quotas must match resource_count");
-  double total = 0.0;
-  for (float quota : quotas) {
-    if (!std::isfinite(quota) || quota < 0.0f || quota > 1.0f)
-      throw std::invalid_argument(
-          "candidate resource quotas must be finite values in [0, 1]");
-    total += quota;
-  }
-  if (total > 1.0 + FEASIBILITY_EPS)
-    throw std::invalid_argument("candidate resource quotas must sum to at most 1");
-  candidate_resource_quotas_ = quotas;
-}
-
 Solution RoutingDecoder::evaluate(const std::vector<int32_t> &route) const {
   Solution failed;
   failed.route = route;
@@ -5941,6 +7861,27 @@ Solution RoutingDecoder::evaluate(const std::vector<int32_t> &route) const {
   const int32_t start_node = current;
   int32_t visited_customers = 0;
   int32_t open_pickups = 0;
+  // Declared precedence rows carry one counter each, in the same slot layout the
+  // construction state uses.
+  std::vector<float> precedence_state(
+      precedence_resource_indices_.empty() ? 0 : resource_count(), 0.0f);
+  const auto precedence_ok = [&](int32_t node, bool depot) {
+    for (int32_t index : precedence_resource_indices_) {
+      if (!precedence_admits(
+              resource(index), node, depot, precedence_state[index],
+              precedence_prerequisites_met(
+                  resource(index), node, [&](int32_t required) {
+                    return visited[static_cast<size_t>(required)] != 0;
+                  })))
+        return false;
+    }
+    return true;
+  };
+  const auto precedence_advance = [&](int32_t node, bool depot) {
+    for (int32_t index : precedence_resource_indices_)
+      precedence_state[index] = precedence_next_state(
+          resource(index), node, depot, precedence_state[index]);
+  };
   int32_t remaining_positive = 0;
   int32_t remaining_negative = 0;
   bool at_depot = problem_.depot_count > 0;
@@ -5990,45 +7931,42 @@ Solution RoutingDecoder::evaluate(const std::vector<int32_t> &route) const {
     load = reload();
   }
 
-  std::vector<float> scalar_state;
-  if (!scalar_resource_indices_.empty()) {
-    scalar_state.assign(resource_count(), 0.0f);
-    for (int32_t resource_index : scalar_resource_indices_)
-      scalar_state[resource_index] = resource(resource_index).initial;
+  // Always sized: these are copied into a State whose slot accessors index the
+  // full registry, so an empty vector here is an out-of-bounds read there.
+  std::vector<float> scalar_state(state_slot_count(), 0.0f);
+  // Guarded resets depend on the unserved remainder; this replay tracks it the
+  // same way construction does.
+  std::vector<int32_t> scalar_guards = initial_reset_guards();
+  std::vector<float> scalar_since_rest(state_slot_count(), 0.0f);
+  for (int32_t resource_index : scalar_resource_indices_) {
+    scalar_state[resource_index] = resource(resource_index).initial;
+    scalar_since_rest[resource_index] = resource(resource_index).initial;
   }
   int32_t resource_current = current;
+  float scalar_break_duration = 0.0f;
   const auto extend_resource_kernels = [&](int32_t next,
                                            bool force_route_end) {
-    const bool depot = next < problem_.depot_count;
+    scalar_break_duration = 0.0f;
     for (int32_t resource_index : scalar_resource_indices_) {
       const ResourceSpec &spec = resource(resource_index);
       float value = scalar_state[resource_index];
-      const bool event_reset =
-          !spec.reset_nodes.empty() && spec.reset_nodes[next];
-      if (spec.edge_uses_distance)
-        value +=
-            spec.edge_coefficient * problem_.dist(resource_current, next);
-      if (!spec.edge_values.empty())
-        value += spec.edge_coefficient *
-                 spec.edge_values[static_cast<size_t>(resource_current) *
-                                      problem_.node_count +
-                                  next];
-      if (!spec.node_values.empty())
-        value += spec.node_coefficient * spec.node_values[next];
-      const bool check = spec.bound_check == BoundCheck::TRANSITION ||
-                         ((depot || force_route_end) &&
-                          spec.bound_check == BoundCheck::ROUTE_END);
-      if (check && (value < spec.lower - FEASIBILITY_EPS ||
-                    value > spec.upper + FEASIBILITY_EPS)) {
+      float rest = scalar_since_rest[resource_index];
+      bool break_taken = false;
+      const bool feasible =
+          extend_declared(spec, resource_current, next, route_depot,
+                          force_route_end,
+                          scalar_guards, resource_index,
+                          value, rest, &break_taken);
+      if (break_taken)
+        scalar_break_duration += spec.optional_reset_duration;
+      if (!feasible) {
         failed.error = "resource bound failed: " + spec.name;
         return false;
       }
-      if ((depot && spec.reset_at_depot) || event_reset)
-        value = spec.reset_value;
-      else if (depot && spec.scope == ResourceScope::ROUTE)
-        value = spec.initial;
       scalar_state[resource_index] = value;
+      scalar_since_rest[resource_index] = rest;
     }
+    consume_reset_guards(scalar_guards, next);
     resource_current = next;
     return true;
   };
@@ -6049,6 +7987,14 @@ Solution RoutingDecoder::evaluate(const std::vector<int32_t> &route) const {
       return failed;
 
     if (next < problem_.depot_count) {
+      if (problem_.has(TIME_WINDOWS) && !problem_.open_route &&
+          current_time + scalar_break_duration +
+                  problem_.dist(current, route_depot) >
+              problem_.tw_end[route_depot] + FEASIBILITY_EPS) {
+        failed.error = "route contains an infeasible transition to node " +
+                       std::to_string(next);
+        return failed;
+      }
       bool depot_allowed = problem_.depot_count > 0 && !at_depot &&
                            (problem_.multi_route ||
                             !problem_.has(VISIT_ALL));
@@ -6059,11 +8005,12 @@ Solution RoutingDecoder::evaluate(const std::vector<int32_t> &route) const {
           visited_customers < problem_.customer_count()) {
         depot_allowed = false;
       }
-      if (!depot_allowed) {
+      if (!depot_allowed || !precedence_ok(next, true)) {
         failed.error = "route contains an infeasible transition to node " +
                        std::to_string(next);
         return failed;
       }
+      precedence_advance(next, true);
       if (!problem_.open_route)
         distance += problem_.dist(current, route_depot);
       current = next;
@@ -6076,16 +8023,24 @@ Solution RoutingDecoder::evaluate(const std::vector<int32_t> &route) const {
       continue;
     }
 
-    if (visited[next]) {
+    if (visited[next] || !precedence_ok(next, false)) {
       failed.error = "route contains an infeasible transition to node " +
                      std::to_string(next);
       return failed;
     }
+    precedence_advance(next, false);
     const int32_t pickup = problem_.pickup_of_delivery[next];
     if (problem_.has(PICKUP_DELIVERY) && pickup >= 0 && !visited[pickup]) {
       failed.error = "route contains an infeasible transition to node " +
                      std::to_string(next);
       return failed;
+    }
+    // Benchmark rule: a route that opens on a backhaul starts empty, whether or
+    // not linehauls remain elsewhere (URS UniVRPEnv.py:517). `reload` only
+    // covers the case where none do.
+    if (at_depot && class_ordered() &&
+        problem_.demand[next] < -FEASIBILITY_EPS) {
+      load = 0.0f;
     }
     const float next_load = load - problem_.demand[next];
     if (problem_.has(CAPACITY) &&
@@ -6121,12 +8076,23 @@ Solution RoutingDecoder::evaluate(const std::vector<int32_t> &route) const {
                      std::to_string(next);
       return failed;
     }
-    const float arrival = std::max(current_time + edge,
+    const float arrival = std::max(current_time + scalar_break_duration + edge,
                                    problem_.tw_start[next]);
+    float return_break_duration = 0.0f;
+    if (!problem_.open_route) {
+      State projected;
+      // resource_state has to be in place before any slot accessor is used.
+      projected.resource_state = scalar_state;
+      projected.resource_since_rest = scalar_since_rest;
+      projected.current = next;
+      projected.route_depot = route_depot;
+      slot(projected, FieldChannel::TIME_WINDOW) = arrival + problem_.service_time[next];
+      return_break_duration = transition_break_duration(projected, route_depot);
+    }
     if (problem_.has(TIME_WINDOWS) &&
         (arrival > problem_.tw_end[next] + FEASIBILITY_EPS ||
          (!problem_.open_route &&
-          arrival + problem_.service_time[next] +
+          arrival + problem_.service_time[next] + return_break_duration +
                   problem_.dist(next, route_depot) >
               problem_.tw_end[route_depot] + FEASIBILITY_EPS))) {
       failed.error = "route contains an infeasible transition to node " +
@@ -6173,11 +8139,21 @@ Solution RoutingDecoder::evaluate(const std::vector<int32_t> &route) const {
       ++off_graph_edges;
   }
 
+  for (int32_t resource_index : precedence_resource_indices_) {
+    const ResourceSpec &spec = resource(resource_index);
+    if (spec.relation == PrecedenceRelation::PAIRWISE &&
+        precedence_state[resource_index] > FEASIBILITY_EPS) {
+      failed.error = "unresolved precedence relation: " + spec.name;
+      return failed;
+    }
+  }
   for (int32_t resource_index : scalar_resource_indices_) {
     const ResourceSpec &spec = resource(resource_index);
     if (spec.bound_check == BoundCheck::SOLUTION_END &&
-        (scalar_state[resource_index] < spec.lower - FEASIBILITY_EPS ||
-         scalar_state[resource_index] > spec.upper + FEASIBILITY_EPS)) {
+        (scalar_state[resource_index] <
+             spec_lower(spec, resource_current) - FEASIBILITY_EPS ||
+         scalar_state[resource_index] >
+             spec_upper(spec, resource_current) + FEASIBILITY_EPS)) {
       failed.error = "terminal resource bound failed: " + spec.name;
       return failed;
     }
@@ -6251,6 +8227,7 @@ ResourceEvaluation RoutingDecoder::evaluate_resources(
     return has_linehaul || !has_backhaul ? problem_.capacity : 0.0f;
   };
   float load = initial_load(problem_.depot_count > 0 ? 1 : 0);
+  float capacity_binding = 0.0f;
   float route_positive = 0.0f;
   float route_negative = 0.0f;
   float route_distance = 0.0f;
@@ -6297,9 +8274,13 @@ ResourceEvaluation RoutingDecoder::evaluate_resources(
       time_warp +=
           std::max(return_time - problem_.tw_end[route_depot], 0.0f);
     }
-    result.binding[static_cast<int32_t>(FieldChannel::CAPACITY)] =
-        std::max(result.binding[static_cast<int32_t>(FieldChannel::CAPACITY)],
-                 std::max(route_positive, route_negative) / capacity_scale);
+    // Accumulate into a local, not into result.binding: the report vector is
+    // registry-sized, so a problem that declares no capacity row -- or no rows
+    // at all -- has no slot here to accumulate into. `report` below places the
+    // total once, if there is a row to place it in.
+    capacity_binding = std::max(capacity_binding,
+                                std::max(route_positive, route_negative) /
+                                    capacity_scale);
     route_positive = 0.0f;
     route_negative = 0.0f;
   };
@@ -6385,115 +8366,141 @@ ResourceEvaluation RoutingDecoder::evaluate_resources(
     return result;
   }
 
-  result.violation[static_cast<int32_t>(FieldChannel::CAPACITY)] =
-      capacity_excess / capacity_scale;
-  result.violation[static_cast<int32_t>(FieldChannel::TIME_WINDOW)] =
-      time_warp / time_scale;
-  result.violation[static_cast<int32_t>(FieldChannel::ROUTE_LIMIT)] =
-      route_excess / route_scale;
-  result.violation[static_cast<int32_t>(FieldChannel::TOUR_LIMIT)] =
-      tour_excess / tour_scale;
-  result.violation[static_cast<int32_t>(FieldChannel::BACKHAUL_ORDER)] =
-      static_cast<float>(backhaul_violations) /
-      std::max(problem_.customer_count(), 1);
-  result.violation[static_cast<int32_t>(FieldChannel::PICKUP_DELIVERY)] =
-      static_cast<float>(precedence_violations) / std::max(pair_count, 1);
-  result.violation[static_cast<int32_t>(FieldChannel::PRIZE_QUOTA)] =
-      std::max(problem_.prize_quota - collected_prize, 0.0f) / quota_scale;
-
-  result.binding[static_cast<int32_t>(FieldChannel::CAPACITY)] =
-      std::clamp(result.binding[static_cast<int32_t>(FieldChannel::CAPACITY)],
-                 0.0f, 1.0f);
-  result.binding[static_cast<int32_t>(FieldChannel::TIME_WINDOW)] =
-      problem_.has(TIME_WINDOWS)
-          ? std::clamp(1.0f - min_time_slack / time_scale, 0.0f, 1.0f)
-          : 0.0f;
-  result.binding[static_cast<int32_t>(FieldChannel::ROUTE_LIMIT)] =
-      std::clamp(max_route_ratio, 0.0f, 1.0f);
-  result.binding[static_cast<int32_t>(FieldChannel::TOUR_LIMIT)] =
-      std::clamp(max_tour_ratio, 0.0f, 1.0f);
-  result.binding[static_cast<int32_t>(FieldChannel::BACKHAUL_ORDER)] =
-      any_backhaul ? 1.0f : 0.0f;
-  result.binding[static_cast<int32_t>(FieldChannel::PICKUP_DELIVERY)] =
-      std::clamp(static_cast<float>(max_open_pickups) /
-                     std::max(pair_count, 1),
-                 0.0f, 1.0f);
-  result.binding[static_cast<int32_t>(FieldChannel::PRIZE_QUOTA)] =
-      problem_.has(PRIZE_QUOTA)
-          ? std::clamp(collected_prize / quota_scale, 0.0f, 1.0f)
-          : 0.0f;
-  for (int32_t channel = 0; channel < FIELD_CHANNEL_COUNT; ++channel) {
-    if (!field_channel_active(channel)) {
-      result.violation[channel] = 0.0f;
-      result.binding[channel] = 0.0f;
-    } else if (result.violation[channel] > FEASIBILITY_EPS) {
-      result.binding[channel] = 1.0f;
+  // A compiled kernel reaches its report through its registry row. These were
+  // written at the channel's own ordinal, which is the same number only while
+  // the registry keeps one row per channel in channel order.
+  const auto report = [&](FieldChannel channel, float violation,
+                          float binding) {
+    const int32_t index = field_resource_index(channel);
+    if (index < 0)
+      return;
+    result.violation[index] = violation;
+    result.binding[index] = std::clamp(binding, 0.0f, 1.0f);
+  };
+  report(FieldChannel::CAPACITY, capacity_excess / capacity_scale,
+         capacity_binding);
+  report(FieldChannel::TIME_WINDOW, time_warp / time_scale,
+         problem_.has(TIME_WINDOWS) ? 1.0f - min_time_slack / time_scale
+                                    : 0.0f);
+  report(FieldChannel::ROUTE_LIMIT, route_excess / route_scale,
+         max_route_ratio);
+  report(FieldChannel::TOUR_LIMIT, tour_excess / tour_scale, max_tour_ratio);
+  report(FieldChannel::BACKHAUL_ORDER,
+         static_cast<float>(backhaul_violations) /
+             std::max(problem_.customer_count(), 1),
+         any_backhaul ? 1.0f : 0.0f);
+  report(FieldChannel::PICKUP_DELIVERY,
+         static_cast<float>(precedence_violations) / std::max(pair_count, 1),
+         static_cast<float>(max_open_pickups) / std::max(pair_count, 1));
+  report(FieldChannel::PRIZE_QUOTA,
+         std::max(problem_.prize_quota - collected_prize, 0.0f) / quota_scale,
+         problem_.has(PRIZE_QUOTA) ? collected_prize / quota_scale : 0.0f);
+  for (int32_t index = 0; index < resource_count(); ++index) {
+    if (!resource(index).active) {
+      result.violation[index] = 0.0f;
+      result.binding[index] = 0.0f;
+    } else if (result.violation[index] > FEASIBILITY_EPS) {
+      result.binding[index] = 1.0f;
     }
   }
-  std::vector<float> scalar_state;
-  if (!scalar_resource_indices_.empty()) {
-    scalar_state.assign(resource_count(), 0.0f);
-    for (int32_t resource_index : scalar_resource_indices_)
-      scalar_state[resource_index] = resource(resource_index).initial;
+  // Always sized: these are copied into a State whose slot accessors index the
+  // full registry, so an empty vector here is an out-of-bounds read there.
+  std::vector<float> scalar_state(state_slot_count(), 0.0f);
+  // Guarded resets depend on the unserved remainder; this replay tracks it the
+  // same way construction does.
+  std::vector<int32_t> scalar_guards = initial_reset_guards();
+  std::vector<float> scalar_since_rest(state_slot_count(), 0.0f);
+  for (int32_t resource_index : scalar_resource_indices_) {
+    scalar_state[resource_index] = resource(resource_index).initial;
+    scalar_since_rest[resource_index] = resource(resource_index).initial;
   }
   int32_t resource_current = route.front();
+  // `node` resolves per-node bounds; reporting must use the same bound the
+  // feasibility path used, or a rejected route reports zero violation.
   const auto record_scalar = [&](int32_t resource_index, float value,
-                                 bool check_bound) {
+                                 bool check_bound, int32_t node) {
     const ResourceSpec &spec = resource(resource_index);
     const float scale = runtime_resource_scale(resource_index);
+    const float lower = spec_lower(spec, node);
+    const float upper = spec_upper(spec, node);
     float violation = 0.0f;
     if (check_bound) {
-      if (std::isfinite(spec.lower))
-        violation = std::max(violation, spec.lower - value);
-      if (std::isfinite(spec.upper))
-        violation = std::max(violation, value - spec.upper);
+      if (std::isfinite(lower))
+        violation = std::max(violation, lower - value);
+      if (std::isfinite(upper))
+        violation = std::max(violation, value - upper);
     }
     result.violation[resource_index] = std::max(
         result.violation[resource_index], violation / std::max(scale, EPS));
     float binding = 0.0f;
-    if (std::isfinite(spec.lower) && std::isfinite(spec.upper)) {
-      const float slack = std::min(value - spec.lower, spec.upper - value);
-      binding = 1.0f - slack / std::max(0.5f * (spec.upper - spec.lower), EPS);
-    } else if (std::isfinite(spec.lower)) {
-      binding = 1.0f - (value - spec.lower) / std::max(scale, EPS);
-    } else if (std::isfinite(spec.upper)) {
-      binding = 1.0f - (spec.upper - value) / std::max(scale, EPS);
+    if (std::isfinite(lower) && std::isfinite(upper)) {
+      const float slack = std::min(value - lower, upper - value);
+      binding = 1.0f - slack / std::max(0.5f * (upper - lower), EPS);
+    } else if (std::isfinite(lower)) {
+      binding = 1.0f - (value - lower) / std::max(scale, EPS);
+    } else if (std::isfinite(upper)) {
+      binding = 1.0f - (upper - value) / std::max(scale, EPS);
     }
     result.binding[resource_index] =
         std::max(result.binding[resource_index],
                  std::clamp(binding, 0.0f, 1.0f));
   };
+  // Declared precedence rows report the share of their relations a route puts in
+  // the wrong order, and the depth of unresolved obligations as tightness. They
+  // are counted here rather than left at zero: a route evaluate() rejects must
+  // not be reported as violation-free.
+  std::vector<float> precedence_open(
+      precedence_resource_indices_.empty() ? 0 : resource_count(), 0.0f);
+  std::vector<uint8_t> precedence_visited(
+      precedence_resource_indices_.empty() ? 0 : problem_.node_count, 0);
+  if (!precedence_resource_indices_.empty())
+    precedence_visited[route.front()] = 1;
+  const auto extend_precedence_kernels = [&](int32_t next) {
+    if (precedence_resource_indices_.empty())
+      return;
+    const bool depot = next < problem_.depot_count;
+    for (int32_t index : precedence_resource_indices_) {
+      const ResourceSpec &spec = resource(index);
+      const bool served = precedence_prerequisites_met(
+          spec, next, [&](int32_t node) {
+            return precedence_visited[static_cast<size_t>(node)] != 0;
+          });
+      if (!precedence_admits(spec, next, depot, precedence_open[index], served))
+        result.violation[index] += 1.0f / std::max(spec.relation_count, 1);
+      precedence_open[index] =
+          precedence_next_state(spec, next, depot, precedence_open[index]);
+      result.binding[index] = std::max(
+          result.binding[index],
+          std::clamp(precedence_open[index] /
+                         std::max(static_cast<float>(spec.relation_count), 1.0f),
+                     0.0f, 1.0f));
+    }
+    precedence_visited[static_cast<size_t>(next)] = 1;
+  };
   const auto extend_scalar_kernels = [&](int32_t next, bool force_route_end) {
     const bool depot = next < problem_.depot_count;
     for (int32_t resource_index : scalar_resource_indices_) {
       const ResourceSpec &spec = resource(resource_index);
-      float value = scalar_state[resource_index];
-      const bool event_reset =
-          !spec.reset_nodes.empty() && spec.reset_nodes[next];
-      if (spec.edge_uses_distance)
-        value +=
-            spec.edge_coefficient * problem_.dist(resource_current, next);
-      if (!spec.edge_values.empty())
-        value += spec.edge_coefficient *
-                 spec.edge_values[static_cast<size_t>(resource_current) *
-                                      problem_.node_count +
-                                  next];
-      if (!spec.node_values.empty())
-        value += spec.node_coefficient * spec.node_values[next];
       const bool check = spec.bound_check == BoundCheck::TRANSITION ||
                          ((depot || force_route_end) &&
                           spec.bound_check == BoundCheck::ROUTE_END);
-      record_scalar(resource_index, value, check);
-      if ((depot && spec.reset_at_depot) || event_reset)
-        value = spec.reset_value;
-      else if (depot && spec.scope == ResourceScope::ROUTE)
-        value = spec.initial;
+      float value = scalar_state[resource_index];
+      float rest = scalar_since_rest[resource_index];
+      float bounded = value;
+      (void)extend_declared(spec, resource_current, next, route_depot,
+                            force_route_end,
+                            scalar_guards, resource_index,
+                            value, rest, nullptr, &bounded);
+      record_scalar(resource_index, bounded, check, next);
       scalar_state[resource_index] = value;
+      scalar_since_rest[resource_index] = rest;
     }
+    consume_reset_guards(scalar_guards, next);
     resource_current = next;
   };
   for (size_t route_index = 1; route_index < route.size(); ++route_index) {
     extend_scalar_kernels(route[route_index], false);
+    extend_precedence_kernels(route[route_index]);
   }
   if (problem_.has(VISIT_ALL) && !problem_.multi_route && !at_depot &&
       !problem_.open_route) {
@@ -6502,9 +8509,20 @@ ResourceEvaluation RoutingDecoder::evaluate_resources(
   }
   for (int32_t resource_index : scalar_resource_indices_) {
     if (resource(resource_index).bound_check == BoundCheck::SOLUTION_END)
-      record_scalar(resource_index, scalar_state[resource_index], true);
+      record_scalar(resource_index, scalar_state[resource_index], true,
+                    resource_current);
     if (result.violation[resource_index] > FEASIBILITY_EPS)
       result.binding[resource_index] = 1.0f;
+  }
+  for (int32_t index : precedence_resource_indices_) {
+    const ResourceSpec &spec = resource(index);
+    // An obligation still open at the end of the solution is never resolved.
+    if (spec.relation == PrecedenceRelation::PAIRWISE &&
+        precedence_open[index] > FEASIBILITY_EPS)
+      result.violation[index] +=
+          precedence_open[index] / std::max(spec.relation_count, 1);
+    if (result.violation[index] > FEASIBILITY_EPS)
+      result.binding[index] = 1.0f;
   }
   result.structurally_valid = true;
   return result;

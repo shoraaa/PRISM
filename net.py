@@ -8,17 +8,57 @@ from torch_geometric.data import Data
 import prism_decoder
 
 
+# The number of compiled fast paths, not a registry width: a problem's registry
+# holds one row per constraint it declares plus whatever rows it appends, so it
+# may be shorter or longer than this. Nothing in the model reads it -- a guard
+# here used to reject any registry with fewer rows, which is exactly the
+# assumption the model does not make.
 FIELD_CHANNEL_COUNT = prism_decoder.FIELD_CHANNEL_COUNT
-LIVE_STATE_FEATURE_COUNT = prism_decoder.LIVE_STATE_FEATURE_COUNT
-RESOURCE_DESCRIPTOR_DIM = prism_decoder.RESOURCE_DESCRIPTOR_DIM
+RESOURCE_ROW_PROPERTY_DIM = prism_decoder.RESOURCE_ROW_PROPERTY_DIM
+RESOURCE_TERM_PROPERTY_DIM = prism_decoder.RESOURCE_TERM_PROPERTY_DIM
+# Learned fixed-width type passed to every per-resource consumer after pooling
+# the row's variable-length term set.
+RESOURCE_TYPE_DIM = 32
 NODE_FEATURE_COUNT = prism_decoder.NODE_FEATURE_COUNT
+NODE_RESOURCE_FEATURE_COUNT = prism_decoder.NODE_RESOURCE_FEATURE_COUNT
+RESOURCE_SUFFIX_FEATURE_COUNT = prism_decoder.RESOURCE_SUFFIX_FEATURE_COUNT
+RESOURCE_TRANSITION_FEATURE_COUNT = (
+    prism_decoder.RESOURCE_TRANSITION_FEATURE_COUNT
+)
 EDGE_FEATURE_COUNT = prism_decoder.EDGE_FEATURE_COUNT
 # The native feature contract places instance-static node attributes first and
 # incumbent replay state afterwards. Edge slots 8/9 mark incumbent/reverse
-# incumbent arcs; all other edge slots are instance-static.
-STATIC_NODE_FEATURE_COUNT = 12
-INCUMBENT_EDGE_FEATURE_START = 8
-INCUMBENT_EDGE_FEATURE_END = 10
+# incumbent arcs; all other edge slots are instance-static. The node contract
+# grew a static tail (the in/out distance profiles) after the incumbent block,
+# so the static view masks a middle range rather than a suffix.
+# Width of the invariant resource-set summary appended to node/edge features.
+# A shared descriptor-conditioned row map followed by one DeepSets sum reduces
+# any number of declared resources to this fixed width for the ordinary GNN.
+NODE_RESOURCE_SUMMARY_DIM = 32
+# Node layout: x, y, is_depot | incumbent_served, route_position,
+# forward_distance, backward_distance | mean_out_distance, mean_in_distance.
+# Edge layout: distance | incumbent, reverse incumbent | objective edge term,
+# reverse distance. Both incumbent blocks are a middle range, so the static
+# view masks a span rather than a suffix.
+# Per-(edge, resource) quantities: normalized pressure, raw pressure, event,
+# exact post-transition state, signed feasibility margin, and a validity bit.
+EDGE_RESOURCE_FEATURE_COUNT = 4 + RESOURCE_TRANSITION_FEATURE_COUNT
+OBJECTIVE_NODE_TERM_COUNT = prism_decoder.OBJECTIVE_NODE_TERM_COUNT
+# Width of the per-node objective summary. The objective language is closed, so
+# this is a direct conditioned projection rather than a pooled reduction.
+OBJECTIVE_SUMMARY_DIM = 8
+STATIC_NODE_FEATURE_COUNT = 3
+INCUMBENT_NODE_FEATURE_END = 7
+INCUMBENT_EDGE_FEATURE_START = 1
+INCUMBENT_EDGE_FEATURE_END = 3
+# Registry-position table size for the --index-embedded-resources ablation.
+# Rows 0..RESOURCE_INDEX_EMBEDDING_ROWS-2 address registry positions directly;
+# the final row is a single shared out-of-table row, so every resource beyond
+# the table (an appended schema row on a novel variant) collapses onto one cold
+# embedding. That is the intended failure mode of the ablation, not a fallback:
+# an identity-addressed model has nothing to say about a resource it never
+# indexed during training.
+RESOURCE_INDEX_EMBEDDING_ROWS = 16
 
 
 # The objective is conditioned on its declared coefficient algebra, not a
@@ -42,7 +82,7 @@ OBJECTIVE_COEFF_DIM = 8
 # coefficient-conditioning layer is not gradient-starved (a zero-init output
 # layer sends zero gradient to the layer below it).
 OBJECTIVE_RESIDUAL_HEAD_INIT_STD = 0.1
-MODEL_SCHEMA = "typed_resource_v6_objective_coeff_algebra"
+MODEL_SCHEMA = "typed_resource_v13_pooled_terms"
 
 
 def _squash_magnitude(value: float) -> float:
@@ -59,12 +99,28 @@ def encode_objective_coeffs(coeffs: dict, device="cpu") -> torch.Tensor:
     """Map the declared objective coefficient triple to a [1, OBJECTIVE_COEFF_DIM]
     unit-interval descriptor. Signed coefficients become (squashed magnitude,
     sign) pairs so the encoding is bounded, sign-aware, and general to unseen
-    coefficient values."""
+    coefficient values.
+
+    The triple is normalized by its own largest magnitude first. Only the ratios
+    between the primitives are semantic: c and 2*c are the same optimization
+    problem, with the same argmin, and objective_energy_scale already absorbs
+    the factor so the energy is unchanged. Encoding raw magnitudes made those
+    two instances condition the field differently, which is the one thing a
+    positive rescale must not do.
+    """
     distance = float(coeffs.get("distance_coeff", 1.0))
     visit = float(coeffs.get("visit_coeff", 0.0))
     miss = float(coeffs.get("miss_coeff", 0.0))
     regularizer = float(coeffs.get("distance_regularizer", 0.0))
     sense = float(coeffs.get("sense", 1.0))
+    norm = max(abs(distance), abs(visit), abs(miss))
+    if norm > 0.0:
+        distance /= norm
+        visit /= norm
+        miss /= norm
+        # The regularizer is a term of the same objective, so it is measured
+        # against the same norm rather than kept in absolute units.
+        regularizer /= norm
     values = [
         _squash_magnitude(distance), _sign_bit(distance),
         _squash_magnitude(visit), _sign_bit(visit),
@@ -73,40 +129,6 @@ def encode_objective_coeffs(coeffs: dict, device="cpu") -> torch.Tensor:
         _sign_bit(sense),
     ]
     return torch.tensor([values], dtype=torch.float32, device=device)
-# Canonical constraint order for schema conditioning of the refiner; mirrors the
-# native CONSTRAINT_KERNEL registry so a multi-hot indexes constraints stably.
-CONSTRAINT_VOCAB = (
-    "visit_all", "capacity", "backhaul_order", "pickup_delivery",
-    "route_limit", "time_windows", "tour_limit", "prize_quota",
-)
-
-
-def constraint_multihot(constraints, device="cpu"):
-    """Multi-hot [len(CONSTRAINT_VOCAB)] over active constraint names."""
-    v = torch.zeros(len(CONSTRAINT_VOCAB), dtype=torch.float32, device=device)
-    idx = {c: i for i, c in enumerate(CONSTRAINT_VOCAB)}
-    for c in constraints:
-        if c in idx:
-            v[idx[c]] = 1.0
-    return v
-
-
-# Schema descriptor = constraint multi-hot + open-route flag + depot-count scale.
-# open/multi-depot are route STRUCTURE, not entries in CONSTRAINT_VOCAB, but the
-# refiner must distinguish e.g. cvrp from mdcvrp/ocvrp (same constraint set).
-SCHEMA_FEATURE_DIM = len(CONSTRAINT_VOCAB) + 2
-
-
-def schema_vector(problem, device="cpu"):
-    """Full schema descriptor for refiner conditioning [SCHEMA_FEATURE_DIM]."""
-    v = constraint_multihot(problem.get("constraints", []), device=device)
-    depot_count = float(problem.get("depot_count", 1))
-    extra = torch.tensor(
-        [float(bool(problem.get("open_route", False))),
-         depot_count / (1.0 + depot_count)],  # squashed, matches build_decoder_data
-        dtype=torch.float32, device=device,
-    )
-    return torch.cat((v, extra))
 
 
 def _require_unit_interval(name, value):
@@ -114,6 +136,13 @@ def _require_unit_interval(name, value):
         raise ValueError(f"{name} must contain only finite values")
     if value.numel() and (value.min() < -1e-6 or value.max() > 1.0 + 1e-6):
         raise ValueError(f"{name} must be normalized to [0, 1]")
+
+
+def _require_signed_unit_interval(name, value):
+    if not torch.isfinite(value).all():
+        raise ValueError(f"{name} must contain only finite values")
+    if value.numel() and (value.min() < -1.0 - 1e-6 or value.max() > 1.0 + 1e-6):
+        raise ValueError(f"{name} must be normalized to [-1, 1]")
 
 
 def _per_graph_descriptor(pyg, name, width, batch_size, reference, default=None):
@@ -178,6 +207,15 @@ def build_decoder_data(decoder, device="cpu"):
         dtype=torch.float32,
         device=device,
     )
+    # Mean normalized |d(i,j) - d(j,i)| over the instance. A per-arc reverse
+    # distance says nothing about the regime the instance as a whole is in,
+    # the same argument depot_scale makes for multi-depot; a scalar rather
+    # than a bit so the degree of asymmetry survives, not just its presence.
+    metric_skew = torch.tensor(
+        [[min(max(float(decoder.metadata["metric_skew"]), 0.0), 1.0)]],
+        dtype=torch.float32,
+        device=device,
+    )
     # Squash the raw depot count into [0, 1): 0->0, 1->0.5, 3->0.75. Gives the
     # field a graph-level multi-depot signal that node feature is_depot (a single
     # binary flag shared by every depot) and raw edge distances cannot convey.
@@ -196,9 +234,61 @@ def build_decoder_data(decoder, device="cpu"):
     resource_events = torch.as_tensor(
         decoder.resource_events, dtype=torch.float32, device=device
     )
-    resource_descriptors = torch.as_tensor(
-        decoder.resource_descriptors, dtype=torch.float32, device=device
-    ).view(1, resource_count, RESOURCE_DESCRIPTOR_DIM)
+    # Per-node, per-resource attributes. The node-side counterpart of the
+    # per-edge pressure: variable in resource_count with no constraint-named
+    # column, so a declared row's node attributes reach the model through the
+    # same shared projection that demand and time windows do.
+    node_resource = torch.as_tensor(
+        decoder.node_resource_features, dtype=torch.float32, device=device
+    )
+    # Per-resource route state along the incumbent, written by the C++ replay
+    # from each row's own declaration. This is the generic counterpart of the
+    # hand-written forward_load / forward_time / open_pickups node columns,
+    # which only exist for three of the seven compiled kernels; a declared row
+    # has no such column and reaches the encoder only through here.
+    node_live_state = torch.as_tensor(
+        decoder.incumbent_live_state, dtype=torch.float32, device=device
+    )
+    # Node terms of the DECLARED objective (charged on visited / on unvisited).
+    # The coefficient vector says what each slot weighs and whether it is live,
+    # so neither is a column named prize or penalty.
+    node_objective = torch.as_tensor(
+        decoder.node_objective_features, dtype=torch.float32, device=device
+    )
+    # Reverse counterpart: what the remaining route still spends on each row.
+    # This is the generic replacement for the backward_load / backward_time /
+    # backward_open_pickups columns, which only ever existed for three of the
+    # seven compiled kernels.
+    node_suffix_state = torch.as_tensor(
+        decoder.incumbent_suffix_state, dtype=torch.float32, device=device
+    )
+    # Rich reverse-route statistics retain positive/negative workload and
+    # departure contributions separately.  incumbent_suffix_state remains in
+    # the contract as the legacy |signed total| view; keeping both makes the new
+    # representation strictly richer without silently reinterpreting the old
+    # scalar column.
+    node_suffix_features = torch.as_tensor(
+        decoder.incumbent_suffix_features, dtype=torch.float32, device=device
+    )
+    resource_transition_features = torch.as_tensor(
+        decoder.incumbent_transition_features,
+        dtype=torch.float32,
+        device=device,
+    )
+    resource_transition_mask = torch.as_tensor(
+        decoder.incumbent_transition_feature_mask,
+        dtype=torch.bool,
+        device=device,
+    )
+    resource_row_properties = torch.as_tensor(
+        decoder.resource_row_properties, dtype=torch.float32, device=device
+    ).view(resource_count, RESOURCE_ROW_PROPERTY_DIM)
+    resource_term_properties = torch.as_tensor(
+        decoder.resource_term_properties, dtype=torch.float32, device=device
+    ).view(-1, RESOURCE_TERM_PROPERTY_DIM)
+    resource_term_counts = torch.as_tensor(
+        decoder.resource_term_counts, dtype=torch.long, device=device
+    )
     objective_edge_costs = torch.as_tensor(
         decoder.objective_edge_costs, dtype=torch.float32, device=device
     )
@@ -242,9 +332,75 @@ def build_decoder_data(decoder, device="cpu"):
         raise ValueError("raw_resource_pressure must match resource_features")
     if resource_events.shape != resource_features.shape:
         raise ValueError("resource_events must match resource_features")
+    if node_resource.shape != (
+        x.shape[0],
+        resource_count,
+        NODE_RESOURCE_FEATURE_COUNT,
+    ):
+        raise ValueError(
+            "node_resource_features must have shape "
+            "[N, resource_count, NODE_RESOURCE_FEATURE_COUNT]"
+        )
     _require_unit_interval("resource_features", resource_features)
     _require_unit_interval("resource_events", resource_events)
-    _require_unit_interval("resource_descriptors", resource_descriptors)
+    if node_live_state.shape != (x.shape[0], resource_count):
+        raise ValueError(
+            "incumbent_live_state must have shape [N, resource_count]"
+        )
+    _require_unit_interval("node_resource_features", node_resource)
+    if node_suffix_state.shape != (x.shape[0], resource_count):
+        raise ValueError(
+            "incumbent_suffix_state must have shape [N, resource_count]"
+        )
+    _require_unit_interval("incumbent_live_state", node_live_state)
+    _require_unit_interval("incumbent_suffix_state", node_suffix_state)
+    if node_suffix_features.shape != (
+        x.shape[0],
+        resource_count,
+        RESOURCE_SUFFIX_FEATURE_COUNT,
+    ):
+        raise ValueError(
+            "incumbent_suffix_features must have shape "
+            "[N, resource_count, RESOURCE_SUFFIX_FEATURE_COUNT]"
+        )
+    _require_unit_interval("incumbent_suffix_features", node_suffix_features)
+    if resource_transition_features.shape != (
+        edge_attr.shape[0],
+        resource_count,
+        RESOURCE_TRANSITION_FEATURE_COUNT,
+    ):
+        raise ValueError(
+            "incumbent_transition_features must have shape "
+            "[E, resource_count, RESOURCE_TRANSITION_FEATURE_COUNT]"
+        )
+    if resource_transition_mask.shape != (
+        edge_attr.shape[0],
+        resource_count,
+    ):
+        raise ValueError(
+            "incumbent_transition_feature_mask must have shape "
+            "[E, resource_count]"
+        )
+    _require_unit_interval(
+        "incumbent_transition_features.next_state",
+        resource_transition_features[..., 0],
+    )
+    _require_signed_unit_interval(
+        "incumbent_transition_features.signed_margin",
+        resource_transition_features[..., 1],
+    )
+    if node_objective.shape != (x.shape[0], OBJECTIVE_NODE_TERM_COUNT):
+        raise ValueError(
+            "node_objective_features must have shape "
+            "[N, OBJECTIVE_NODE_TERM_COUNT]"
+        )
+    _require_unit_interval("node_objective_features", node_objective)
+    _require_unit_interval("resource_row_properties", resource_row_properties)
+    _require_unit_interval("resource_term_properties", resource_term_properties)
+    if resource_term_counts.shape != (resource_count,):
+        raise ValueError("resource_term_counts must have shape [resource_count]")
+    if int(resource_term_counts.sum()) != resource_term_properties.shape[0]:
+        raise ValueError("resource term counts do not match term properties")
     return Data(
         x=x,
         edge_index=edge_index,
@@ -256,10 +412,20 @@ def build_decoder_data(decoder, device="cpu"):
         objective_energy_scale=objective_energy_scale,
         multi_route=multi_route,
         depot_scale=depot_scale,
+        metric_skew=metric_skew,
         raw_resource_pressure=raw_resource_pressure,
         resource_features=resource_features,
         resource_events=resource_events,
-        resource_descriptors=resource_descriptors,
+        node_resource=node_resource,
+        node_live_state=node_live_state,
+        node_suffix_state=node_suffix_state,
+        node_suffix_features=node_suffix_features,
+        resource_transition_features=resource_transition_features,
+        resource_transition_mask=resource_transition_mask,
+        node_objective=node_objective,
+        resource_row_properties=resource_row_properties,
+        resource_term_properties=resource_term_properties,
+        resource_term_counts=resource_term_counts,
         objective_edge_costs=objective_edge_costs,
         resource_scales=resource_scales,
         edge_offsets=edge_offsets,
@@ -273,7 +439,6 @@ def decode_iteration(
     model,
     device="cpu",
     risk_penalty=10.0,
-    learned_candidate_quotas=False,
 ):
     """Run one model-guided perturbation on an installed incumbent graph."""
     if not decoder.best_solution["feasible"]:
@@ -283,13 +448,6 @@ def decode_iteration(
         )
     graph = build_decoder_data(decoder, device=device)
     output = model(graph)
-    if learned_candidate_quotas:
-        decoder.set_candidate_resource_quotas(
-            output["candidate_quota"][0].detach().cpu().numpy()
-        )
-        decoder.set_incumbent(decoder.best_solution["route"])
-        graph = build_decoder_data(decoder, device=device)
-        output = model(graph)
     edge_field = output["residual"].detach().cpu().numpy()
     multipliers = output["multipliers"][0].detach().cpu().numpy()
     solution = decoder.solve(
@@ -333,6 +491,163 @@ class GNNLayer(nn.Module):
         w = w0 + self.act_fn(self.e_bn(w1 + x3[edge_index[0]] + x4[edge_index[1]]))
         return x, w
 
+def _unit_scale(projected):
+    return F.layer_norm(projected, (projected.shape[-1],))
+
+
+class ConditionedProjection(nn.Module):
+    """Project attributes under a semantic descriptor without set reduction."""
+
+    def __init__(self, attr_feats, descriptor_dim, units, output):
+        super().__init__()
+        self.attr_proj = nn.Linear(attr_feats, units)
+        self.type_proj = nn.Linear(descriptor_dim, units)
+        self.head = nn.Linear(units, output)
+
+    def forward(self, attributes, descriptor):
+        hidden = _unit_scale(self.attr_proj(attributes)) + _unit_scale(
+            self.type_proj(descriptor)
+        )
+        return self.head(F.silu(hidden))
+
+
+class ResourceProgramEncoder(nn.Module):
+    """Encode fixed row properties plus a set of executable term properties.
+
+    The shared term map and normalized sum are invariant to term order.  An
+    explicit cardinality coordinate preserves multiplicity, so adding a term
+    changes the semantic point without changing any tensor width.
+    """
+
+    def __init__(self, units, output=RESOURCE_TYPE_DIM):
+        super().__init__()
+        self.row_map = nn.Sequential(
+            nn.Linear(RESOURCE_ROW_PROPERTY_DIM, units),
+            nn.SiLU(),
+            nn.Linear(units, units),
+        )
+        self.term_map = nn.Sequential(
+            nn.Linear(RESOURCE_TERM_PROPERTY_DIM, units),
+            nn.SiLU(),
+            nn.Linear(units, units),
+            nn.SiLU(),
+        )
+        self.combine = nn.Sequential(
+            nn.Linear(2 * units + 1, units),
+            nn.SiLU(),
+            nn.Linear(units, output),
+        )
+
+    def forward(self, row_properties, term_properties, term_counts):
+        if row_properties.ndim != 2 or row_properties.shape[-1] != (
+            RESOURCE_ROW_PROPERTY_DIM
+        ):
+            raise ValueError("row properties must have shape [R, Dr]")
+        if term_properties.ndim != 2 or term_properties.shape[-1] != (
+            RESOURCE_TERM_PROPERTY_DIM
+        ):
+            raise ValueError("term properties must have shape [K, Dt]")
+        if term_counts.shape != (row_properties.shape[0],):
+            raise ValueError("term counts must have shape [R]")
+        if int(term_counts.sum()) != term_properties.shape[0]:
+            raise ValueError("term counts do not match term property rows")
+
+        resources = row_properties.shape[0]
+        row_hidden = self.row_map(row_properties)
+        term_sum = row_hidden.new_zeros(resources, row_hidden.shape[-1])
+        if term_properties.shape[0] > 0:
+            term_hidden = self.term_map(term_properties)
+            owners = torch.repeat_interleave(
+                torch.arange(resources, device=term_counts.device), term_counts
+            )
+            term_sum.index_add_(0, owners, term_hidden)
+            term_sum = term_sum / term_counts.to(term_sum.dtype).clamp_min(
+                1.0
+            ).sqrt().unsqueeze(-1)
+        cardinality = term_counts.to(row_hidden.dtype).unsqueeze(-1)
+        cardinality = cardinality / (1.0 + cardinality)
+        return torch.sigmoid(
+            self.combine(torch.cat((row_hidden, term_sum, cardinality), dim=-1))
+        )
+
+
+class ResourcePool(nn.Module):
+    """Program-property-conditioned DeepSets encoder over resource rows.
+
+    Shared ``phi`` weights produce one equivariant state per row. A normalized
+    sum and explicit cardinality are then passed through ``rho`` for the
+    fixed-width GNN summary. The unpooled states also go directly to the shared
+    resource field, retaining the easy per-resource path that made v6 trainable.
+    """
+
+    def __init__(
+        self,
+        attr_feats,
+        descriptor_dim,
+        units,
+        summary,
+    ):
+        super().__init__()
+        self.attr_proj = nn.Linear(attr_feats, units)
+        self.type_proj = nn.Linear(descriptor_dim, units)
+        self.units = units
+        self.row_mlp = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(units, units),
+            nn.SiLU(),
+        )
+        self.summary_head = nn.Sequential(
+            nn.Linear(units + 1, units),
+            nn.SiLU(),
+            nn.Linear(units, summary),
+        )
+
+    def encode_rows(self, attributes, descriptor, active):
+        """Return permutation-equivariant per-resource states [B,R,U]."""
+        if attributes.ndim != 3 or descriptor.ndim != 3 or active.ndim != 2:
+            raise ValueError(
+                "resource pooling expects attributes [B,R,A], descriptors "
+                "[B,R,D], and active mask [B,R]"
+            )
+        if attributes.shape[:2] != descriptor.shape[:2] or (
+            attributes.shape[:2] != active.shape
+        ):
+            raise ValueError("resource pooling tensors disagree on [B,R]")
+        batch_size, resource_count = active.shape
+        if resource_count == 0:
+            return attributes.new_zeros(batch_size, 0, self.units)
+
+        weights = active.to(attributes.dtype).unsqueeze(-1)
+        hidden = self.row_mlp(
+            _unit_scale(self.attr_proj(attributes))
+            + _unit_scale(self.type_proj(descriptor))
+        ) * weights
+        return hidden
+
+    def reduce_rows(self, hidden, active):
+        """Reduce equivariant row states with one invariant DeepSets sum."""
+        batch_size, resource_count = active.shape
+        if resource_count == 0:
+            return hidden.new_zeros(
+                batch_size, self.summary_head[-1].out_features
+            )
+        active_count = active.to(hidden.dtype).sum(dim=1, keepdim=True)
+        semantic_sum = hidden.sum(dim=1) / active_count.clamp_min(1.0).sqrt()
+        cardinality = active_count / (1.0 + active_count)
+        summary = self.summary_head(
+            torch.cat((semantic_sum, cardinality), dim=-1)
+        )
+        no_resources = ~active.bool().any(dim=1)
+        if no_resources.any():
+            summary = summary.masked_fill(no_resources.unsqueeze(-1), 0.0)
+        return summary
+
+    def forward(self, attributes, descriptor, active):
+        return self.reduce_rows(
+            self.encode_rows(attributes, descriptor, active), active
+        )
+
+
 class EmbNet(nn.Module):
     def __init__(
         self,
@@ -343,16 +658,71 @@ class EmbNet(nn.Module):
         act_fn="silu",
         agg_fn="mean",
         grad_checkpointing=False,
+        node_resource_feats=0,
+        edge_resource_feats=0,
+        objective_node_feats=0,
+        objective_coeff_dim=0,
+        resource_descriptor_dim=0,
+        node_resource_summary=0,
+        objective_summary=0,
     ):
         super().__init__()
         self.depth = depth
-        self.feats = feats
-        self.edge_feats = edge_feats
         self.units = units
         self.act_fn = getattr(F, act_fn)
         self.agg_fn = getattr(gnn, f'global_{agg_fn}_pool')
         self.grad_checkpointing = grad_checkpointing
-        
+        # Per-node resource attributes (demand, window bounds, service time, and
+        # whatever slots a declared row publishes) reach the node encoder as a
+        # fixed-width pooled summary instead of as constraint-named columns.
+        # phi is shared across resources and keyed by the semantic descriptor,
+        # so an appended schema row contributes through the same weights, the
+        # width does not depend on resource_count, and nothing here reads a
+        # registry position. Without this the attributes reach only the
+        # per-channel field head, leaving the feasibility, binding, coupler and
+        # objective-residual heads with no view of demand or time windows.
+        self.node_resource_summary = node_resource_summary
+        if node_resource_summary:
+            # Forward state, the legacy scalar suffix, and the richer split
+            # suffix statistics are ordinary per-(node, resource) attributes.
+            self.node_resource_encoder = ResourcePool(
+                node_resource_feats + 2 + RESOURCE_SUFFIX_FEATURE_COUNT,
+                resource_descriptor_dim,
+                units,
+                node_resource_summary,
+            )
+            feats = feats + node_resource_summary
+            # The edge side has the same shape of problem: 7 of the 12 edge
+            # columns are one-per-compiled-channel, so a declared row's live
+            # pressure and reset events -- which the decoder already publishes
+            # per resource -- never reach the GNN at all. Same pool, same
+            # descriptor key, three per-(edge, resource) attributes instead of
+            # six.
+            self.edge_resource_encoder = ResourcePool(
+                edge_resource_feats,
+                resource_descriptor_dim,
+                units,
+                node_resource_summary,
+            )
+            edge_feats = edge_feats + node_resource_summary
+            # The objective's node terms take the same two-branch conditioned
+            # projection, keyed by the declared coefficient vector instead of a
+            # resource descriptor. No reduction: the objective language is
+            # closed at three declared quantities, so there is no set to pool.
+            self.objective_node_encoder = ConditionedProjection(
+                objective_node_feats,
+                objective_coeff_dim,
+                units,
+                objective_summary,
+            )
+            feats = feats + objective_summary
+        else:
+            self.node_resource_encoder = None
+            self.edge_resource_encoder = None
+            self.objective_node_encoder = None
+        self.feats = feats
+        self.edge_feats = edge_feats
+
         self.v_lin0 = nn.Linear(self.feats, self.units)
         self.e_lin0 = nn.Linear(self.edge_feats, self.units)
         
@@ -360,6 +730,185 @@ class EmbNet(nn.Module):
             GNNLayer(self.units, self.act_fn, self.agg_fn) for _ in range(self.depth)
         ])
         
+    def augment_nodes(
+        self,
+        x,
+        node_resource,
+        node_live_state,
+        node_suffix_state,
+        node_suffix_features,
+        node_objective,
+        objective_coeffs,
+        resource_type,
+        resource_active,
+        return_resource_rows=False,
+    ):
+        """Append the pooled per-node resource summary to node features.
+
+        ``node_resource`` is [N, R, A] static attributes, ``node_live_state``
+        and ``node_suffix_state`` the [N, R] route state before and after this
+        node, and ``node_suffix_features`` the richer [N, R, S] split reverse
+        statistics. ``resource_type`` is the
+        matching [N, R, D] semantic descriptors and ``resource_active`` the
+        [N, R] active mask. The reduction is masked and taken over resources, so
+        the result is invariant to registry order and fixed-width for any
+        registry. Returns ``x`` unchanged when pooling is disabled.
+        """
+        if self.node_resource_encoder is None:
+            return (x, None) if return_resource_rows else x
+        x = torch.cat(
+            (x, self.objective_node_encoder(node_objective, objective_coeffs)),
+            dim=-1,
+        )
+        return self._pool(
+            self.node_resource_encoder,
+            x,
+            torch.cat(
+                (
+                    node_resource,
+                    node_live_state.unsqueeze(-1),
+                    node_suffix_state.unsqueeze(-1),
+                    node_suffix_features,
+                ),
+                dim=-1,
+            ),
+            resource_type,
+            resource_active,
+            return_resource_rows=return_resource_rows,
+        )
+
+    @staticmethod
+    def _pool(
+        encoder,
+        base,
+        attributes,
+        resource_type,
+        resource_active,
+        return_resource_rows=False,
+    ):
+        """Append a permutation-invariant learned resource-set summary.
+
+        A registry with no active row reduces to zero, which is the same
+        neutral value an all-inactive registry contributes anywhere else.
+        """
+        rows = encoder.encode_rows(attributes, resource_type, resource_active)
+        summary = encoder.reduce_rows(rows, resource_active)
+        augmented = torch.cat((base, summary), dim=-1)
+        return (augmented, rows) if return_resource_rows else augmented
+
+    def augment_from_graph(
+        self,
+        graph,
+        x=None,
+        resource_type=None,
+        live_state=True,
+        return_resource_rows=False,
+    ):
+        """augment_nodes for a decoder graph, broadcasting the per-graph rows.
+
+        ``resource_type`` is the learned pooled program type produced one level
+        up by ConstraintFieldNet. ``live_state=False`` substitutes zeros for the incumbent
+        route state, keeping the width identical the way the incumbent node
+        columns are zeroed rather than dropped -- that is what an
+        incumbent-blind view needs.
+        """
+        if self.node_resource_encoder is None:
+            base = graph.x if x is None else x
+            return (base, None) if return_resource_rows else base
+        node_count = graph.x.shape[0]
+        batch = getattr(graph, "batch", None)
+
+        def rows(tensor, rank):
+            # active_channels arrives as [R] or [G, R], descriptors as [R, D] or
+            # [G, R, D]; add the graph axis before broadcasting to one row per
+            # node so a single-graph registry serves every node.
+            while tensor.ndim < rank:
+                tensor = tensor.unsqueeze(0)
+            if tensor.shape[0] == 1 or batch is None:
+                return tensor[0].unsqueeze(0).expand(node_count, *tensor.shape[1:])
+            return tensor[batch]
+
+        if resource_type is None:
+            raise ValueError("augment_from_graph requires pooled resource_type")
+        node_live_state = graph.node_live_state
+        node_suffix_state = graph.node_suffix_state
+        node_suffix_features = graph.node_suffix_features
+        if not live_state:
+            node_live_state = torch.zeros_like(node_live_state)
+            node_suffix_state = torch.zeros_like(node_suffix_state)
+            node_suffix_features = torch.zeros_like(node_suffix_features)
+        return self.augment_nodes(
+            graph.x if x is None else x,
+            graph.node_resource,
+            node_live_state,
+            node_suffix_state,
+            node_suffix_features,
+            graph.node_objective,
+            rows(graph.objective_coeffs, 2),
+            rows(resource_type, 3),
+            rows(graph.active_channels, 2),
+            return_resource_rows=return_resource_rows,
+        )
+
+    def augment_edges(
+        self,
+        edge_attr,
+        graph,
+        resource_type=None,
+        behavioral=True,
+        return_resource_rows=False,
+    ):
+        """Append the pooled per-edge resource summary to edge features.
+
+        Pressure/event features are joined by the exact normalized next state
+        and signed admissibility margin produced by the native resource
+        transition. The validity bit distinguishes sources absent from the
+        incumbent rather than silently treating missing behavior as zero.
+        """
+        if self.edge_resource_encoder is None:
+            return (edge_attr, None) if return_resource_rows else edge_attr
+        edge_count = edge_attr.shape[0]
+        batch = getattr(graph, "batch", None)
+        edge_graph = None if batch is None else batch[graph.edge_index[0]]
+
+        def rows(tensor, rank):
+            while tensor.ndim < rank:
+                tensor = tensor.unsqueeze(0)
+            if tensor.shape[0] == 1 or edge_graph is None:
+                return tensor[0].unsqueeze(0).expand(edge_count, *tensor.shape[1:])
+            return tensor[edge_graph]
+
+        if resource_type is None:
+            raise ValueError("augment_edges requires pooled resource_type")
+        transition_features = graph.resource_transition_features
+        transition_mask = graph.resource_transition_mask.to(edge_attr.dtype)
+        if not behavioral:
+            transition_features = torch.zeros_like(transition_features)
+            transition_mask = torch.zeros_like(transition_mask)
+        attributes = torch.cat(
+            (
+                torch.stack(
+                    (
+                        graph.resource_features,
+                        graph.raw_resource_pressure,
+                        graph.resource_events,
+                    ),
+                    dim=-1,
+                ),
+                transition_features,
+                transition_mask.unsqueeze(-1),
+            ),
+            dim=-1,
+        )
+        return self._pool(
+            self.edge_resource_encoder,
+            edge_attr,
+            attributes,
+            rows(resource_type, 3),
+            rows(graph.active_channels, 2),
+            return_resource_rows=return_resource_rows,
+        )
+
     def forward(self, x, edge_index, edge_attr, return_nodes=False):
         w = edge_attr
         x = self.v_lin0(x)
@@ -395,8 +944,77 @@ class ConstraintFieldNet(nn.Module):
         linear_objective_residual_head=False,
         unconditioned_objective_residual_head=False,
         couple_state_multipliers=True,
+        index_embedded_resources=False,
+        monolithic_resource_field=False,
+        program_blind_resources=False,
+        normalize_projections=True,
+        pool_node_resources=True,
     ):
         super().__init__()
+        # Monolithic ablation: remove the FACTORIZATION itself, not just its
+        # semantics. Every active resource is collapsed onto one shared token,
+        # so a single undifferentiated penalty intensity serves the whole
+        # composition and the field can no longer price two constraints
+        # differently. This is the coarse "everything off" end of the
+        # factorization ladder (semantic descriptor -> identity-addressed ->
+        # monolithic); unlike [[index_embedded_resources]] it degrades
+        # in-distribution too, and it makes resource-token coupling vacuous, so
+        # it cannot separate factorization from contextualization on its own.
+        self.monolithic_resource_field = monolithic_resource_field
+        # Semantic-factorization ablation. When True the algebra-derived type
+        # descriptor is replaced by a learned embedding of the resource's
+        # REGISTRY POSITION, keeping the descriptor's width and unit-interval
+        # range so only the semantics change, not the capacity or the downstream
+        # shapes. The model can then only memorize resource identities it saw in
+        # training instead of reading what a resource *is*, which is the claim
+        # under test: semantic factorization -- not sheer token capacity -- is
+        # what carries the field to appended schema rows and unseen
+        # compositions.
+        self.index_embedded_resources = index_embedded_resources
+        if index_embedded_resources and monolithic_resource_field:
+            raise ValueError(
+                "index_embedded_resources and monolithic_resource_field are "
+                "mutually exclusive: pooling collapses every token, so the "
+                "registry-position embedding it would read is erased"
+            )
+        # Program-blind ablation: the rung BELOW [[index_embedded_resources]] on
+        # the same ladder. Identity-addressing still tells the model *which*
+        # registry row it is looking at; this tells it nothing. Every resource
+        # receives the same constant type vector, so no static description of
+        # the constraint -- neither its executable properties nor its identity --
+        # reaches the network. Per-resource factorization is untouched: each row
+        # keeps its own token, multiplier and field head, and the live state,
+        # node attributes and candidate-conditioned effects u_r(e, t) still
+        # arrive per resource. The claim under test is the parsimony one: if the
+        # row/term property maps earn their place, removing them must cost
+        # something that the executed effects alone cannot supply.
+        # The residual GNN's activations grow with depth, so `edge_projection`
+        # and `graph_projection` emit values around |40| and |20|. Every head
+        # that consumes them passes them through a tanh, which saturates
+        # completely: the field, risk and multiplier heads then see only the
+        # SIGN pattern of their input, and the per-resource signals added to it
+        # (|token| ~ 0.2-1.1, |resource_edge| ~ 0.5) are ~50x too small to move
+        # any sign. Measured consequence: the per-edge field takes 1 distinct
+        # value across every edge of a pdtsp instance and 2 on cvrp, and the
+        # feasibility-risk head is constant to 1e-15.
+        #
+        # This is the same failure the objective head already documents and
+        # fixes below with a parameter-free per-edge layer_norm; these two
+        # projections never received it. Normalizing adds no parameters, so a
+        # checkpoint trained either way stays layout-compatible -- but the
+        # forward result differs, so test.py must read the flag rather than
+        # assume it.
+        self.normalize_projections = normalize_projections
+        self.program_blind_resources = program_blind_resources
+        if program_blind_resources and (
+            index_embedded_resources or monolithic_resource_field
+        ):
+            raise ValueError(
+                "program_blind_resources is mutually exclusive with "
+                "index_embedded_resources and monolithic_resource_field: all "
+                "three overwrite the same resource type vector, so combining "
+                "them measures whichever happens to run last"
+            )
         # Objective-residual head parameterization. Default: a coefficient-
         # conditioned MLP (hidden layer mixes edge state with the declared
         # coefficients). Ablation (True): a single linear layer over
@@ -443,6 +1061,13 @@ class ConstraintFieldNet(nn.Module):
         # their own descriptor. The attention parameters stay registered either
         # way so checkpoints remain layout-compatible across the ablation.
         self.couple_resource_tokens = couple_resource_tokens
+        # Node-attribute pooling ablation. False drops the pooled per-node
+        # resource summary, so demand, window bounds and service time reach only
+        # the per-channel field head -- the routing that made the feasibility
+        # and binding heads stall. The node encoder narrows accordingly, so an
+        # ablated run is trained from scratch rather than resumed.
+        self.pool_node_resources = pool_node_resources
+        self.resource_program_encoder = ResourceProgramEncoder(units)
         self.emb_net = EmbNet(
             depth=depth,
             feats=NODE_FEATURE_COUNT,
@@ -451,12 +1076,25 @@ class ConstraintFieldNet(nn.Module):
             act_fn=act_fn,
             agg_fn=agg_fn,
             grad_checkpointing=grad_checkpointing,
+            node_resource_feats=NODE_RESOURCE_FEATURE_COUNT,
+            edge_resource_feats=EDGE_RESOURCE_FEATURE_COUNT,
+            objective_node_feats=OBJECTIVE_NODE_TERM_COUNT,
+            objective_coeff_dim=OBJECTIVE_COEFF_DIM,
+            resource_descriptor_dim=RESOURCE_TYPE_DIM,
+            node_resource_summary=(
+                NODE_RESOURCE_SUMMARY_DIM if pool_node_resources else 0
+            ),
+            objective_summary=(
+                OBJECTIVE_SUMMARY_DIM if pool_node_resources else 0
+            ),
         )
         # Algebra-derived type descriptor + active flag + mean/max pressure +
         # graph context. No resource name or registry position reaches the
         # token encoder, so the same weights apply to appended schema rows.
+        # (--index-embedded-resources deliberately breaks exactly this property;
+        # see self.index_embedded_resources above.)
         descriptor_size = (
-            RESOURCE_DESCRIPTOR_DIM + 4 + OBJECTIVE_COEFF_DIM + 1 + 2
+            RESOURCE_TYPE_DIM + 4 + OBJECTIVE_COEFF_DIM + 1 + 3
         )
         self.resource_encoder = nn.Sequential(
             nn.Linear(descriptor_size, units),
@@ -468,7 +1106,19 @@ class ConstraintFieldNet(nn.Module):
             units, attention_heads, batch_first=True
         )
         self.edge_projection = nn.Linear(units, units)
-        self.resource_edge_projection = nn.Linear(2, units)
+        # (algebraic pressure, reset event) per edge, plus the descriptor-
+        # conditioned node and edge row states. These states stay separated by
+        # resource until this shared field projection, preserving the v6-style
+        # per-column signal without depending on constraint names or registry
+        # positions. The no-pooling ablation retains the old raw node block.
+        resource_field_context = (
+            NODE_RESOURCE_FEATURE_COUNT + 2 * units
+            if pool_node_resources
+            else NODE_RESOURCE_FEATURE_COUNT
+        )
+        self.resource_edge_projection = nn.Linear(
+            2 + resource_field_context, units
+        )
         self.token_projection = nn.Linear(units, units)
         self.graph_projection = nn.Linear(units, units)
         self.field_head = nn.Linear(units, 1)
@@ -476,24 +1126,10 @@ class ConstraintFieldNet(nn.Module):
         self.feasibility_head = nn.Linear(units, 1)
         self.multiplier_head = nn.Linear(units, 1)
         self.binding_head = nn.Linear(units, 1)
-        self.candidate_quota_head = nn.Linear(units, 1)
-        self.distance_quota_head = nn.Linear(units, 1)
         self.coupler_query_head = nn.Linear(units, units)
         self.coupler_key_head = nn.Linear(units, units)
         self.coupler_bias_head = nn.Linear(units, 1)
-        # Retain the legacy objective-head parameters in the state dict so
-        # existing typed-resource checkpoints and optimizer states remain
-        # loadable. Forward fixes this slot to one: a scalar objective weight is
-        # only a second decoder temperature and cannot learn edge ordering.
-        self.objective_multiplier_head = nn.Linear(units, 1)
-        self.objective_coupler_query_head = nn.Linear(units, units)
-        self.objective_coupler_bias_head = nn.Linear(units, 1)
         self.value_head = nn.Linear(units + 1, 1)
-        # Retain the original shared head in the state dict so typed-resource
-        # checkpoints keep their parameter/optimizer ordering. It is no longer
-        # used directly: one shared signed logit caused severe negative transfer
-        # between distance and prize objectives.
-        self.edge_logit_head = nn.Linear(units, 1)
         # Keep this final in module registration order. A single shared head
         # conditioned on the declared objective coefficient vector produces the
         # signed, dimensionless correction to normalized objective energy. The
@@ -519,32 +1155,16 @@ class ConstraintFieldNet(nn.Module):
                 nn.SiLU(),
                 nn.Linear(units, 1),
             )
-        # Schema-conditioned advantage scale g_phi(schema): a detached, learned
-        # RELATIVE multiplier on the batch-pooled advantage scale. It reads the
-        # same algebra descriptor the field consumes (constraint multi-hot + route
-        # structure), so a schema's dispersion relative to the batch is predicted
-        # as a smooth function of the composition and generalises to held-out
-        # variants -- replacing any hand-grouped per-objective normaliser. It is
-        # initialised at 1.0 so it starts as an exact no-op on top of the pooled
-        # scale (a stationary global magnitude); predicting absolute dispersion
-        # instead would ramp the effective step size by orders of magnitude and
-        # diverge. Because the output depends only on the schema (not the option),
-        # every option of a schema shares one multiplier, so degenerate
-        # low-variance options are not amplified. Trained by a separate log-space
-        # regression, never through the policy loss (detached where it scales).
-        self.reward_scale_head = nn.Sequential(
-            nn.Linear(SCHEMA_FEATURE_DIM, units),
-            nn.SiLU(),
-            nn.Linear(units, 1),
+        # Registered unconditionally (like resource_attention) so a property
+        # model and an index-embedded ablation share one parameter
+        # layout and one checkpoint format.
+        self.resource_index_embedding = nn.Embedding(
+            RESOURCE_INDEX_EMBEDDING_ROWS, RESOURCE_TYPE_DIM
         )
         nn.init.zeros_(self.field_head.weight)
         nn.init.zeros_(self.field_head.bias)
         nn.init.zeros_(self.additive_head.weight)
         nn.init.zeros_(self.additive_head.bias)
-        # Preserve the neutral objective policy exactly at initialization and
-        # when upgrading an older typed-resource checkpoint.
-        nn.init.zeros_(self.edge_logit_head.weight)
-        nn.init.zeros_(self.edge_logit_head.bias)
         # Small non-zero init on the final layer so the hidden (coefficient-
         # conditioning) layer receives gradient from step 0. Bias stays zero so a
         # row-constant output remains neutral after row-centering; the residual
@@ -570,23 +1190,14 @@ class ConstraintFieldNet(nn.Module):
         nn.init.zeros_(self.coupler_query_head.bias)
         nn.init.zeros_(self.coupler_bias_head.weight)
         nn.init.zeros_(self.coupler_bias_head.bias)
-        # These legacy heads are deliberately neutral and unused by forward.
-        nn.init.zeros_(self.objective_multiplier_head.weight)
-        nn.init.zeros_(self.objective_multiplier_head.bias)
-        nn.init.zeros_(self.objective_coupler_query_head.weight)
-        nn.init.zeros_(self.objective_coupler_query_head.bias)
-        nn.init.zeros_(self.objective_coupler_bias_head.weight)
-        nn.init.zeros_(self.objective_coupler_bias_head.bias)
-        # A zero value is the neutral bootstrap for old checkpoints and makes
+        # A zero value is the neutral bootstrap and makes
         # enabling temporal credit leave the field policy unchanged initially.
         nn.init.zeros_(self.value_head.weight)
         nn.init.zeros_(self.value_head.bias)
-        # Start the schema scale at exactly 1.0 (softplus(shift) == 1) so enabling
-        # it leaves the advantage untouched until the regression fits dispersion.
-        nn.init.zeros_(self.reward_scale_head[-1].weight)
-        nn.init.constant_(
-            self.reward_scale_head[-1].bias, math.log(math.expm1(1.0))
-        )
+        # Unit-variance logits so sigmoid() spreads the rows across (0, 1) and
+        # distinct registry positions start distinguishable. Unused (and so
+        # exactly neutral) unless --index-embedded-resources is set.
+        nn.init.normal_(self.resource_index_embedding.weight, std=1.0)
         self.register_buffer(
             "unit_softplus_shift",
             torch.log(torch.expm1(torch.ones(()))),
@@ -615,11 +1226,58 @@ class ConstraintFieldNet(nn.Module):
             self.additive_head(interaction).squeeze(-1),
         )
 
-    def reward_scale(self, schema):
-        """Positive per-schema advantage scale g_phi(schema) from the algebra
-        descriptor [..., SCHEMA_FEATURE_DIM]. Softplus keeps it positive and, at
-        initialization, exactly 1.0 so enabling it is a no-op until fitted."""
-        return F.softplus(self.reward_scale_head(schema).squeeze(-1))
+    def _resource_type_rows(self, pyg, resource_count):
+        """Pool each resource's executable term set into [G, R, D]."""
+        rows = pyg.resource_row_properties
+        terms = pyg.resource_term_properties
+        counts = pyg.resource_term_counts
+        _require_unit_interval("resource_row_properties", rows)
+        _require_unit_interval("resource_term_properties", terms)
+        if self.program_blind_resources:
+            # Same shape, same unit-interval range, and identical across rows so
+            # the type vector carries no per-resource information at all. The
+            # encoder stays registered (and unused, at its init) so a blind and
+            # a descriptor-conditioned checkpoint remain layout-compatible.
+            if rows.ndim not in (2, 3):
+                raise ValueError("resource_row_properties must have rank 2 or 3")
+            graphs = rows.shape[0] if rows.ndim == 3 else 1
+            return rows.new_full((graphs, resource_count, RESOURCE_TYPE_DIM), 0.5)
+        if rows.ndim == 2:
+            resource_type = self.resource_program_encoder(
+                rows, terms, counts.reshape(-1)
+            ).unsqueeze(0)
+        elif rows.ndim == 3:
+            if counts.ndim != 2 or rows.shape[:2] != counts.shape:
+                raise ValueError("batched row properties and term counts disagree")
+            encoded = []
+            offset = 0
+            for graph_rows, graph_counts in zip(rows, counts):
+                term_count = int(graph_counts.sum())
+                encoded.append(
+                    self.resource_program_encoder(
+                        graph_rows,
+                        terms[offset : offset + term_count],
+                        graph_counts,
+                    )
+                )
+                offset += term_count
+            if offset != terms.shape[0]:
+                raise ValueError("batched term counts do not match term rows")
+            resource_type = torch.stack(encoded, dim=0)
+        else:
+            raise ValueError("resource_row_properties must have rank 2 or 3")
+        if resource_type.shape[1] != resource_count:
+            raise ValueError("resource program rows disagree with active channels")
+        if self.index_embedded_resources:
+            positions = torch.arange(
+                resource_count, device=resource_type.device
+            ).clamp_(max=RESOURCE_INDEX_EMBEDDING_ROWS - 1)
+            resource_type = (
+                torch.sigmoid(self.resource_index_embedding(positions))
+                .unsqueeze(0)
+                .expand(resource_type.shape[0], -1, -1)
+            )
+        return resource_type
 
     def forward(self, pyg):
         _require_unit_interval("node_features", pyg.x)
@@ -629,8 +1287,6 @@ class ConstraintFieldNet(nn.Module):
             active = active.unsqueeze(0)
         _require_unit_interval("active_channels", active)
         resource_count = active.shape[-1]
-        if resource_count < FIELD_CHANNEL_COUNT:
-            raise ValueError("resource registry must include canonical rows")
 
         # Objective guidance must not see the incumbent whose refinement it is
         # supposed to improve. Otherwise PPO can reduce its loss by recognizing
@@ -642,7 +1298,13 @@ class ConstraintFieldNet(nn.Module):
         static_x = torch.cat(
             (
                 pyg.x[:, :STATIC_NODE_FEATURE_COUNT],
-                torch.zeros_like(pyg.x[:, STATIC_NODE_FEATURE_COUNT:]),
+                torch.zeros_like(
+                    pyg.x[
+                        :,
+                        STATIC_NODE_FEATURE_COUNT:INCUMBENT_NODE_FEATURE_END,
+                    ]
+                ),
+                pyg.x[:, INCUMBENT_NODE_FEATURE_END:],
             ),
             dim=1,
         )
@@ -665,7 +1327,33 @@ class ConstraintFieldNet(nn.Module):
         # embedding even while the objective residual is identically zero, so
         # merely adding the objective head changes the policy being restored.
         edge_count = pyg.edge_attr.shape[0]
-        edge_embedding = self.emb_net(pyg.x, pyg.edge_index, pyg.edge_attr)
+        # The pooled summary is a static instance property, so it is appended to
+        # both views: the objective view stays blind to the incumbent because
+        # only the incumbent columns of pyg.x are zeroed above.
+        node_resource_type = self._resource_type_rows(pyg, resource_count)
+        encoder_x, node_resource_rows = self.emb_net.augment_from_graph(
+            pyg,
+            resource_type=node_resource_type,
+            return_resource_rows=True,
+        )
+        static_x = self.emb_net.augment_from_graph(
+            pyg, x=static_x, resource_type=node_resource_type, live_state=False
+        )
+        encoder_edge_attr, edge_resource_rows = self.emb_net.augment_edges(
+            pyg.edge_attr,
+            pyg,
+            resource_type=node_resource_type,
+            return_resource_rows=True,
+        )
+        static_edge_attr = self.emb_net.augment_edges(
+            static_edge_attr,
+            pyg,
+            resource_type=node_resource_type,
+            behavioral=False,
+        )
+        edge_embedding = self.emb_net(
+            encoder_x, pyg.edge_index, encoder_edge_attr
+        )
 
         # The objective view must not update BatchNorm a second time. Reuse the
         # running statistics learned by the dynamic path while retaining
@@ -728,6 +1416,9 @@ class ConstraintFieldNet(nn.Module):
         depot_scale = _per_graph_descriptor(
             pyg, "depot_scale", 1, batch_size, active
         )
+        metric_skew = _per_graph_descriptor(
+            pyg, "metric_skew", 1, batch_size, active
+        )
 
         normalized_resources = pyg.resource_features
         if normalized_resources.shape != (edge_embedding.shape[0], resource_count):
@@ -747,19 +1438,17 @@ class ConstraintFieldNet(nn.Module):
         else:
             resource_mean = normalized_resources.mean(dim=0, keepdim=True)
             resource_max = normalized_resources.amax(dim=0, keepdim=True)
-        resource_type = pyg.resource_descriptors
-        if resource_type.ndim == 2:
-            resource_type = resource_type.unsqueeze(0)
+        resource_type = self._resource_type_rows(pyg, resource_count)
         if resource_type.shape != (
             batch_size,
             resource_count,
-            RESOURCE_DESCRIPTOR_DIM,
+            RESOURCE_TYPE_DIM,
         ):
             raise ValueError(
-                "resource_descriptors must have shape "
-                "[num_graphs, resource_count, RESOURCE_DESCRIPTOR_DIM]"
+                "pooled resource types must have shape "
+                "[num_graphs, resource_count, RESOURCE_TYPE_DIM]"
             )
-        _require_unit_interval("resource_descriptors", resource_type)
+        _require_unit_interval("resource_types", resource_type)
 
         def _broadcast(column):
             return column.unsqueeze(1).expand(-1, resource_count, -1)
@@ -775,21 +1464,45 @@ class ConstraintFieldNet(nn.Module):
                 _broadcast(objective_scale),
                 _broadcast(multi_route),
                 _broadcast(depot_scale),
+                _broadcast(metric_skew),
             ),
             dim=-1,
         )
-        _require_unit_interval("resource_descriptors", descriptor)
+        _require_unit_interval("resource_token_inputs", descriptor)
         tokens = self.resource_encoder(descriptor)
+        # Monolithic ablation: pool the per-resource tokens into one shared
+        # token (mean over ACTIVE resources) and broadcast it back across every
+        # channel. Pooling must happen here, after the encoder -- the descriptor
+        # also carries per-resource mean/max pressure, so collapsing only its
+        # type block would leave the tokens differentiated through pressure.
+        # The decoder contract is untouched (still resource_count channels and
+        # MULTIPLIER_COUNT multipliers), but each active resource necessarily
+        # receives the same learned intensity. Resource-token coupling below
+        # degenerates to an identity on identical tokens, which is exactly the
+        # point: there is no composition left to attend over.
+        if self.monolithic_resource_field:
+            weights = active.unsqueeze(-1)
+            pooled = (tokens * weights).sum(dim=1, keepdim=True) / (
+                weights.sum(dim=1, keepdim=True).clamp_min(1.0)
+            )
+            tokens = pooled.expand(-1, resource_count, -1)
         # Cross-resource coupling. The --no-couple-resource-tokens ablation
         # skips this residual so every token is an independent per-resource
         # encoding of its own descriptor, isolating the contribution of
         # compositional attention. The attention parameters remain in the state
         # dict (unused, at their init) so a coupled and an ablated checkpoint
         # share an identical parameter layout.
-        if self.couple_resource_tokens:
+        # An EMPTY registry is now reachable: a problem that declares no
+        # constraint (a TSP) carries no resource rows at all, where it used to
+        # carry seven inactive ones. There is no sequence to attend over, and
+        # the all-masked workaround below has no row to unmask, so skip the
+        # residual entirely -- it would be a no-op on zero tokens anyway.
+        if self.couple_resource_tokens and resource_count > 0:
             padding_mask = ~active.bool()
             no_resources = ~active.bool().any(dim=1)
             if no_resources.any():
+                # Attention over an all-masked row is undefined, so leave one
+                # key visible; the tokens it mixes are inactive either way.
                 padding_mask = padding_mask.clone()
                 padding_mask[no_resources, 0] = False
             coupled_tokens, _ = self.resource_attention(
@@ -798,6 +1511,13 @@ class ConstraintFieldNet(nn.Module):
             tokens = tokens + coupled_tokens
 
         projected_edges = self.edge_projection(edge_embedding)
+        if self.normalize_projections:
+            # Same normalization, same reason, as the objective head below --
+            # see the note in __init__ for what saturating here costs the
+            # resource field and the feasibility-risk head.
+            projected_edges = F.layer_norm(
+                projected_edges, (projected_edges.shape[-1],)
+            )
         # The residual GNN can have large eval-time activations after many
         # layers. Applying tanh directly here saturated every component and
         # made the nominal per-edge residual constant across all TSP edges. Use
@@ -845,6 +1565,55 @@ class ConstraintFieldNet(nn.Module):
         )[source]
         objective_residual = torch.tanh(centered_objective_residual)
         projected_tokens = self.token_projection(tokens)
+        edge_active = active[edge_batch] if batched else active[0]
+        channel_state = normalized_resources
+        channel_events = resource_events
+        # Gather the arrival node's descriptor-conditioned resource states and
+        # concatenate the corresponding edge states. The ordinary GNN receives
+        # only their invariant set summaries; the shared per-resource field
+        # retains these equivariant rows until its final channel computation.
+        if node_resource_rows is None:
+            resource_context_edges = pyg.node_resource[pyg.edge_index[1]]
+        else:
+            resource_context_edges = torch.cat(
+                (
+                    pyg.node_resource[pyg.edge_index[1]],
+                    node_resource_rows[pyg.edge_index[1]],
+                    edge_resource_rows,
+                ),
+                dim=-1,
+            )
+        # Monolithic ablation, second half: pooling the tokens alone is NOT
+        # enough to remove the factorization. _field_channel also consumes a
+        # PER-CHANNEL live-pressure pair (normalized_resources, resource_events),
+        # so a token-only collapse leaves each resource its own analytic pathway
+        # and the field still differentiates them -- which would let the
+        # ablation "survive" for a reason that has nothing to do with learned
+        # factorization. Pool that input over the active resources too, so every
+        # channel is fed one undifferentiated pressure signal and no per-resource
+        # information reaches the field at all.
+        if self.monolithic_resource_field:
+            edge_weights = edge_active
+            edge_denominator = edge_weights.sum(
+                dim=-1, keepdim=True
+            ).clamp_min(1.0)
+            channel_state = (
+                (normalized_resources * edge_weights).sum(dim=-1, keepdim=True)
+                / edge_denominator
+            ).expand_as(normalized_resources)
+            channel_events = (
+                (resource_events * edge_weights).sum(dim=-1, keepdim=True)
+                / edge_denominator
+            ).expand_as(resource_events)
+            # The per-node attribute block is a third per-resource pathway into
+            # the field head, so it has to be pooled here as well or the
+            # ablation leaves each resource distinguishable after all.
+            resource_context_edges = (
+                (resource_context_edges * edge_weights[..., None]).sum(
+                    dim=1, keepdim=True
+                )
+                / edge_denominator[..., None]
+            ).expand_as(resource_context_edges)
         raw_channels = []
         additive_channels = []
         for channel in range(resource_count):
@@ -854,10 +1623,11 @@ class ConstraintFieldNet(nn.Module):
                 else projected_tokens[0, channel]
             )
             resource_edge = self.resource_edge_projection(
-                torch.stack(
+                torch.cat(
                     (
-                        normalized_resources[:, channel],
-                        resource_events[:, channel],
+                        channel_state[:, channel, None],
+                        channel_events[:, channel, None],
+                        resource_context_edges[:, channel],
                     ),
                     dim=1,
                 )
@@ -881,23 +1651,39 @@ class ConstraintFieldNet(nn.Module):
                 )
             raw_channels.append(raw)
             additive_channels.append(additive_channel)
-        raw_residual = torch.stack(raw_channels, dim=1)
+        # An empty registry stacks to [edges, 0] rather than failing: a problem
+        # with no resource rows has no resource energy, which the decoder
+        # already accepts as an [edges, 0] field.
+        raw_residual = (
+            torch.stack(raw_channels, dim=1)
+            if raw_channels
+            else projected_edges.new_zeros(edge_count, 0)
+        )
         # Resource guidance is a signed, zero-neutral learned field. Analytic
         # pressure remains an input feature, but the decoder does not multiply
         # it into energy. Signed terms let PPO reward useful capacity/route-limit
         # edges as well as penalize harmful ones; exact native feasibility
         # remains authoritative.
         residual = torch.tanh(raw_residual)
-        additive = torch.tanh(torch.stack(additive_channels, dim=1))
+        additive = torch.tanh(
+            torch.stack(additive_channels, dim=1)
+            if additive_channels
+            else projected_edges.new_zeros(edge_count, 0)
+        )
         feasibility_logits = self.feasibility_head(
             torch.tanh(projected_edges)
         ).squeeze(-1)
         feasibility_risk = torch.sigmoid(feasibility_logits)
-        edge_active = active[edge_batch] if batched else active[0]
         residual = residual * edge_active
         additive = additive * edge_active
 
         projected_graph = self.graph_projection(graph_embedding)
+        if self.normalize_projections:
+            # The multiplier, binding and coupler heads read `state`, whose
+            # tanh saturates for exactly the same reason the edge one does.
+            projected_graph = F.layer_norm(
+                projected_graph, (projected_graph.shape[-1],)
+            )
         state = torch.tanh(projected_graph.unsqueeze(1) + tokens)
         graph_state = torch.tanh(projected_graph)
         binding_logits = self.binding_head(state).squeeze(-1)
@@ -941,15 +1727,6 @@ class ConstraintFieldNet(nn.Module):
             device=graph_state.device,
         )
         objective_coupler_bias = torch.zeros_like(objective_multiplier)
-        resource_quota_logits = self.candidate_quota_head(state).squeeze(-1)
-        resource_quota_logits = resource_quota_logits.masked_fill(
-            ~active.bool(), torch.finfo(resource_quota_logits.dtype).min
-        )
-        distance_quota_logit = self.distance_quota_head(graph_state)
-        candidate_quota_logits = torch.cat(
-            (resource_quota_logits, distance_quota_logit), dim=1
-        )
-        candidate_quota = torch.softmax(candidate_quota_logits, dim=1)
         multipliers = torch.cat(
             (multipliers, objective_multiplier.unsqueeze(1)), dim=1
         )
@@ -970,8 +1747,6 @@ class ConstraintFieldNet(nn.Module):
             "raw_residual": raw_residual,
             "coupler_weights": coupler_weights,
             "coupler_bias": coupler_bias,
-            "candidate_quota_logits": candidate_quota_logits,
-            "candidate_quota": candidate_quota[:, :-1],
             "value_context": graph_state,
             "active_channels": active,
         }
@@ -1029,682 +1804,13 @@ class ConstraintFieldNet(nn.Module):
         return self.value_head(torch.cat((context, progress), dim=-1)).squeeze(-1)
 
 
-def _sinusoidal_positions(length, units, device, dtype):
-    """Plain sinusoidal PE over route position.
-
-    A first, cheap stand-in for CaR's cyclic positional encoding. Route order is
-    what distinguishes an improvement policy from the order-agnostic field, so
-    even this simple version is load-bearing; swap in the cyclic variant later.
-    """
-    position = torch.arange(length, device=device, dtype=dtype).unsqueeze(1)
-    div = torch.exp(
-        torch.arange(0, units, 2, device=device, dtype=dtype)
-        * (-math.log(10000.0) / units)
-    )
-    pe = torch.zeros(length, units, device=device, dtype=dtype)
-    pe[:, 0::2] = torch.sin(position * div)
-    pe[:, 1::2] = torch.cos(position * div[: pe[:, 1::2].shape[1]])
-    return pe
-
-
-class RefinementDecoder(nn.Module):
-    """Learned remove-and-reinsert refinement operator (CaR Path A).
-
-    Replaces the hand-designed C++ perturb / scope_restricted_refine move
-    generator with a neural policy: given the current incumbent as an ordered
-    sequence, a *ruin* head selects rm_num customers to remove and a *recreate*
-    head sequentially chooses a reinsertion gap for each. The C++ decoder stays
-    the feasibility+cost oracle (`evaluate`), so the policy only proposes routes;
-    it never has to re-derive the resource algebra.
-
-    The encoder is shared with ConstraintFieldNet via `emb_net` (CaR's
-    unified_encoder), so construction/field and refinement reuse one node
-    representation.
-    """
-
-    def __init__(
-        self,
-        units=32,
-        rm_num=3,
-        emb_net=None,
-        depth=12,
-        act_fn="silu",
-        agg_fn="mean",
-        grad_checkpointing=False,
-    ):
-        super().__init__()
-        self.units = units
-        self.rm_num = rm_num
-        if emb_net is None:
-            emb_net = EmbNet(
-                depth=depth,
-                feats=NODE_FEATURE_COUNT,
-                edge_feats=EDGE_FEATURE_COUNT,
-                units=units,
-                act_fn=act_fn,
-                agg_fn=agg_fn,
-                grad_checkpointing=grad_checkpointing,
-            )
-        self.emb_net = emb_net
-        # Live resource state has a graph-dependent width (resource_count). We
-        # summarize it to a fixed 3-dim [mean, max, spread] per node so the same
-        # weights apply to any registry. TODO: condition on resource_descriptors
-        # like ConstraintFieldNet to keep per-resource identity.
-        self.state_proj = nn.Linear(3, units)
-        self.pos_proj = nn.Linear(units, units)
-        self.route_attention = nn.MultiheadAttention(
-            units, 4 if units % 4 == 0 else 1, batch_first=True
-        )
-        self.route_norm = nn.LayerNorm(units)
-        # Ruin head: per-route-position removal logit.
-        self.remove_head = nn.Sequential(
-            nn.Linear(units, units), nn.SiLU(), nn.Linear(units, 1)
-        )
-        # Recreate head: score inserting node h_node into gap (h_u, h_v).
-        self.insert_head = nn.Sequential(
-            nn.Linear(3 * units, units), nn.SiLU(), nn.Linear(units, 1)
-        )
-
-    def encode_static(self, graph):
-        """Route-independent GNN node embeddings [N, units].
-
-        Depends only on static (instance-level) node/edge features, so it can be
-        computed ONCE per instance and reused across every rollout and step --
-        the key to a batched, oracle-free rollout. Dynamic route state is folded
-        in separately by fuse_state().
-        """
-        _, node_emb = self.emb_net(
-            graph.x, graph.edge_index, graph.edge_attr, return_nodes=True
-        )
-        return node_emb
-
-    def fuse_state(self, node_emb, live_state):
-        """Add the dynamic per-node resource state to static embeddings."""
-        summary = torch.stack(
-            (
-                live_state.mean(dim=1),
-                live_state.amax(dim=1),
-                live_state.amax(dim=1) - live_state.amin(dim=1),
-            ),
-            dim=1,
-        )  # [N, 3]
-        return node_emb + self.state_proj(summary)  # [N, units]
-
-    def encode_nodes(self, graph, live_state):
-        """Convenience: static encode + fuse (used by the C++-graph path)."""
-        return self.fuse_state(self.encode_static(graph), live_state)
-
-    def route_context(self, node_h, route):
-        """Order-aware per-position embeddings for one route (cheap: PE + MHA)."""
-        seq = node_h[route]  # [L, units]
-        pe = _sinusoidal_positions(
-            seq.shape[0], self.units, seq.device, seq.dtype
-        )
-        seq = seq + self.pos_proj(pe)
-        attended, _ = self.route_attention(
-            seq.unsqueeze(0), seq.unsqueeze(0), seq.unsqueeze(0)
-        )
-        return self.route_norm(seq + attended.squeeze(0))  # [L, units]
-
-    def forward(
-        self, graph, route, live_state, depot_count, greedy=False, adj=None,
-        node_emb=None,
-    ):
-        """Propose one refined route.
-
-        node_emb: optional precomputed static node embeddings [N, units] from
-        encode_static(). Pass it to skip the per-step GNN forward (compute once
-        per instance) -- the oracle-free batched rollout relies on this. When
-        None, the GNN runs on `graph` as before.
-
-        adj: optional [N, N] bool adjacency (e.g. the decoder's candidate-graph
-        neighborhood). When given, reinsertion is restricted to gaps adjacent to
-        the removed node's neighbors -- this is the difference between a ~0.6%
-        and a ~40% improving-move density, since scoring all gaps blindly almost
-        never lands near an improving position.
-
-        Returns (new_route: list[int], logp: scalar tensor, entropy: scalar
-        tensor). Feasibility/cost are NOT checked here -- pass new_route to
-        decoder.evaluate() and reward accordingly.
-        """
-        device = node_emb.device if node_emb is not None else graph.x.device
-        route = torch.as_tensor(route, device=device).long()
-        if node_emb is None:
-            node_emb = self.encode_static(graph)
-        node_h = self.fuse_state(node_emb, live_state)  # [N, units]
-        seq = self.route_context(node_h, route)  # [L, units]
-        route_list = route.tolist()
-
-        # ---- Ruin: sample rm_num distinct customer positions ----
-        is_customer = route >= depot_count  # depots are never removed
-        remove_logits = self.remove_head(seq).squeeze(-1)  # [L]
-        remove_logits = remove_logits.masked_fill(~is_customer, float("-inf"))
-        logp = seq.new_zeros(())
-        entropy = seq.new_zeros(())
-        removed_positions = []
-        n_remove = min(self.rm_num, int(is_customer.sum().item()))
-        for _ in range(n_remove):
-            # Fresh mask each step: mutating a tensor already captured by an
-            # earlier masked_fill breaks autograd (version-counter error).
-            taken = torch.zeros_like(is_customer)
-            if removed_positions:
-                taken[removed_positions] = True
-            logits = remove_logits.masked_fill(taken, float("-inf"))
-            dist = torch.distributions.Categorical(logits=logits)
-            pos = logits.argmax() if greedy else dist.sample()
-            logp = logp + dist.log_prob(pos)
-            entropy = entropy + dist.entropy()
-            removed_positions.append(int(pos.item()))
-
-        removed_nodes = [route_list[p] for p in removed_positions]
-        partial = [
-            n for i, n in enumerate(route_list) if i not in set(removed_positions)
-        ]
-
-        # ---- Recreate: sequentially reinsert each removed node into a gap ----
-        # Gap endpoints reuse the cached node embeddings directly, so no GNN or
-        # attention pass runs inside this loop. (Trade-off: gap scoring loses
-        # full-route context vs re-encoding; add it back if reinsertion quality
-        # is the bottleneck.)
-        for node in removed_nodes:
-            partial_t = torch.as_tensor(partial, device=device).long()
-            gap_h = node_h[partial_t]  # [P, units]
-            gaps = gap_h.shape[0] - 1
-            u = gap_h[:-1]
-            v = gap_h[1:]
-            node_e = node_h[node].expand(gaps, -1)
-            gap_score = self.insert_head(
-                torch.cat((node_e, u, v), dim=-1)
-            ).squeeze(-1)  # [gaps]
-            if adj is not None:
-                # Allow a gap only if one of its endpoints neighbors the node.
-                near = adj[node, partial_t]  # [P] bool
-                allowed = near[:-1] | near[1:]  # [gaps]
-                if allowed.any():
-                    gap_score = gap_score.masked_fill(~allowed, float("-inf"))
-            dist = torch.distributions.Categorical(logits=gap_score)
-            gap = gap_score.argmax() if greedy else dist.sample()
-            logp = logp + dist.log_prob(gap)
-            entropy = entropy + dist.entropy()
-            partial.insert(int(gap.item()) + 1, node)
-
-        return partial, logp, entropy
-
-
-class BatchedRelocate(nn.Module):
-    """Fully-batched relocate operator (rm_num=1) over [B, L] routes.
-
-    The proven single-node relocate (52%-improving neighborhood) done for a whole
-    batch of rollouts at once -- no Python per-rollout loop, no per-move .item()
-    sync. This is what makes GPU actually pay off: one forward proposes B moves.
-    Encoder is shared via `emb_net`; static node embeddings are passed in
-    precomputed (encode_static), so the GNN runs once per instance, not per step.
-    """
-
-    def __init__(self, units=32, depth=12, emb_net=None, grad_checkpointing=False,
-                 heads=4, max_seg=1):
-        super().__init__()
-        self.units = units
-        self.max_seg = max_seg  # OR-OPT: relocate contiguous segments of len 1..max_seg
-        if emb_net is None:
-            emb_net = EmbNet(
-                depth=depth, feats=NODE_FEATURE_COUNT, edge_feats=EDGE_FEATURE_COUNT,
-                units=units, grad_checkpointing=grad_checkpointing,
-            )
-        self.emb_net = emb_net
-        self.state_proj = nn.Linear(3, units)
-        self.pos_proj = nn.Linear(units, units)
-        self.route_attention = nn.MultiheadAttention(
-            units, 4 if units % 4 == 0 else 1, batch_first=True
-        )
-        self.route_norm = nn.LayerNorm(units)
-        # N2S-style node-pair heads (CaR-constraint models/SINGLEModel.py). The
-        # removal score of a node comes from its compatibility with its route
-        # PREDECESSOR and SUCCESSOR (how badly it fits between them) -- the
-        # learnable signal a flat per-node head lacks, which is why my removal CE
-        # plateaued. Reinsertion scores each gap by the removed node's
-        # compatibility with the gap's two endpoints.
-        self.heads = heads if units % heads == 0 else 1
-        self.rm_q = nn.Linear(units, units, bias=False)
-        self.rm_k = nn.Linear(units, units, bias=False)
-        self.rm_agg = nn.Sequential(
-            nn.Linear(self.heads, 32), nn.SiLU(), nn.Linear(32, 1)
-        )
-        self.ins_q = nn.Linear(units, units, bias=False)
-        self.ins_k = nn.Linear(units, units, bias=False)
-        self.ins_agg = nn.Sequential(
-            nn.Linear(2 * self.heads, 32), nn.SiLU(), nn.Linear(32, 1)
-        )
-        # Schema conditioning: a graph-level descriptor (constraint multi-hot +
-        # open-route + depot-count scale) projected and added to every node
-        # embedding, so ONE refiner behaves per-schema (CaR-constraint's
-        # constraint generalization, extended to route structure).
-        self.schema_proj = nn.Linear(SCHEMA_FEATURE_DIM, units)
-        # OR-OPT heads: segment length (from graph context) and reversal (from the
-        # segment's head/tail). Present even at max_seg=1 (unused) so checkpoints
-        # are shape-stable across max_seg settings.
-        self.len_head = nn.Sequential(
-            nn.Linear(units, units), nn.SiLU(), nn.Linear(units, max_seg)
-        )
-        self.rev_head = nn.Sequential(
-            nn.Linear(2 * units, units), nn.SiLU(), nn.Linear(units, 1)
-        )
-
-    def encode_static(self, graph):
-        """Static node embeddings [N, units] -- compute once per instance."""
-        _, node_emb = self.emb_net(
-            graph.x, graph.edge_index, graph.edge_attr, return_nodes=True
-        )
-        return node_emb
-
-    @staticmethod
-    def _summary(live):  # [B, N, C] -> [B, N, 3]
-        return torch.stack(
-            (live.mean(-1), live.amax(-1), live.amax(-1) - live.amin(-1)), dim=-1
-        )
-
-    def _encode_route(self, node_emb, live, rt, valid, schema=None):
-        """Fuse static node emb with live state (+ schema), gather the route,
-        self-attend. Returns (seq [B,L,U], node_h [B,N,U]). schema [K] multi-hot
-        of active constraints, broadcast to all nodes."""
-        B, L = rt.shape
-        U = self.units
-        node_h = node_emb.unsqueeze(0) + self.state_proj(self._summary(live))  # [B,N,U]
-        if schema is not None:
-            node_h = node_h + self.schema_proj(schema).view(1, 1, U)
-        safe = rt.clamp(min=0)
-        seq = torch.gather(node_h, 1, safe.unsqueeze(-1).expand(B, L, U))
-        pe = _sinusoidal_positions(L, U, node_emb.device, seq.dtype).unsqueeze(0)
-        seq = seq + self.pos_proj(pe)
-        attn, _ = self.route_attention(seq, seq, seq, key_padding_mask=~valid)
-        return self.route_norm(seq + attn), node_h
-
-    def _removal_logits(self, seq, rt, valid, depot_count, tabu_node=None):
-        """N2S node-pair removal score per route position: compatibility of each
-        node with its predecessor and successor (Q_pre.K + Q.K_post - Q_pre.K_post
-        per head, aggregated). tabu_node [B] optionally forbids re-removing a
-        node (anti-cycling, so greedy hill-climb can't oscillate)."""
-        B, L, U = seq.shape
-        H, d = self.heads, self.units // self.heads
-        q = self.rm_q(seq).view(B, L, H, d)
-        k = self.rm_k(seq).view(B, L, H, d)
-        zpad = q.new_zeros(B, 1, H, d)
-        q_pre = torch.cat((zpad, q[:, :-1]), dim=1)   # predecessor query
-        k_post = torch.cat((k[:, 1:], zpad), dim=1)   # successor key
-        compat = ((q_pre * k).sum(-1) + (q * k_post).sum(-1)
-                  - (q_pre * k_post).sum(-1))          # [B, L, H]
-        logit = self.rm_agg(compat).squeeze(-1)        # [B, L]
-        is_cust = valid & (rt >= depot_count)
-        if tabu_node is not None:
-            is_cust = is_cust & (rt != tabu_node.view(B, 1))
-        return logit.masked_fill(~is_cust, float("-inf"))
-
-    @staticmethod
-    def _partial(rt, valid, pos_r):
-        """Route with position pos_r [B] removed, order preserved (pad=-1).
-        Returns (partial [B,L], m [B])."""
-        B, L = rt.shape
-        dev = rt.device
-        rows = torch.arange(B, device=dev)
-        keep = valid.clone()
-        keep[rows, pos_r] = False
-        m = valid.sum(1) - 1
-        dest = keep.cumsum(1) - 1
-        partial = torch.full((B, L), -1, dtype=torch.long, device=dev)
-        partial[rows.unsqueeze(1).expand(B, L)[keep], dest[keep]] = rt[keep]
-        return partial, m
-
-    def _gap_logits(self, node_h, partial, m, removed, adj, gap_feas_fn):
-        """N2S node-pair reinsertion score per gap: the removed node's
-        compatibility with the gap's two endpoints (u = partial[g],
-        v = partial[g+1]). Masked to the proximity-restricted feasible action
-        space. Returns gscore [B,L-1]."""
-        B, L = partial.shape
-        U = self.units
-        H, d = self.heads, self.units // self.heads
-        dev = node_h.device
-        rows = torch.arange(B, device=dev)
-        psafe = partial.clamp(min=0)
-        ph = torch.gather(node_h, 1, psafe.unsqueeze(-1).expand(B, L, U))
-        qc = self.ins_q(node_h[rows, removed]).view(B, 1, H, d)  # removed-node query
-        ku = self.ins_k(ph[:, :-1]).view(B, L - 1, H, d)         # gap left endpoint
-        kv = self.ins_k(ph[:, 1:]).view(B, L - 1, H, d)          # gap right endpoint
-        compat_u = (qc * ku).sum(-1)  # [B, L-1, H]
-        compat_v = (qc * kv).sum(-1)
-        gscore = self.ins_agg(torch.cat((compat_u, compat_v), -1)).squeeze(-1)
-        gap_valid = torch.arange(L - 1, device=dev).unsqueeze(0) < (m - 1).unsqueeze(1)
-        # adj=None disables the proximity restriction (feasibility alone defines
-        # the action space). Proximity densified an untrained random policy but
-        # can exclude the teacher's best gap, breaking imitation CE, and a trained
-        # policy does not need it.
-        prox = gap_valid
-        if adj is not None:
-            near = adj[removed]  # [B, N]
-            prox = gap_valid & (
-                torch.gather(near, 1, psafe[:, :-1]) | torch.gather(near, 1, psafe[:, 1:])
-            )
-        if gap_feas_fn is not None:
-            feas_gap = gap_feas_fn(partial, m, removed)
-            prox_feas = prox & feas_gap
-            allowed = torch.where(
-                prox_feas.any(1, keepdim=True), prox_feas,
-                torch.where(feas_gap.any(1, keepdim=True), feas_gap, gap_valid),
-            )
-        else:
-            allowed = torch.where(prox.any(1, keepdim=True), prox, gap_valid)
-        return gscore.masked_fill(~allowed, float("-inf"))
-
-    @staticmethod
-    def _apply_insert(partial, m, removed, gap):
-        """Insert `removed` after position `gap` in `partial`. Returns
-        (new_rt [B,L], new_valid [B,L])."""
-        B, L = partial.shape
-        dev = partial.device
-        ar = torch.arange(L, device=dev).unsqueeze(0).expand(B, L)
-        at = ar == (gap + 1).unsqueeze(1)
-        after = ar > (gap + 1).unsqueeze(1)
-        src_idx = torch.where(after, (ar - 1).clamp(min=0), ar)
-        gathered = torch.gather(partial, 1, src_idx)
-        new_rt = torch.where(at, removed.unsqueeze(1), gathered)
-        new_valid = ar < (m + 1).unsqueeze(1)
-        new_rt = torch.where(new_valid, new_rt, torch.full_like(new_rt, -1))
-        return new_rt, new_valid
-
-    # ---------- OR-OPT (segment relocate) neural heads ----------
-    @staticmethod
-    def _shift_up(t, n):
-        if n == 0:
-            return t
-        z = t.new_zeros((t.shape[0], n) + tuple(t.shape[2:]))
-        return torch.cat((t[:, n:], z), dim=1)
-
-    def _segment_start_logits(self, seq, rt, valid, depot_count, s):
-        """Score each position as the START of a length-s segment to relocate,
-        via node-pair compatibility on the segment's boundary (predecessor->head,
-        tail->successor, minus predecessor->successor). Masked to positions where
-        [i..i+s-1] are all customers (segment stays inside one route)."""
-        B, L, U = seq.shape
-        H, d = self.heads, self.units // self.heads
-        q = self.rm_q(seq).view(B, L, H, d)
-        k = self.rm_k(seq).view(B, L, H, d)
-        z1 = q.new_zeros(B, 1, H, d)
-        q_pred = torch.cat((z1, q[:, :-1]), dim=1)       # q[i-1]
-        q_tail = self._shift_up(q, s - 1)                 # q[i+s-1]
-        k_succ = self._shift_up(k, s)                     # k[i+s]
-        compat = ((q_pred * k).sum(-1) + (q_tail * k_succ).sum(-1)
-                  - (q_pred * k_succ).sum(-1))            # [B, L, H]
-        logit = self.rm_agg(compat).squeeze(-1)          # [B, L]
-        is_cust = valid & (rt >= depot_count)
-        ok = is_cust.clone()
-        for kk in range(1, s):
-            shifted = torch.cat(
-                (is_cust[:, kk:], torch.zeros(B, kk, dtype=torch.bool, device=seq.device)),
-                dim=1,
-            )
-            ok = ok & shifted
-        return logit.masked_fill(~ok, float("-inf"))
-
-    def _block_gap_logits(self, node_h, partial, block, feas_gap):
-        """Score each gap for inserting `block` [B,s]: removed-block head compat
-        with the gap's left endpoint + block tail compat with the right endpoint.
-        feas_gap [B,G] restricts to feasible insertions. Returns [B,G]."""
-        B, L = partial.shape
-        U = self.units
-        H, d = self.heads, self.units // self.heads
-        rows = torch.arange(B, device=node_h.device)
-        psafe = partial.clamp(min=0)
-        ph = torch.gather(node_h, 1, psafe.unsqueeze(-1).expand(B, L, U))  # [B,L,U]
-        v = torch.cat((ph[:, 1:], ph[:, -1:]), dim=1)  # right endpoint (last repeats)
-        qh = self.ins_q(node_h[rows, block[:, 0]]).view(B, 1, H, d)
-        qt = self.ins_q(node_h[rows, block[:, -1]]).view(B, 1, H, d)
-        ku = self.ins_k(ph).view(B, L, H, d)
-        kv = self.ins_k(v).view(B, L, H, d)
-        compat_u = (qh * ku).sum(-1)
-        compat_v = (qt * kv).sum(-1)
-        gscore = self.ins_agg(torch.cat((compat_u, compat_v), -1)).squeeze(-1)  # [B,L]
-        return gscore.masked_fill(~feas_gap, float("-inf"))
-
-    def oropt_imitation_loss(self, node_emb, live, rt, valid, ev, seg_pos, seg_len,
-                             gap, rev, depot_count=1, schema=None):
-        """Behaviour-clone the best_oropt teacher: CE over segment length, start
-        position, insertion gap, and (for s>1) reversal. Uses the evaluator to
-        build the per-row partial for the teacher's segment (teacher forcing)."""
-        rt = rt.long()
-        B, L = rt.shape
-        dev = node_emb.device
-        rows = torch.arange(B, device=dev)
-        seq, node_h = self._encode_route(node_emb, live, rt, valid, schema=schema)
-
-        # (1) length
-        gctx = node_h.mean(dim=1)  # [B, U]
-        len_logits = self.len_head(gctx)  # [B, max_seg]
-        loss = F.cross_entropy(len_logits, (seg_len - 1).clamp(0, self.max_seg - 1))
-
-        # (2) start position, per teacher length
-        start_logits = torch.full((B, L), float("-inf"), device=dev)
-        for s in range(1, self.max_seg + 1):
-            sl = self._segment_start_logits(seq, rt, valid, depot_count, s)
-            m = (seg_len == s).unsqueeze(1)
-            start_logits = torch.where(m, sl, start_logits)
-        loss = loss + F.cross_entropy(start_logits, seg_pos)
-
-        # (3) gap + (4) reversal, per teacher length (build partial via evaluator)
-        gap_loss = seq.new_zeros(())
-        rev_loss = seq.new_zeros(())
-        rev_count = 0
-        for s in range(1, self.max_seg + 1):
-            sel = seg_len == s
-            if not bool(sel.any()):
-                continue
-            partial, mm, block = ev.segment_partial_rows(rt, valid, seg_pos, s)
-            block_o = torch.where(rev.unsqueeze(1), block.flip(1), block)
-            _, feas = ev._segment_insertion_eval(partial, mm, block_o)  # [B,G] bool
-            glog = self._block_gap_logits(node_h, partial, block_o, feas)
-            gl = F.cross_entropy(glog[sel], gap[sel])
-            gap_loss = gap_loss + gl * float(sel.sum())
-            if s > 1:
-                bt = torch.cat((node_h[rows, block[:, 0]], node_h[rows, block[:, -1]]), -1)
-                rev_logit = self.rev_head(bt).squeeze(-1)  # [B]
-                rev_loss = rev_loss + F.binary_cross_entropy_with_logits(
-                    rev_logit[sel], rev[sel].float(), reduction="sum"
-                )
-                rev_count += int(sel.sum())
-        loss = loss + gap_loss / B
-        if rev_count:
-            loss = loss + rev_loss / rev_count
-        return loss
-
-    @staticmethod
-    def _safe_logits(logits):
-        """Rows that are entirely -inf (no legal action) would make Categorical
-        NaN; replace them with uniform so sampling is defined (those rows are
-        masked out downstream anyway)."""
-        dead = torch.isinf(logits).all(dim=1, keepdim=True)
-        return torch.where(dead, torch.zeros_like(logits), logits)
-
-    def forward_oropt(self, ev, node_emb, live, rt, valid, depot_count=1,
-                      greedy=False, schema=None):
-        """OR-OPT deployment step: sample (length, start, reversal, gap) and apply
-        the segment relocate. Uses the evaluator for per-row segment construction
-        and feasibility. Returns (new_rt, new_valid, logp, entropy, removed_head)
-        where removed_head is the segment's first node (for anti-cycling tabu)."""
-        rt = rt.long()
-        B, L = rt.shape
-        dev = node_emb.device
-        rows = torch.arange(B, device=dev)
-        seq, node_h = self._encode_route(node_emb, live, rt, valid, schema=schema)
-
-        len_logits = self.len_head(node_h.mean(dim=1))  # [B, max_seg]
-        ld = torch.distributions.Categorical(logits=len_logits)
-        s_sel = len_logits.argmax(1) if greedy else ld.sample()
-        logp = ld.log_prob(s_sel)
-        ent = ld.entropy()
-        seg_len = s_sel + 1
-
-        new_rt = rt.clone()
-        new_valid = valid.clone()
-        removed_head = rt[:, 0].clone()
-        for s in range(1, self.max_seg + 1):
-            rows_s = seg_len == s
-            if not bool(rows_s.any()):
-                continue
-            slog = self._safe_logits(
-                self._segment_start_logits(seq, rt, valid, depot_count, s)
-            )
-            sd = torch.distributions.Categorical(logits=slog)
-            p = slog.argmax(1) if greedy else sd.sample()
-            logp = logp + torch.where(rows_s, sd.log_prob(p), logp.new_zeros(()))
-            ent = ent + torch.where(rows_s, sd.entropy(), ent.new_zeros(()))
-            partial, mm, block = ev.segment_partial_rows(rt, valid, p, s)
-            if s > 1:
-                bt = torch.cat(
-                    (node_h[rows, block[:, 0]], node_h[rows, block[:, -1]]), -1
-                )
-                rlogit = self.rev_head(bt).squeeze(-1)
-                rprob = torch.sigmoid(rlogit)
-                rev = (rprob > 0.5) if greedy else (torch.rand_like(rprob) < rprob)
-                rl = -torch.nn.functional.binary_cross_entropy_with_logits(
-                    rlogit, rev.float(), reduction="none"
-                )
-                logp = logp + torch.where(rows_s, rl, logp.new_zeros(()))
-            else:
-                rev = torch.zeros(B, dtype=torch.bool, device=dev)
-            block_o = torch.where(rev.unsqueeze(1), block.flip(1), block)
-            _, feas = ev._segment_insertion_eval(partial, mm, block_o)  # [B,G]
-            glog = self._safe_logits(
-                self._block_gap_logits(node_h, partial, block_o, feas)
-            )
-            gd = torch.distributions.Categorical(logits=glog)
-            g = glog.argmax(1) if greedy else gd.sample()
-            logp = logp + torch.where(rows_s, gd.log_prob(g), logp.new_zeros(()))
-            ent = ent + torch.where(rows_s, gd.entropy(), ent.new_zeros(()))
-            cand, cand_valid, _ = ev._segment_insertion_candidates(partial, mm, block_o)
-            chosen = cand[rows, g]
-            chosen_v = cand_valid[rows, g]
-            # only commit rows that picked this length and had a feasible gap
-            had_feas = feas.any(dim=1)
-            commit = rows_s & had_feas
-            new_rt = torch.where(commit.unsqueeze(1), chosen, new_rt)
-            new_valid = torch.where(commit.unsqueeze(1), chosen_v, new_valid)
-            removed_head = torch.where(commit, block[:, 0], removed_head)
-        return new_rt, new_valid, logp, ent, removed_head
-
-    def forward(self, node_emb, live, rt, valid, adj, depot_count=1, greedy=False,
-                gap_feas_fn=None, tabu_node=None, schema=None):
-        """node_emb [N,U] static; live [B,N,C]; rt long [B,L] (pad=-1);
-        valid bool [B,L]; adj bool [N,N]. Returns (new_rt [B,L], new_valid [B,L],
-        logp [B], entropy [B], removed [B]).
-
-        gap_feas_fn(partial [B,L], m [B], removed [B]) -> bool [B,L-1] optionally
-        restricts recreate to feasible insertions, making every proposed move
-        feasible-by-construction (the CaR/SRR feasible action space). tabu_node [B]
-        forbids re-removing a node (anti-cycling). schema [K] constraint multi-hot
-        conditions the policy per problem schema."""
-        rt = rt.long()
-        B = rt.shape[0]
-        rows = torch.arange(B, device=node_emb.device)
-        seq, node_h = self._encode_route(node_emb, live, rt, valid, schema=schema)
-
-        # ---- Ruin: sample one customer per row ----
-        rlog = self._removal_logits(seq, rt, valid, depot_count, tabu_node=tabu_node)
-        rd = torch.distributions.Categorical(logits=rlog)
-        pos_r = rlog.argmax(1) if greedy else rd.sample()
-        logp = rd.log_prob(pos_r)
-        ent = rd.entropy()
-        removed = rt[rows, pos_r]  # [B]
-
-        partial, m = self._partial(rt, valid, pos_r)
-
-        # ---- Recreate: sample a feasible gap ----
-        gscore = self._gap_logits(node_h, partial, m, removed, adj, gap_feas_fn)
-        gd = torch.distributions.Categorical(logits=gscore)
-        gap = gscore.argmax(1) if greedy else gd.sample()
-        logp = logp + gd.log_prob(gap)
-        ent = ent + gd.entropy()
-
-        new_rt, new_valid = self._apply_insert(partial, m, removed, gap)
-        return new_rt, new_valid, logp, ent, removed
-
-    def imitation_loss(self, node_emb, live, rt, valid, adj, rm_pos, gap_target,
-                       depot_count=1, gap_feas_fn=None, schema=None):
-        """Cross-entropy behaviour-cloning of a teacher relocate.
-
-        Teacher forcing: score the removal head, then conditioned on the teacher's
-        removed position `rm_pos` [B] score the gap head over the resulting
-        partial, and return CE(removal, rm_pos) + CE(gap, gap_target). This warms
-        the policy to reproduce best-improvement local search before RL -- the fix
-        my own notes flagged (REINFORCE-from-scratch is too sample-inefficient
-        here) and the recipe CaR uses (imitation loss alongside RL). schema [K]
-        constraint multi-hot conditions the policy per problem schema."""
-        rt = rt.long()
-        B = rt.shape[0]
-        rows = torch.arange(B, device=node_emb.device)
-        seq, node_h = self._encode_route(node_emb, live, rt, valid, schema=schema)
-        rlog = self._removal_logits(seq, rt, valid, depot_count)
-        rm_loss = torch.nn.functional.cross_entropy(rlog, rm_pos)
-        removed = rt[rows, rm_pos]
-        partial, m = self._partial(rt, valid, rm_pos)
-        gscore = self._gap_logits(node_h, partial, m, removed, adj, gap_feas_fn)
-        gap_loss = torch.nn.functional.cross_entropy(gscore, gap_target)
-        return rm_loss + gap_loss
-
-
 def load_constraint_field_state_dict(
     model: ConstraintFieldNet, state_dict: dict
-) -> bool:
-    """Load a typed-resource checkpoint, upgrading compatible neutral heads.
-
-    V1 checkpoints contain the identity ``resource_types`` buffer and fixed
-    seven-wide coupler heads. Silently upgrading those weights would undermine
-    the descriptor-only claim, so the v1 boundary is intentionally clean. A
-    pre-objective-guidance v2 checkpoint is safe to upgrade because the new
-    residual head's zero initialization exactly reproduces its policy. A v2
-    checkpoint containing learned logits is rejected because those parameters
-    are in log-probability units, not energy units.
-    """
-    if "resource_types" in state_dict:
-        raise RuntimeError(
-            "incompatible ConstraintFieldNet v1 checkpoint: typed-resource "
-            "v5 scale-equivariant-energy model requires retraining"
-        )
-    upgraded = False
-    state_dict = dict(state_dict)
-    if any(
-        key.startswith("objective_edge_logit_head.") for key in state_dict
-    ):
-        raise RuntimeError(
-            "incompatible ConstraintFieldNet v2 checkpoint: learned edge "
-            "logits must be retrained as objective-energy residuals"
-        )
-    for prefix, head in (
-        ("edge_logit_head", model.edge_logit_head),
-    ):
-        head_keys = {f"{prefix}.weight", f"{prefix}.bias"}
-        missing_head = head_keys - state_dict.keys()
-        if not missing_head:
-            continue
-        if missing_head != head_keys:
-            raise RuntimeError(
-                "incompatible ConstraintFieldNet v2 checkpoint"
-            )
-        state_dict[f"{prefix}.weight"] = head.weight.detach().clone()
-        state_dict[f"{prefix}.bias"] = head.bias.detach().clone()
-        upgraded = True
-    # The schema-conditioned advantage-scale head is absent from pre-g_phi
-    # checkpoints. Inject its neutral initialization (g_phi == 1, an exact no-op)
-    # so strict loading succeeds without altering the restored policy.
-    model_state = model.state_dict()
-    injectable = ("reward_scale_head.", "objective_energy_residual_head.")
-    for key in model_state:
-        if key.startswith(injectable) and key not in state_dict:
-            # The residual head's final layer is zero-initialized, so injecting
-            # its model init reproduces the pre-objective neutral policy exactly.
-            state_dict[key] = model_state[key].detach().clone()
-            upgraded = True
+) -> None:
+    """Strict schema load. Program pooling intentionally invalidates all old weights."""
     try:
-        model.load_state_dict(state_dict, strict=True)
+        model.load_state_dict(dict(state_dict), strict=True)
     except RuntimeError as error:
         raise RuntimeError(
-            "incompatible ConstraintFieldNet v2 checkpoint"
+            f"incompatible ConstraintFieldNet checkpoint for {MODEL_SCHEMA}"
         ) from error
-    return upgraded
