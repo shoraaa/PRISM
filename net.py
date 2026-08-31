@@ -1009,7 +1009,26 @@ class ConstraintFieldNet(nn.Module):
         # checkpoint trained either way stays layout-compatible -- but the
         # forward result differs, so test.py must read the flag rather than
         # assume it.
+        # Split because the two projections feed different mechanisms and the
+        # evidence for normalizing them differs. `edge` feeds the field and risk
+        # heads, which were measurably collapsed (one distinct field value
+        # across a pdtsp instance). `graph` feeds the multiplier/binding/coupler
+        # heads -- the state-dependent pricing path, which measurably works --
+        # so normalizing it changes something that was not broken. "both" is the
+        # combination that regressed against an unfixed baseline from epoch ~10,
+        # and these settings are what isolate which half is responsible.
+        if normalize_projections is True:
+            normalize_projections = "both"
+        elif normalize_projections is False:
+            normalize_projections = "none"
+        if normalize_projections not in ("both", "edge", "graph", "none"):
+            raise ValueError(
+                "normalize_projections must be one of "
+                "'both', 'edge', 'graph', 'none' (or a bool)"
+            )
         self.normalize_projections = normalize_projections
+        self.normalize_edge_projection = normalize_projections in ("both", "edge")
+        self.normalize_graph_projection = normalize_projections in ("both", "graph")
         # None means "take the v14 default", which is blind unless a higher rung
         # of the same ladder was asked for. Only an EXPLICIT True alongside
         # another rung is ambiguous, and that is what still raises.
@@ -1517,7 +1536,7 @@ class ConstraintFieldNet(nn.Module):
             tokens = tokens + coupled_tokens
 
         projected_edges = self.edge_projection(edge_embedding)
-        if self.normalize_projections:
+        if self.normalize_edge_projection:
             # Same normalization, same reason, as the objective head below --
             # see the note in __init__ for what saturating here costs the
             # resource field and the feasibility-risk head.
@@ -1671,7 +1690,7 @@ class ConstraintFieldNet(nn.Module):
         residual = torch.tanh(raw_residual) * edge_active
 
         projected_graph = self.graph_projection(graph_embedding)
-        if self.normalize_projections:
+        if self.normalize_graph_projection:
             # The multiplier, binding and coupler heads read `state`, whose
             # tanh saturates for exactly the same reason the edge one does.
             projected_graph = F.layer_norm(

@@ -55,11 +55,9 @@ class OptionStep:
     decisions: torch.Tensor
     rewards: torch.Tensor
     resource_delta: Optional[torch.Tensor]
-    binding_target: torch.Tensor
     duration: int
     decision_rollouts: Optional[torch.Tensor] = None
     field_enabled: bool = True
-    risk_penalty: float = 0.0
     search_progress: float = 0.0
     transition_rollout: Optional[int] = None
     temporal_advantage: float = 0.0
@@ -97,7 +95,6 @@ def replay_decision_logp_from_cpp_batch_trace(
     model: ConstraintFieldNet,
     beta: float,
     field_enabled: bool = True,
-    risk_penalty: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Replay one log-probability per stochastic Decoder decision."""
     device = output["residual"].device
@@ -192,7 +189,6 @@ def replay_logp_from_cpp_batch_trace(
     model: ConstraintFieldNet,
     beta: float,
     field_enabled: bool = True,
-    risk_penalty: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Replay summed per-rollout log-probabilities for diagnostics."""
     decision_logp, decision_rollouts, decisions = (
@@ -203,7 +199,6 @@ def replay_logp_from_cpp_batch_trace(
             model,
             beta,
             field_enabled=field_enabled,
-            risk_penalty=risk_penalty,
         )
     )
     logp_sum = output["residual"].new_zeros(decisions.numel())
@@ -215,7 +210,6 @@ def _guidance_numpy(
     output: dict,
     graph,
     field_enabled: bool = True,
-    risk_penalty: float = 0.0,
 ) -> dict:
     multipliers = output["multipliers"][0]
     if not field_enabled:
@@ -233,11 +227,10 @@ def _guidance_numpy(
         "multipliers": multipliers.detach().cpu().numpy(),
         "coupler_weights": output["coupler_weights"][0].detach().cpu().numpy(),
         "coupler_bias": output["coupler_bias"][0].detach().cpu().numpy(),
-        "risk_penalty": 0.0,
     }
 
 
-def _field_guidance(model, decoder, device, risk_penalty: float = 0.0) -> dict:
+def _field_guidance(model, decoder, device) -> dict:
     """One no-grad model evaluation of the current decoder graph -> guidance.
 
     Used to *construct* the bootstrap incumbent from the learned field (not just
@@ -249,7 +242,7 @@ def _field_guidance(model, decoder, device, risk_penalty: float = 0.0) -> dict:
     graph = build_decoder_data(decoder, device)
     with torch.no_grad():
         output = model(graph)
-    return _guidance_numpy(output, graph, risk_penalty=risk_penalty)
+    return _guidance_numpy(output, graph)
 
 
 def _neutral_guidance(decoder) -> dict:
@@ -272,7 +265,6 @@ def _neutral_guidance(decoder) -> dict:
             dtype=np.float32,
         ),
         "coupler_bias": np.zeros(multipliers, dtype=np.float32),
-        "risk_penalty": 0.0,
     }
 
 
@@ -456,7 +448,6 @@ def setup_decoder(
     problem: dict, args: argparse.Namespace, deterministic: bool = False,
     model: Optional[ConstraintFieldNet] = None,
     field_enabled: bool = True,
-    risk_penalty: float = 0.0,
 ):
     decoder = _new_decoder(problem, args, deterministic=deterministic)
     # Field-constructed bootstrap: once the field is live, build the initial
@@ -466,8 +457,7 @@ def setup_decoder(
     # fall back to neutral distance construction.
     if model is not None and field_enabled:
         guidance = _field_guidance(
-            model, decoder, args.device, risk_penalty=risk_penalty
-        )
+            model, decoder, args.device)
     else:
         guidance = _neutral_guidance(decoder)
     if deterministic:
@@ -489,7 +479,6 @@ def setup_decoder_resampling(
     max_attempts: int = 8,
     model: Optional[ConstraintFieldNet] = None,
     field_enabled: bool = True,
-    risk_penalty: float = 0.0,
 ):
     """Bootstrap a decoder, resampling the instance on infeasible generation.
 
@@ -506,7 +495,6 @@ def setup_decoder_resampling(
             decoder, incumbent = setup_decoder(
                 problem, args, deterministic=deterministic,
                 model=model, field_enabled=field_enabled,
-                risk_penalty=risk_penalty,
             )
             return decoder, incumbent, problem
         except RuntimeError as exc:
@@ -611,7 +599,6 @@ def collect_instance_rollout(
     variant: str,
     args: argparse.Namespace,
     field_enabled: bool = True,
-    risk_penalty: float = 0.0,
 ) -> InstanceRollout:
     model.train()
     # Match the successful refinement-only pipeline: build a neutral feasible
@@ -622,7 +609,7 @@ def collect_instance_rollout(
     # refinement signal that rh1gudc1 learned from.
     decoder, incumbent, problem = setup_decoder_resampling(
         problem, variant, args,
-        model=model, field_enabled=field_enabled, risk_penalty=risk_penalty,
+        model=model, field_enabled=field_enabled,
     )
     steps: list[OptionStep] = []
     emissions = 0
@@ -651,24 +638,16 @@ def collect_instance_rollout(
                 old_output,
                 graph,
                 field_enabled=field_enabled,
-                risk_penalty=risk_penalty,
-            )
-            binding_target = torch.as_tensor(
-                decoder.evaluate_resources(incumbent["route"])["binding"],
-                dtype=torch.float32,
-                device=args.device,
             )
             cached_version = version
             cached_graph = graph
             cached_output = old_output
             cached_guidance = guidance
-            cached_binding = binding_target
             emissions += 1
         else:
             graph = cached_graph
             old_output = cached_output
             guidance = cached_guidance
-            binding_target = cached_binding
 
         option_incumbent = incumbent
         option_steps: list[OptionStep] = []
@@ -700,7 +679,6 @@ def collect_instance_rollout(
                             model,
                             args.beta,
                             field_enabled=field_enabled,
-                            risk_penalty=risk_penalty,
                         )
                     )
             else:
@@ -725,11 +703,9 @@ def collect_instance_rollout(
                 decisions=decisions.detach(),
                 rewards=torch.zeros(args.n_rollouts, device=args.device),
                 resource_delta=resource_delta,
-                binding_target=binding_target,
                 duration=0,
                 decision_rollouts=decision_rollouts.detach(),
                 field_enabled=field_enabled,
-                risk_penalty=risk_penalty,
                 search_progress=option_progress,
             )
             steps.append(step)
@@ -875,24 +851,6 @@ def _slack_loss(step: OptionStep, output: dict) -> torch.Tensor:
     return error.square().sum() / denominator
 
 
-def _objective_residual_loss(step: OptionStep, output: dict) -> torch.Tensor:
-    """Anchor policy-relevant dimensionless objective-residual differences.
-
-    A constant added to every outgoing edge cancels in the decoder softmax, so
-    center each source row before penalizing the learned residual.
-    """
-    residuals = output["objective_residual"]
-    offsets = step.graph.edge_offsets.to(residuals.device)
-    counts = offsets[1:] - offsets[:-1]
-    source = torch.repeat_interleave(
-        torch.arange(counts.numel(), device=residuals.device), counts
-    )
-    sums = residuals.new_zeros(counts.numel()).scatter_add(0, source, residuals)
-    means = sums / counts.to(residuals.dtype).clamp_min(1.0)
-    centered = residuals - means[source]
-    return centered.square().mean()
-
-
 def _disable_objective_residual(model: ConstraintFieldNet) -> None:
     """Fix the objective-energy residual at its neutral zero value."""
     with torch.no_grad():
@@ -928,7 +886,6 @@ def _step_loss(
                 model,
                 args.beta,
                 field_enabled=step.field_enabled,
-                risk_penalty=step.risk_penalty,
             )
         )
         old_logp = step.old_logp.to(logp.device)
@@ -1084,11 +1041,7 @@ def _step_loss(
         + auxiliary_scale * args.slack_weight * slack
         - args.entropy_weight * entropy
     )
-    objective_residual_loss = _objective_residual_loss(step, output)
     with torch.no_grad():
-        risk_labels = torch.as_tensor(
-            step.trace["feasibility_risk_labels"], device=logp.device
-        ).float()
         screening_fast = float(
             step.trace.get("screening_fast_evaluations", 0)
         )
@@ -1111,13 +1064,8 @@ def _step_loss(
             "value_prediction": value_prediction.detach(),
             "value_target": value_target.detach(),
             "slack_loss": slack.detach(),
-            "objective_residual_loss": objective_residual_loss.detach(),
             "auxiliary_loss": slack.detach(),
             "auxiliary_scale": float(auxiliary_scale),
-            "feasibility_labels": float(risk_labels.numel()),
-            "feasibility_positive_rate": (
-                risk_labels.mean().detach() if risk_labels.numel() else 0.0
-            ),
             "screening_fast_evaluations": screening_fast,
             "screening_fallback_evaluations": screening_fallback,
             "screening_fast_fraction": (
@@ -1174,7 +1122,7 @@ def ppo_update(
         temporal_values = torch.as_tensor(
             temporal_advantages,
             dtype=torch.float32,
-            device=steps[0].binding_target.device,
+            device=steps[0].rewards.device,
         )
         temporal_adv_scale = (
             temporal_values.square().mean().sqrt().clamp_min(1e-8)
@@ -1319,9 +1267,6 @@ def train_instance_ppo(
         variant,
         args,
         field_enabled=field_enabled,
-        risk_penalty=(
-            args.feasibility_risk_penalty if field_enabled else 0.0
-        ),
     )
     metrics = ppo_update(model, optimizer, [rollout], args, epoch)
     metrics.update(
@@ -1408,9 +1353,6 @@ def train_epoch(
         group = min(accumulation_size, args.steps_per_epoch - completed)
         rollouts = []
         field_enabled = epoch >= args.pretrain_epochs
-        risk_penalty = (
-            args.feasibility_risk_penalty if field_enabled else 0.0
-        )
         for variant in variant_schedule[completed : completed + group]:
             phase_started = time.perf_counter()
             problem = generated_problem(
@@ -1429,7 +1371,6 @@ def train_epoch(
                 variant,
                 args,
                 field_enabled=field_enabled,
-                risk_penalty=risk_penalty,
             )
             rollout_seconds += time.perf_counter() - phase_started
             rollouts.append(rollout)
@@ -1539,7 +1480,6 @@ def infer_instance(
         deterministic=True,
     )
     # Construction and refinement use the same selected guidance mode.
-    risk_penalty = args.feasibility_risk_penalty
     net_evals = 0
     def _baseline_guidance() -> dict:
         if baseline == "constant":
@@ -1556,8 +1496,7 @@ def infer_instance(
         else:
             model.eval()
             construct_guidance = _field_guidance(
-                model, decoder, args.device, risk_penalty=risk_penalty
-            )
+                model, decoder, args.device)
             net_evals += 1
         initial = list(decoder.sample(**construct_guidance))
         incumbent, _winner = _best_feasible_solution(
@@ -1615,7 +1554,7 @@ def infer_instance(
         output = model(graph)
         evaluations = 1
         return (
-            _guidance_numpy(output, graph, risk_penalty=risk_penalty),
+            _guidance_numpy(output, graph),
             evaluations,
         )
 
@@ -2264,16 +2203,6 @@ def parse_args() -> argparse.Namespace:
             "0 restores local POMO credit only"
         ),
     )
-    parser.add_argument(
-        "--value-loss-weight",
-        type=float,
-        default=0.0,
-        help=(
-            "EXPERIMENTAL (off by default; may be removed or evolved in the "
-            "future). Weight of the optional refresh-state critic loss; the "
-            "default 0 keeps temporal credit critic-free"
-        ),
-    )
     parser.add_argument("--neural-call-cost", type=float, default=0.0)
     parser.add_argument("--infeasible-penalty", type=float, default=10.0)
     parser.add_argument(
@@ -2331,21 +2260,6 @@ def parse_args() -> argparse.Namespace:
             " only policy-relevant differences are penalized. Set 0 to train"
             " with plain PPO and measure how much feasibility structure the"
             " decision objective induces on its own."
-        ),
-    )
-    parser.add_argument("--dual-weight", type=float, default=1.0)
-    parser.add_argument("--feasibility-weight", type=float, default=1.0)
-    parser.add_argument("--binding-weight", type=float, default=1.0)
-    parser.add_argument(
-        "--price-weight",
-        type=float,
-        default=0.0,
-        help=(
-            "Weight of the multiplier->binding-indicator supervision. Default 0:"
-            " pinning multipliers to the binding (feasibility) target injects"
-            " harmful ranking distortion (the penalty prices nothing in the"
-            " objective-gated SRR), measured net-negative on distance variants."
-            " Let RL shape the multipliers from search progress instead."
         ),
     )
     parser.add_argument(
@@ -2422,9 +2336,9 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--no-normalize-projections",
-        dest="normalize_projections",
-        action="store_false",
+        "--normalize-projections",
+        choices=("both", "edge", "graph", "none"),
+        default="both",
         help=(
             "Restore the pre-fix forward pass, in which edge_projection and"
             " graph_projection feed tanh unnormalized. Their activations reach"
@@ -2502,19 +2416,6 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--objective-residual-l2",
-        "--edge-logit-l2",
-        dest="objective_residual_l2",
-        type=float,
-        default=0.1,
-        help=(
-            "L2 anchor on source-centered objective-energy residuals "
-            "(default: 0.1); prevents PPO random walk from overwhelming the "
-            "exact objective energy while leaving row-constant corrections "
-            "unpenalized"
-        ),
-    )
-    parser.add_argument(
         "--ppo-epochs",
         type=int,
         default=4,
@@ -2546,16 +2447,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--beta", type=float, default=2.0)
     parser.add_argument(
         "--feasibility-lookahead-depth", type=int, default=2
-    )
-    parser.add_argument(
-        "--feasibility-risk-penalty",
-        type=float,
-        default=1.0,
-        help=(
-            "Weight of the detached feasibility-risk classifier in decoder "
-            "ranking (default: 1). "
-            "Use 0 for the measured risk-guidance ablation."
-        ),
     )
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument(
@@ -2667,10 +2558,6 @@ def main() -> None:
         raise ValueError("gae_lambda must lie in [0, 1]")
     if args.temporal_credit_weight < 0.0:
         raise ValueError("temporal_credit_weight must be nonnegative")
-    if args.value_loss_weight < 0.0:
-        raise ValueError("value_loss_weight must be nonnegative")
-    if args.objective_residual_l2 < 0.0:
-        raise ValueError("objective_residual_l2 must be nonnegative")
     if args.smallvram is None:
         args.smallvram = (
             torch.version.hip is not None

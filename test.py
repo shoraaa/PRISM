@@ -196,16 +196,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--feasibility-risk-penalty",
-        type=float,
-        default=None,
-        help=(
-            "Weight of the checkpoint's feasibility-risk energy. By default "
-            "this is recovered from the checkpoint config; use 0 for the "
-            "matched risk-guidance ablation."
-        ),
-    )
-    parser.add_argument(
         "--threads", type=int, default=prism_decoder.get_available_threads()
     )
     parser.add_argument("--seed", type=int, default=1234)
@@ -325,12 +315,6 @@ def main() -> int:
     # under. The attention parameters are always present in the state dict, so a
     # missing flag would silently evaluate an ablated model *with* coupling.
     train_config = checkpoint.get("config", {})
-    if args.feasibility_risk_penalty is None:
-        args.feasibility_risk_penalty = float(
-            train_config.get("feasibility_risk_penalty", 1.0)
-        )
-    if args.feasibility_risk_penalty < 0.0:
-        raise ValueError("--feasibility-risk-penalty must be nonnegative")
     model = ConstraintFieldNet(
         couple_resource_tokens=train_config.get(
             "couple_resource_tokens", True
@@ -376,7 +360,7 @@ def main() -> int:
         # checkpoint predating the fix was trained against saturated
         # projections, and evaluating one with them normalized feeds heads an
         # input distribution they never saw.
-        normalize_projections=train_config.get("normalize_projections", False),
+        normalize_projections=train_config.get("normalize_projections", "none"),
     ).to(args.device)
     load_constraint_field_state_dict(model, checkpoint["model_state_dict"])
     model.eval()

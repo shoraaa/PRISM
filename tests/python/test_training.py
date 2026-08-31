@@ -23,7 +23,6 @@ from train import (
     _new_decoder,
     _epoch_lr,
     _epoch_seed,
-    _objective_residual_loss,
     _random_guidance,
     _training_accumulation_size,
     _training_variant_schedule,
@@ -64,20 +63,16 @@ def _args() -> Namespace:
         pretrain_aux_scale=1.0,
         gae_lambda=0.95,
         temporal_credit_weight=0.1,
-        value_loss_weight=0.5,
         rl_weight=1.0,
         aux_rl_scale=0.1,
         slack_weight=1.0,
         
-        binding_weight=0.25,
-        price_weight=0.25,
         entropy_weight=0.001,
         no_adv_norm=False,
         ppo_clip=0.1,
         grad_clip=1.0,
         smallvram=False,
         feasibility_lookahead_depth=2,
-        feasibility_risk_penalty=10.0,
     )
 
 
@@ -321,7 +316,6 @@ def test_decision_level_ppo_moves_policy_without_auxiliary_losses(
                 model,
                 args.beta,
                 field_enabled=step.field_enabled,
-                risk_penalty=step.risk_penalty,
             )
             if new_logp.numel():
                 replay_drift.append(
@@ -461,28 +455,6 @@ def test_winner_temporal_advantage_is_non_cancelling_pomo_contrast() -> None:
     )
     assert float(advantage.sum()) == pytest.approx(0.0)
     assert float(advantage.abs().sum()) > 0.0
-
-
-def test_edge_logit_anchor_ignores_row_constants() -> None:
-    step = SimpleNamespace(
-        graph=SimpleNamespace(edge_offsets=torch.tensor([0, 2, 5]))
-    )
-    constant_rows = torch.tensor(
-        [2.0, 2.0, -3.0, -3.0, -3.0], requires_grad=True
-    )
-    varying_rows = torch.tensor(
-        [1.0, 3.0, -4.0, -3.0, -2.0], requires_grad=True
-    )
-
-    constant_loss = _objective_residual_loss(
-        step, {"objective_residual": constant_rows}
-    )
-    varying_loss = _objective_residual_loss(
-        step, {"objective_residual": varying_rows}
-    )
-
-    assert constant_loss == 0.0
-    assert varying_loss > 0.0
 
 
 def test_stagnant_options_reuse_field_and_skip_fallback_labels() -> None:
@@ -771,7 +743,6 @@ def test_policy_replay_is_objective_scale_and_resource_unit_invariant() -> None:
             output,
             FixedCoupler(),
             beta=1.7,
-            risk_penalty=0.4,
         )[0]
 
     reference = replay(1.0, 1.0)
@@ -887,18 +858,15 @@ def test_validation_size_defaults_to_eight_instances(monkeypatch) -> None:
     assert args.static_field is False
     assert args.gae_lambda == pytest.approx(1.0)
     assert args.temporal_credit_weight == pytest.approx(0.1)
-    assert args.value_loss_weight == pytest.approx(0.0)
     assert args.epochs == 100
     assert args.pretrain_epochs == 0
     assert args.option_max_steps == 4
     assert args.smdp_gamma == pytest.approx(0.99)
     assert args.infeasible_penalty == pytest.approx(10.0)
-    assert args.feasibility_risk_penalty == pytest.approx(1.0)
-    assert args.price_weight == pytest.approx(0.0)
+    assert args.slack_weight == pytest.approx(1.0)
     assert args.grad_accum_variants == 4
     assert args.aux_rl_scale == pytest.approx(0.0)
     assert args.objective_residual_enabled is True
-    assert args.objective_residual_l2 == pytest.approx(0.1)
     assert args.val_ema_decay == pytest.approx(0.0)
     assert args.lr_schedule == "constant"
     assert args.min_changed_edges == 8

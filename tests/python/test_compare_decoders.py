@@ -43,20 +43,6 @@ def test_compare_defaults_to_eight_dynamic_instances() -> None:
     assert args.n_node is None
     assert args.vrpdb_size == 100
     assert args.aug is None
-    assert args.feasibility_risk_penalty is None
-
-
-def test_compare_accepts_matched_risk_guidance_ablation() -> None:
-    args = decoder_evaluation.parse_args(
-        [
-            "--checkpoint",
-            "model.pt",
-            "--feasibility-risk-penalty",
-            "0",
-        ]
-    )
-
-    assert args.feasibility_risk_penalty == 0.0
 
 
 def test_shared_augmentation_override_reaches_constructive_baselines() -> None:

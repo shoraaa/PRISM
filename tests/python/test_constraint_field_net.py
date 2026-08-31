@@ -137,7 +137,6 @@ def test_constraint_field_net_uses_normalized_decoder_contract() -> None:
     # within a graph, and a constant added to every candidate at a node cancels
     # in the comparison that picks one, so it could never change a decision.
     guidance = _guidance_numpy(output, data)
-    assert guidance["risk_penalty"] == 0.0
     assert "edge_risk" not in guidance and "edge_additive" not in guidance
 
 
@@ -1023,11 +1022,11 @@ def test_cpp_trace_replays_exact_state_dependent_policy() -> None:
     )
     trace = traced["trace"]
     replayed, decisions = replay_logp_from_cpp_batch_trace(
-        trace, graph, output, model, beta=2.0, risk_penalty=3.0
+        trace, graph, output, model, beta=2.0
     )
     decision_logp, decision_rollouts, decision_counts = (
         replay_decision_logp_from_cpp_batch_trace(
-            trace, graph, output, model, beta=2.0, risk_penalty=3.0
+            trace, graph, output, model, beta=2.0
         )
     )
 
@@ -1138,7 +1137,6 @@ def test_default_depth_tsp_edge_logit_does_not_saturate_constant() -> None:
     # v14 deleted the risk channel: its head produced a value that was constant
     # within a graph, and a constant added to every candidate at a node cancels
     # in the comparison that picks one, so it could never change a decision.
-    assert _guidance_numpy(output, graph)["risk_penalty"] == 0.0
     assert "edge_risk" not in _guidance_numpy(output, graph)
     assert "edge_additive" not in _guidance_numpy(output, graph)
 
@@ -1421,8 +1419,8 @@ def test_projection_normalization_is_live_and_checkpoint_compatible() -> None:
     why the flag has to be recorded and read back rather than assumed.
     """
     normalized = ConstraintFieldNet()
-    saturated = ConstraintFieldNet(normalize_projections=False)
-    assert normalized.normalize_projections is True, "the fix is the default"
+    saturated = ConstraintFieldNet(normalize_projections="none")
+    assert normalized.normalize_projections == "both", "the fix is the default"
     assert set(normalized.state_dict()) == set(saturated.state_dict()), (
         "layer_norm must stay parameter-free so checkpoints cross-load"
     )
