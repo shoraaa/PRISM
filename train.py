@@ -30,10 +30,12 @@ if str(SRC) not in sys.path:
 
 import prism_decoder
 from net import (
+    CORE_INTERFACE_LEVELS,
     ConstraintFieldNet,
     MODEL_SCHEMA,
     build_decoder_data,
     load_constraint_field_state_dict,
+    migrate_constraint_field_optimizer_state_dict,
 )
 from problem_data import (
     ALL_VARIANTS,
@@ -153,27 +155,19 @@ def replay_decision_logp_from_cpp_batch_trace(
     if not field_enabled:
         field_multiplier = torch.zeros_like(field_multiplier)
         objective_weight = torch.ones_like(objective_weight)
-    # Match the native dimensionless, signed, zero-neutral energy contract.
+    # Match the native dimensionless energy contract. The exact normalized
+    # objective is the fixed anchor; only resource fields are learned.
     field_term = residual
-    objective_residual = output["objective_residual"][global_edge]
-    if not field_enabled:
-        objective_residual = torch.zeros_like(objective_residual)
-    energy = objective_weight.unsqueeze(1) * (
-        objective + objective_residual
-    ) + (
+    energy = objective_weight.unsqueeze(1) * objective + (
         field_multiplier.unsqueeze(1) * field_term
     ).sum(dim=-1)
     logits = (-float(beta) * energy).masked_fill(~valid, -torch.inf)
 
     chosen_edge = edge_offsets[current[selected]] + chosen[selected]
     chosen_field = output["residual"][chosen_edge]
-    chosen_objective_residual = output["objective_residual"][chosen_edge]
-    if not field_enabled:
-        chosen_objective_residual = torch.zeros_like(chosen_objective_residual)
     chosen_energy = objective_weight[selected] * (
         graph.objective_edge_costs.to(device)[chosen_edge]
         / objective_energy_scale[0]
-        + chosen_objective_residual
     ) + (field_multiplier[selected] * chosen_field).sum(dim=-1)
     step_logp = (
         -float(beta) * chosen_energy
@@ -218,11 +212,6 @@ def _guidance_numpy(
         multipliers = multipliers.clone()
         multipliers[:-1] = 0.0
     return {
-        "objective_residual": (
-            output["objective_residual"]
-            if field_enabled
-            else torch.zeros_like(output["objective_residual"])
-        ).detach().cpu().numpy(),
         "edge_field": output["residual"].detach().cpu().numpy(),
         "multipliers": multipliers.detach().cpu().numpy(),
         "coupler_weights": output["coupler_weights"][0].detach().cpu().numpy(),
@@ -253,9 +242,6 @@ def _neutral_guidance(decoder) -> dict:
     multiplier_values = np.zeros(multipliers, dtype=np.float32)
     multiplier_values[channels] = 1.0
     return {
-        "objective_residual": np.zeros(
-            decoder.metadata["edge_count"], dtype=np.float32
-        ),
         "edge_field": np.zeros(
             (decoder.metadata["edge_count"], channels), dtype=np.float32
         ),
@@ -794,8 +780,8 @@ def _detached_output(
     detached = dict(output)
     links = []
     for key in (
-        "objective_residual",
         "residual",
+        "semantic_margin",
         "multipliers",
         "binding_logits",
         "coupler_weights",
@@ -811,7 +797,7 @@ def _detached_output(
 
 
 def _slack_loss(step: OptionStep, output: dict) -> torch.Tensor:
-    """Shape the encoder to represent the executed admissibility margin.
+    """Teach a non-energy head the executed signed admissibility margin.
 
     The decoder publishes, for every candidate edge and every active row, the
     signed margin by which taking that edge would clear (or breach) the row's
@@ -820,46 +806,108 @@ def _slack_loss(step: OptionStep, output: dict) -> torch.Tensor:
     nothing about it is a feature choice: it is what the interpreter already
     computed to decide legality.
 
-    Regressing the per-resource field onto it makes the representation carry
-    feasibility, which is exactly what the probes then measure. A constant
-    offset over a source row cancels in the decoder's comparison of candidates,
-    so both sides are row-centered first and only the policy-relevant
-    differences are penalized.
+    This head is deliberately separate from `output["residual"]`: a positive
+    margin consistently means legal slack, but it is not a search cost. In
+    particular, `min(x-l, u-x)` can select an inactive side of a two-sided
+    resource. The semantic prediction remains useful and generic without
+    forcing that geometry into the energy minimized by the decoder.
     """
     margin = step.graph.resource_transition_features[..., 1]
     mask = step.graph.resource_transition_mask
-    field = output["residual"]
-    if margin.shape != field.shape or not margin.numel():
-        return field.sum() * 0.0
-    offsets = step.graph.edge_offsets.to(field.device)
-    counts = offsets[1:] - offsets[:-1]
-    source = torch.repeat_interleave(
-        torch.arange(counts.numel(), device=field.device), counts
-    )
-
-    def centered(values: torch.Tensor) -> torch.Tensor:
-        sums = values.new_zeros((counts.numel(),) + values.shape[1:])
-        sums = sums.index_add(0, source, values)
-        means = sums / counts.to(values.dtype).clamp_min(1.0).reshape(
-            -1, *([1] * (values.dim() - 1))
+    prediction = output["semantic_margin"]
+    if not margin.numel():
+        # An empty registry (a bare TSP) has no row to supervise.
+        return prediction.sum() * 0.0
+    if margin.shape != prediction.shape:
+        # Returning zero here would silently remove semantic supervision.
+        raise RuntimeError(
+            "slack target and field disagree: "
+            f"margin {tuple(margin.shape)} vs semantic prediction "
+            f"{tuple(prediction.shape)}"
         )
-        return values - means[source]
-
-    active = mask.to(field.dtype)
-    error = (centered(field) - centered(margin.to(field.dtype))) * active
+    active = mask.to(prediction.dtype)
+    error = (prediction - margin.to(prediction.dtype)) * active
     denominator = active.sum().clamp_min(1.0)
     return error.square().sum() / denominator
 
 
-def _disable_objective_residual(model: ConstraintFieldNet) -> None:
-    """Fix the objective-energy residual at its neutral zero value."""
-    with torch.no_grad():
-        # Zeroing the final layer makes the shared head output identically zero
-        # for every objective coefficient vector.
-        model.objective_energy_residual_head[-1].weight.zero_()
-        model.objective_energy_residual_head[-1].bias.zero_()
-    for parameter in model.objective_energy_residual_head.parameters():
-        parameter.requires_grad_(False)
+def _balanced_regression_loss(
+    prediction: torch.Tensor, target: torch.Tensor
+) -> torch.Tensor:
+    """Keep sparse positive binding deltas from being drowned by zeros."""
+    elementwise = F.smooth_l1_loss(prediction, target, reduction="none")
+    positive = target > 1e-6
+    positive_count = positive.sum().to(prediction.dtype)
+    negative_count = target.numel() - positive_count
+    if positive_count == 0 or negative_count == 0:
+        return elementwise.mean()
+    weights = torch.where(
+        positive,
+        negative_count / positive_count,
+        target.new_ones(()),
+    )
+    return (elementwise * weights).sum() / weights.sum().clamp_min(1.0)
+
+
+def _energy_alignment_loss(step: OptionStep, output: dict) -> torch.Tensor:
+    """Orient search energy with exact composed candidate consequences.
+
+    The native executable evaluator reports, for every screened candidate,
+    `clamp(candidate_binding - incumbent_binding + violation, 0, 1)` for each
+    runtime registry row. It is resource-name independent, composition aware,
+    and has the decoder energy's polarity: larger is worse. The construction
+    fallback uses the same rollout-level resource delta on chosen edges when a
+    step has no screened SRR candidates.
+    """
+    field = output["residual"]
+    device = field.device
+    screened_edges = torch.as_tensor(
+        step.trace.get("screened_edges", []), device=device
+    ).long()
+    if screened_edges.numel():
+        target = torch.as_tensor(
+            step.trace["screened_resource_delta"], device=device
+        ).to(field.dtype)
+        prediction = field[screened_edges]
+        if prediction.shape != target.shape:
+            raise RuntimeError(
+                "screened energy target and field disagree: "
+                f"target {tuple(target.shape)} vs field "
+                f"{tuple(prediction.shape)}"
+            )
+        active = output["active_channels"][0].bool().expand_as(prediction)
+        if active.any():
+            return _balanced_regression_loss(
+                prediction[active], target[active]
+            )
+        return prediction.sum() * 0.0
+
+    if step.resource_delta is None:
+        return field.sum() * 0.0
+    current = torch.as_tensor(
+        step.trace.get("current_nodes", []), device=device
+    ).long()
+    chosen = torch.as_tensor(
+        step.trace.get("chosen_indices", []), device=device
+    ).long()
+    stochastic = torch.as_tensor(
+        step.trace.get("stochastic", []), device=device
+    ).bool()
+    if current.numel() == 0 or not stochastic.any():
+        return field.sum() * 0.0
+    rollout_index = _decision_rollout_index(step.trace, device)
+    edge = step.graph.edge_offsets.to(device)[current] + chosen
+    prediction = field[edge]
+    target = step.resource_delta.to(device=device, dtype=field.dtype)[
+        rollout_index
+    ]
+    active = output["active_channels"][0].bool().expand_as(prediction)
+    selected = stochastic.unsqueeze(1) & active
+    if not selected.any():
+        return prediction.sum() * 0.0
+    return _balanced_regression_loss(
+        prediction[selected], target[selected]
+    )
 
 
 def _step_loss(
@@ -1020,25 +1068,23 @@ def _step_loss(
         critic_loss = F.smooth_l1_loss(value_prediction, value_target)
         critic_sample = 1.0
 
-    # v14 objective: ordinary policy gradient plus one auxiliary.
-    #
-    # The four auxiliary terms it replaces supervised quantities the decoder
-    # already computes exactly -- `_dual_loss` regressed the learned field onto
-    # `screened_resource_delta`, `_price_loss` (disabled by default, because
-    # pinning prices to a feasibility indicator distorted ranking) and
-    # `_binding_loss` onto the binding fraction -- or supervised a head whose
-    # output could not reach a decision (`_feasibility_loss`; see the note on
-    # the deleted head in net.py). `slack` keeps the one thing they were
-    # collectively buying: it shapes the encoder to represent the executed
-    # admissibility margin, which is also what the feasibility probes read, so
-    # supervision and evaluation finally concern the same quantity.
-    #
-    # The critic is gone because it was never on: --value-loss-weight defaulted
-    # to 0 and the advantage is a batch-mean baseline, not a value estimate.
-    slack = _slack_loss(step, output)
+    semantic_margin = _slack_loss(step, output)
+    energy_alignment = _energy_alignment_loss(step, output)
+    semantic_weight = float(
+        getattr(
+            args,
+            "semantic_margin_weight",
+            getattr(args, "slack_weight", 1.0),
+        )
+    )
+    energy_weight = float(getattr(args, "energy_alignment_weight", 1.0))
+    auxiliary_loss = (
+        semantic_weight * semantic_margin
+        + energy_weight * energy_alignment
+    )
     loss = (
         rl_weight * rl_loss
-        + auxiliary_scale * args.slack_weight * slack
+        + auxiliary_scale * auxiliary_loss
         - args.entropy_weight * entropy
     )
     with torch.no_grad():
@@ -1063,8 +1109,9 @@ def _step_loss(
             "critic_sample": critic_sample,
             "value_prediction": value_prediction.detach(),
             "value_target": value_target.detach(),
-            "slack_loss": slack.detach(),
-            "auxiliary_loss": slack.detach(),
+            "semantic_margin_loss": semantic_margin.detach(),
+            "energy_alignment_loss": energy_alignment.detach(),
+            "auxiliary_loss": auxiliary_loss.detach(),
             "auxiliary_scale": float(auxiliary_scale),
             "screening_fast_evaluations": screening_fast,
             "screening_fallback_evaluations": screening_fallback,
@@ -2133,7 +2180,7 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--candidates", type=int, default=64)
-    parser.add_argument("--n-rollouts", type=int, default=32)
+    parser.add_argument("--n-rollouts", type=int, default=10)
     parser.add_argument(
         "--val-n-rollouts",
         type=int,
@@ -2143,8 +2190,8 @@ def parse_args() -> argparse.Namespace:
             "--n-rollouts)"
         ),
     )
-    parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--steps-per-epoch", type=int, default=32)
+    parser.add_argument("--epochs", type=int, default=1000)
+    parser.add_argument("--steps-per-epoch", type=int, default=100)
     parser.add_argument(
         "--rollouts-per-update",
         "--grad-accum-variants",
@@ -2162,7 +2209,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--search-iterations",
         type=int,
-        default=4,
+        default=10,
         help="post-bootstrap perturbation/SRR iterations (default: 16)",
     )
     parser.add_argument(
@@ -2245,21 +2292,42 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--aux-rl-scale",
         type=float,
-        default=0.0,
-        help="EXPERIMENTAL (off by default; may be removed or evolved in the "
-        "future). Auxiliary-loss scale after PPO fine-tuning starts; default 0 "
-        "carries no auxiliary-head loss into RL",
+        default=0.1,
+        help="Auxiliary-loss scale after PPO fine-tuning starts"
     )
     parser.add_argument(
+        "--semantic-margin-weight",
         "--slack-weight",
+        dest="semantic_margin_weight",
         type=float,
         default=1.0,
         help=(
-            "Weight of the only auxiliary term: regress the per-resource field"
-            " onto the executed signed admissibility margin, row-centered so"
-            " only policy-relevant differences are penalized. Set 0 to train"
-            " with plain PPO and measure how much feasibility structure the"
-            " decision objective induces on its own."
+            "Weight for predicting the executable signed margin with the"
+            " non-energy semantic head. --slack-weight is a compatibility"
+            " alias."
+        ),
+    )
+    parser.add_argument(
+        "--energy-alignment-weight",
+        type=float,
+        default=1.0,
+        help=(
+            "Weight for aligning the search-energy field with exact composed"
+            " candidate binding increases and violations."
+        ),
+    )
+    parser.add_argument(
+        "--core-interface",
+        choices=CORE_INTERFACE_LEVELS,
+        default="full",
+        help=(
+            "Nested behavioral-channel ablation. live-state keeps only the"
+            " current normalized resource level; post-state adds the candidate"
+            " post-state and validity mask (so delta x is determined); events"
+            " adds reset/trigger events; margin adds the signed admissibility"
+            " margin; full restores pressure, operand, and incumbent-suffix"
+            " context and is the deployed/default interface. Tensor widths and"
+            " parameter counts are identical across all five rungs."
         ),
     )
     parser.add_argument(
@@ -2294,31 +2362,6 @@ def parse_args() -> argparse.Namespace:
             " static-intensity ablation: multipliers are frozen to their"
             " per-refresh GNN value, isolating live-state-modulated intensity"
             " (static vs. per-decision lambda_r)."
-        ),
-    )
-    parser.add_argument(
-        "--linear-objective-residual-head",
-        action="store_true",
-        help=(
-            "Design-choice ablation for the signed objective-energy residual:"
-            " replace the coefficient-conditioned MLP with a single linear head"
-            " over [edge_state, coeffs]. Tests the claim that a purely linear"
-            " coefficient term collapses into a per-row constant that downstream"
-            " row-centering deletes, leaving the residual unable to specialize"
-            " per objective. Mutually exclusive with"
-            " --unconditioned-objective-residual-head."
-        ),
-    )
-    parser.add_argument(
-        "--unconditioned-objective-residual-head",
-        action="store_true",
-        help=(
-            "Design-choice ablation for the signed objective-energy residual:"
-            " drop the declared coefficient vector from the head input so one"
-            " shared MLP logit serves every objective. Tests whether the"
-            " unconditioned shared head suffers cross-objective negative transfer"
-            " that coefficient conditioning resolves. Mutually exclusive with"
-            " --linear-objective-residual-head."
         ),
     )
     parser.add_argument(
@@ -2394,8 +2437,8 @@ def parse_args() -> argparse.Namespace:
             " and per-edge pressure and reset events. Without it only the seven"
             " compiled channels have named columns, so a declared row reaches"
             " the model at the field head alone and never enters the node or"
-            " edge embeddings the feasibility, binding, coupler and"
-            " objective-residual heads are built from. Pooling is masked by the"
+            " edge embeddings the field, binding and coupler heads are built"
+            " from. Pooling is masked by the"
             " active rows and shared across resources, so the width is"
             " independent of the registry and nothing reads a registry"
             " position. --no-resource-pooling is the ablation; it narrows both"
@@ -2403,18 +2446,6 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--entropy-weight", type=float, default=0.001)
-    parser.add_argument(
-        "--objective-residual",
-        "--edge-logit",
-        dest="objective_residual_enabled",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help=(
-            "Enable the learned signed objective-energy residual (default: "
-            "enabled). Use --no-objective-residual for the neutral ablation; "
-            "--no-edge-logit remains a compatibility alias."
-        ),
-    )
     parser.add_argument(
         "--ppo-epochs",
         type=int,
@@ -2434,13 +2465,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--srr-exploration-budget",
         type=int,
-        default=0,
+        default=10,
         help=(
             "Bounded number of objective-worsening but guided-energy-descending "
             "moves the SRR descent may accept per invocation, letting the learned "
             "field steer uphill to escape local optima (champion tracking keeps "
             "the best solution). Constant energy has no gradient, so the budget "
-            "is inert for that control. 0 disables (default)."
+            "is inert for that control. ."
         ),
     )
     parser.add_argument("--no-adv-norm", action="store_true")
@@ -2448,7 +2479,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--feasibility-lookahead-depth", type=int, default=2
     )
-    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--lr", type=float, default=5e-5)
     parser.add_argument(
         "--lr-schedule",
         dest="lr_schedule",
@@ -2589,15 +2620,12 @@ def main() -> None:
         gate_multipliers_by_binding=args.gate_multipliers_by_binding,
         couple_resource_tokens=args.couple_resource_tokens,
         couple_state_multipliers=args.couple_state_multipliers,
-        linear_objective_residual_head=args.linear_objective_residual_head,
-        unconditioned_objective_residual_head=(
-            args.unconditioned_objective_residual_head
-        ),
         index_embedded_resources=args.index_embedded_resources,
         monolithic_resource_field=args.monolithic_resource_field,
         program_blind_resources=args.program_blind_resources,
         normalize_projections=args.normalize_projections,
         pool_node_resources=args.resource_pooling,
+        core_interface=args.core_interface,
     ).to(args.device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
     start_epoch = 0
@@ -2607,21 +2635,35 @@ def main() -> None:
         checkpoint = torch.load(
             args.resume, map_location=args.device, weights_only=False
         )
-        if checkpoint.get("model_schema") != MODEL_SCHEMA:
-            raise RuntimeError(
-                "resume checkpoint declares model schema "
-                f"{checkpoint.get('model_schema')!r}, but this model is "
-                f"{MODEL_SCHEMA!r}"
+        checkpoint_schema = checkpoint.get("model_schema")
+        checkpoint_config = checkpoint.get("config")
+        trained_core_interface = (checkpoint_config or {}).get(
+            "core_interface", "full"
+        )
+        if trained_core_interface != args.core_interface:
+            raise ValueError(
+                "--core-interface must match the resumed checkpoint: "
+                f"checkpoint={trained_core_interface!r}, "
+                f"requested={args.core_interface!r}"
             )
-        load_constraint_field_state_dict(model, checkpoint["model_state_dict"])
-        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        load_constraint_field_state_dict(
+            model,
+            checkpoint["model_state_dict"],
+            model_schema=checkpoint_schema,
+            config=checkpoint_config,
+        )
+        optimizer.load_state_dict(
+            migrate_constraint_field_optimizer_state_dict(
+                model,
+                checkpoint["optimizer_state_dict"],
+                model_schema=checkpoint_schema,
+                config=checkpoint_config,
+            )
+        )
         start_epoch = int(checkpoint["epoch"]) + 1
         global_step = int(
             checkpoint.get("global_step", start_epoch * args.steps_per_epoch)
         )
-
-    if not args.objective_residual_enabled:
-        _disable_objective_residual(model)
 
     ema = (
         WeightEMA(model, args.val_ema_decay)

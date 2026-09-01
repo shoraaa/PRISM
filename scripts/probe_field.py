@@ -121,11 +121,14 @@ def build_model(code, checkpoint_path: Path, device: str):
         checkpoint_path, map_location=device, weights_only=False
     )
     schema = checkpoint.get("model_schema")
-    if schema != code.net.MODEL_SCHEMA:
+    supported = {
+        code.net.MODEL_SCHEMA,
+        getattr(code.net, "LEGACY_NO_OBJECTIVE_RESIDUAL_SCHEMA", None),
+    }
+    if schema not in supported:
         raise SystemExit(
-            f"checkpoint schema {schema!r} does not match --code-root schema "
-            f"{code.net.MODEL_SCHEMA!r}; point --code-root at the matching "
-            f"checkout"
+            f"checkpoint schema {schema!r} is not supported by --code-root; "
+            f"point --code-root at a matching checkout"
         )
     config = checkpoint.get("config", {})
     # Rebuild under the flags the checkpoint was trained with. Several of them
@@ -142,9 +145,17 @@ def build_model(code, checkpoint_path: Path, device: str):
         if name not in ("self",) and name in config
     }
     model = code.net.ConstraintFieldNet(**kwargs).to(device)
-    code.net.load_constraint_field_state_dict(
-        model, checkpoint["model_state_dict"]
-    )
+    if schema == code.net.MODEL_SCHEMA:
+        code.net.load_constraint_field_state_dict(
+            model, checkpoint["model_state_dict"]
+        )
+    else:
+        code.net.load_constraint_field_state_dict(
+            model,
+            checkpoint["model_state_dict"],
+            model_schema=schema,
+            config=config,
+        )
     model.eval()
     return model, checkpoint, config
 
@@ -282,10 +293,6 @@ def field_guidance(code, model, decoder, args) -> tuple[dict, object]:
         "multipliers": output["multipliers"][0].detach().cpu().numpy(),
         "coupler_weights": output["coupler_weights"][0].detach().cpu().numpy(),
         "coupler_bias": output["coupler_bias"][0].detach().cpu().numpy(),
-        "objective_residual": output["objective_residual"]
-        .detach()
-        .cpu()
-        .numpy(),
         "edge_risk": output["feasibility_risk"].detach().cpu().numpy(),
         "risk_penalty": float(args.risk_penalty),
     }
@@ -357,7 +364,7 @@ def state_records(
     active = output["active_channels"][0].detach().cpu().numpy()
     field = output["residual"].detach().cpu().numpy()
     additive = output["additive"].detach().cpu().numpy()
-    obj_residual = output["objective_residual"].detach().cpu().numpy()
+    obj_residual = np.zeros(metadata["edge_count"], dtype=np.float32)
     risk = output["feasibility_risk"].detach().cpu().numpy()
     feas_logit = output["feasibility_logits"].detach().cpu().numpy()
     binding_logit = output["binding_logits"][0].detach().cpu().numpy()

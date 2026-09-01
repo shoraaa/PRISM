@@ -13,10 +13,11 @@ from problem_data import TRAIN_VARIANTS, VariantCurriculum, problem_schema
 from train import (
     OptionOutcome,
     OptionStep,
+    _energy_alignment_loss,
+    _slack_loss,
     _assign_refresh_gae,
     _assign_smdp_returns,
     _best_feasible_solution,
-    _disable_objective_residual,
     _distance_guidance,
     _inference_decoder_args,
     _neutral_guidance,
@@ -65,7 +66,8 @@ def _args() -> Namespace:
         temporal_credit_weight=0.1,
         rl_weight=1.0,
         aux_rl_scale=0.1,
-        slack_weight=1.0,
+        semantic_margin_weight=1.0,
+        energy_alignment_weight=1.0,
         
         entropy_weight=0.001,
         no_adv_norm=False,
@@ -233,11 +235,12 @@ def test_event_driven_option_rollout_and_pretrain_update(
     assert len(transition_steps) == rollout.improvements
     assert any(step.value_target is not None for step in rollout.steps)
     assert all(0.0 <= step.search_progress < 1.0 for step in rollout.steps)
-    # v14 reports one auxiliary. The four it replaces supervised quantities the
-    # decoder already computes exactly, or a head whose output could not reach a
-    # decision; `slack_loss` regresses the field onto the executed signed
-    # admissibility margin, which is also what the feasibility probes read.
-    assert {"slack_loss", "approx_kl", "clip_frac"} <= metrics.keys()
+    assert {
+        "semantic_margin_loss",
+        "energy_alignment_loss",
+        "approx_kl",
+        "clip_frac",
+    } <= metrics.keys()
     assert not {"dual_loss", "feasibility_loss", "binding_loss", "price_loss"} & metrics.keys()
     assert metrics["auxiliary_scale"] == pytest.approx(0.25)
     # The pricing heads (multiplier, coupler, binding gate) kept their learned
@@ -295,7 +298,6 @@ def test_decision_level_ppo_moves_policy_without_auxiliary_losses(
         for name, parameter in model.named_parameters()
         if name.startswith(
             (
-                "objective_energy_residual_head",
                 "field_head",
                 "multiplier_head",
             )
@@ -328,8 +330,7 @@ def test_decision_level_ppo_moves_policy_without_auxiliary_losses(
         if name in policy_before
     )
     # First inner epoch: the policy is unchanged, so approx_kl is zero up to
-    # float32 C++/torch replay roundoff (~1e-8 now that the objective residual is
-    # a small non-zero learned term rather than exactly zero).
+    # float32 C++/torch replay roundoff.
     assert metrics["approx_kl"] == pytest.approx(0.0, abs=1e-5)
     assert np.isfinite(metrics["rl_loss"])
     assert abs(metrics["rl_score_proxy"]) > 1e-6
@@ -349,44 +350,6 @@ def test_decision_level_ppo_moves_policy_without_auxiliary_losses(
     assert metrics["ppo_reuse_passes"] == 1.0
     assert metrics["ppo_clipping_active"] == 0.0
     assert metrics["auxiliary_scale"] == pytest.approx(args.aux_rl_scale)
-
-
-def test_tsp_refinement_transition_updates_objective_residual_head() -> None:
-    rng = np.random.default_rng(409)
-    coordinates = rng.random((20, 2), dtype=np.float32)
-    problem = problem_schema("tsp") | {
-        "name": "tsp",
-        "coordinates": coordinates,
-        "distance": np.linalg.norm(
-            coordinates[:, None] - coordinates[None, :], axis=-1
-        ).astype(np.float32),
-    }
-    args = _args()
-    args.pretrain_epochs = 0
-    args.ppo_epochs = 1
-    args.temporal_credit_weight = 0.0
-    args.dual_weight = 0.0
-    args.feasibility_weight = 0.0
-    args.binding_weight = 0.0
-    args.price_weight = 0.0
-    args.entropy_weight = 0.0
-    model = ConstraintFieldNet(depth=1, units=8)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
-    rollout = collect_instance_rollout(model, problem, "tsp", args)
-    refinement = rollout.steps[0]
-    assert torch.count_nonzero(refinement.graph.x[:, 5]) > 0
-    assert refinement.old_logp.numel() > 0
-    refinement.rewards = torch.tensor([-1.0, 1.0])
-    rollout.steps = [refinement]
-    before = (
-        model.objective_energy_residual_head[-1].weight.detach().clone()
-    )
-
-    ppo_update(model, optimizer, [rollout], args, epoch=0)
-
-    assert not torch.equal(
-        before, model.objective_energy_residual_head[-1].weight.detach()
-    )
 
 
 def test_smdp_returns_discount_across_variable_duration_options() -> None:
@@ -542,8 +505,7 @@ def test_zero_neutral_model_reproduces_plain_objective_search() -> None:
     args = _args()
     model = ConstraintFieldNet(depth=1, units=8).eval()
 
-    # A fresh model preserves plain-objective quality; equal-cost route
-    # orientations may differ under the small v6 objective-residual initializer.
+    # A fresh zero-neutral resource field preserves plain-objective quality.
     decoder = _new_decoder(problem, args, deterministic=True)
     initial = list(decoder.sample(**_neutral_guidance(decoder)))
     incumbent, _ = _best_feasible_solution(initial, context="neutral bootstrap")
@@ -677,7 +639,6 @@ def test_policy_replay_uses_direct_field_not_analytic_pressure() -> None:
     output = {
         "residual": residual,
         "additive": torch.zeros_like(residual),
-        "objective_residual": torch.zeros(2),
         "feasibility_risk": torch.zeros(2),
         "active_channels": active,
     }
@@ -714,7 +675,6 @@ def test_policy_replay_is_objective_scale_and_resource_unit_invariant() -> None:
     output = {
         "residual": residual,
         "additive": torch.flip(residual, dims=(1,)) / 5.0,
-        "objective_residual": torch.tensor([0.2, -0.1]),
         "feasibility_risk": torch.tensor([0.05, 0.15]),
         "active_channels": active,
     }
@@ -776,7 +736,6 @@ def test_policy_replay_resource_energy_is_channel_permutation_invariant() -> Non
     output = {
         "residual": residual,
         "additive": torch.zeros_like(residual),
-        "objective_residual": torch.zeros(2),
         "feasibility_risk": torch.zeros(2),
         "active_channels": torch.ones(1, channels),
     }
@@ -858,15 +817,19 @@ def test_validation_size_defaults_to_eight_instances(monkeypatch) -> None:
     assert args.static_field is False
     assert args.gae_lambda == pytest.approx(1.0)
     assert args.temporal_credit_weight == pytest.approx(0.1)
-    assert args.epochs == 100
+    assert args.epochs == 1000
     assert args.pretrain_epochs == 0
     assert args.option_max_steps == 4
     assert args.smdp_gamma == pytest.approx(0.99)
     assert args.infeasible_penalty == pytest.approx(10.0)
-    assert args.slack_weight == pytest.approx(1.0)
-    assert args.grad_accum_variants == 4
-    assert args.aux_rl_scale == pytest.approx(0.0)
-    assert args.objective_residual_enabled is True
+    assert args.semantic_margin_weight == pytest.approx(1.0)
+    assert args.energy_alignment_weight == pytest.approx(1.0)
+    assert args.core_interface == "full"
+    assert args.grad_accum_variants == 13
+    # Both generic auxiliaries are on by default: one predicts executable
+    # semantics and one aligns the separate search field with exact candidate
+    # consequences.
+    assert args.aux_rl_scale == pytest.approx(0.1)
     assert args.val_ema_decay == pytest.approx(0.0)
     assert args.lr_schedule == "constant"
     assert args.min_changed_edges == 8
@@ -882,6 +845,25 @@ def test_training_min_changed_edges_cli_override(monkeypatch) -> None:
     assert args.min_changed_edges == 5
 
 
+def test_core_interface_cli_selects_a_nested_ablation_rung(monkeypatch) -> None:
+    monkeypatch.setattr(
+        sys, "argv", ["train.py", "--core-interface", "post-state"]
+    )
+
+    args = parse_args()
+
+    assert args.core_interface == "post-state"
+
+
+def test_core_interface_cli_rejects_unknown_rung(monkeypatch) -> None:
+    monkeypatch.setattr(
+        sys, "argv", ["train.py", "--core-interface", "resource-name"]
+    )
+
+    with pytest.raises(SystemExit):
+        parse_args()
+
+
 def test_training_rejects_nonpositive_min_changed_edges(monkeypatch) -> None:
     monkeypatch.setattr(
         sys, "argv", ["train.py", "--min-changed-edges", "0"]
@@ -889,27 +871,6 @@ def test_training_rejects_nonpositive_min_changed_edges(monkeypatch) -> None:
 
     with pytest.raises(SystemExit):
         parse_args()
-
-
-def test_no_objective_residual_cli_zeros_and_freezes_objective_head(monkeypatch) -> None:
-    monkeypatch.setattr(sys, "argv", ["train.py", "--no-objective-residual"])
-
-    args = parse_args()
-    model = ConstraintFieldNet(depth=1, units=8)
-    final_layer = model.objective_energy_residual_head[-1]
-    with torch.no_grad():
-        final_layer.weight.fill_(1.0)
-        final_layer.bias.fill_(1.0)
-
-    _disable_objective_residual(model)
-
-    assert args.objective_residual_enabled is False
-    assert torch.count_nonzero(final_layer.weight) == 0
-    assert torch.count_nonzero(final_layer.bias) == 0
-    assert all(
-        not parameter.requires_grad
-        for parameter in model.objective_energy_residual_head.parameters()
-    )
 
 
 def test_rollout_accumulation_preserves_legacy_sample_batch(monkeypatch) -> None:
@@ -1402,3 +1363,141 @@ def test_validation_mean_best_cost_canonicalizes_maximize_objectives(
     _, average_best_cost, _, _ = validation(None, dataset, _args())
 
     assert average_best_cost == pytest.approx((5.0 - 12.0) / 2.0)
+
+
+def _slack_step(margin, mask, offsets):
+    """Minimal OptionStep carrying only what `_slack_loss` reads."""
+    graph = SimpleNamespace(
+        resource_transition_features=torch.stack(
+            (torch.zeros_like(margin), margin), dim=-1
+        ),
+        resource_transition_mask=mask,
+        edge_offsets=offsets,
+    )
+    return SimpleNamespace(graph=graph)
+
+
+def test_semantic_margin_loss_predicts_the_interpreter_margin() -> None:
+    """The semantic head represents margin without defining search energy."""
+    # One source node, four candidate edges, one resource row.
+    offsets = torch.tensor([0, 4], dtype=torch.long)
+    mask = torch.ones(4, 1, dtype=torch.bool)
+    margin = torch.tensor([[-1.0], [0.0], [1.0], [2.0]])
+
+    aligned = _slack_loss(
+        _slack_step(margin, mask, offsets),
+        {"semantic_margin": margin.clone()},
+    )
+    opposed = _slack_loss(
+        _slack_step(margin, mask, offsets),
+        {"semantic_margin": -margin.clone()},
+    )
+    assert aligned < opposed
+    # The margin itself is the exact target, so it is the global minimum.
+    assert aligned.item() == pytest.approx(0.0, abs=1e-6)
+
+
+def test_semantic_margin_loss_preserves_absolute_slack() -> None:
+    """Unlike energy, the semantic prediction retains row-constant meaning."""
+    offsets = torch.tensor([0, 4], dtype=torch.long)
+    mask = torch.ones(4, 1, dtype=torch.bool)
+    margin = torch.tensor([[-1.0], [0.0], [1.0], [2.0]])
+    base = _slack_loss(
+        _slack_step(margin, mask, offsets),
+        {"semantic_margin": margin},
+    )
+    shifted = _slack_loss(
+        _slack_step(margin, mask, offsets),
+        {"semantic_margin": margin + 0.5},
+    )
+    assert base.item() == pytest.approx(0.0, abs=1e-6)
+    assert shifted.item() == pytest.approx(0.25, abs=1e-6)
+
+
+def test_slack_loss_raises_rather_than_silently_vanishing() -> None:
+    """A shape disagreement used to return zero and train as plain PPO."""
+    offsets = torch.tensor([0, 4], dtype=torch.long)
+    mask = torch.ones(4, 1, dtype=torch.bool)
+    margin = torch.zeros(4, 1)
+    step = _slack_step(margin, mask, offsets)
+    with pytest.raises(RuntimeError, match="slack target and field disagree"):
+        _slack_loss(step, {"semantic_margin": torch.zeros(4, 2)})
+
+
+def test_slack_loss_is_zero_for_an_empty_registry() -> None:
+    """A bare TSP declares no row, so there is nothing to supervise."""
+    offsets = torch.tensor([0, 4], dtype=torch.long)
+    step = _slack_step(torch.zeros(4, 0), torch.zeros(4, 0, dtype=torch.bool), offsets)
+    assert _slack_loss(
+        step, {"semantic_margin": torch.zeros(4, 0)}
+    ).item() == 0.0
+
+
+def test_semantic_margin_loss_does_not_train_search_energy() -> None:
+    offsets = torch.tensor([0, 2], dtype=torch.long)
+    margin = torch.tensor([[0.5], [-0.5]])
+    mask = torch.ones_like(margin, dtype=torch.bool)
+    semantic = torch.zeros_like(margin, requires_grad=True)
+    energy = torch.zeros_like(margin, requires_grad=True)
+
+    loss = _slack_loss(
+        _slack_step(margin, mask, offsets),
+        {"semantic_margin": semantic, "residual": energy},
+    )
+    loss.backward()
+
+    assert semantic.grad is not None
+    assert torch.count_nonzero(semantic.grad) > 0
+    assert energy.grad is None
+
+
+def test_energy_alignment_uses_exact_composed_binding_delta() -> None:
+    target = torch.tensor([[0.0, 0.8], [0.4, 0.0]])
+    step = SimpleNamespace(
+        trace={
+            "screened_edges": np.array([0, 2], dtype=np.int64),
+            "screened_resource_delta": target.numpy(),
+        },
+        graph=SimpleNamespace(edge_offsets=torch.tensor([0, 3])),
+        resource_delta=None,
+    )
+    aligned_field = torch.zeros(3, 2)
+    aligned_field[[0, 2]] = target
+    output = {
+        "residual": aligned_field,
+        "active_channels": torch.ones(1, 2),
+    }
+    opposed = dict(output)
+    opposed["residual"] = -aligned_field
+
+    aligned_loss = _energy_alignment_loss(step, output)
+    opposed_loss = _energy_alignment_loss(step, opposed)
+
+    assert aligned_loss.item() == pytest.approx(0.0, abs=1e-6)
+    assert opposed_loss > aligned_loss
+
+
+def test_energy_alignment_does_not_train_semantic_margin_head() -> None:
+    step = SimpleNamespace(
+        trace={
+            "screened_edges": np.array([0], dtype=np.int64),
+            "screened_resource_delta": np.array([[0.75]], dtype=np.float32),
+        },
+        graph=SimpleNamespace(edge_offsets=torch.tensor([0, 1])),
+        resource_delta=None,
+    )
+    energy = torch.zeros(1, 1, requires_grad=True)
+    semantic = torch.zeros(1, 1, requires_grad=True)
+    loss = _energy_alignment_loss(
+        step,
+        {
+            "residual": energy,
+            "semantic_margin": semantic,
+            "active_channels": torch.ones(1, 1),
+        },
+    )
+    loss.backward()
+
+    assert energy.grad is not None
+    assert torch.count_nonzero(energy.grad) > 0
+    assert semantic.grad is None

@@ -318,19 +318,20 @@ def main(argv: list[str] | None = None) -> int:
 
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     schema = checkpoint.get("model_schema")
-    if schema != net_module.MODEL_SCHEMA:
-        raise SystemExit(
-            f"checkpoint schema {schema!r} does not match the working tree's "
-            f"{net_module.MODEL_SCHEMA!r}; the property layout is compiled in"
-        )
     config = checkpoint.get("config", {})
     config = config if isinstance(config, dict) else vars(config)
     trained_model = ConstraintFieldNet(
         index_embedded_resources=config.get("index_embedded_resources", False),
         monolithic_resource_field=config.get("monolithic_resource_field", False),
         program_blind_resources=config.get("program_blind_resources", False),
+        core_interface=config.get("core_interface", "full"),
     )
-    load_constraint_field_state_dict(trained_model, checkpoint["model_state_dict"])
+    load_constraint_field_state_dict(
+        trained_model,
+        checkpoint["model_state_dict"],
+        model_schema=schema,
+        config=config,
+    )
     trained_model.eval()
     torch.manual_seed(0)
     random_model = ConstraintFieldNet().eval()

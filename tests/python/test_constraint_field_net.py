@@ -12,7 +12,9 @@ sys.path.insert(0, str(ROOT / "src"))
 import prism_decoder  # noqa: E402
 from problem_data import problem_schema  # noqa: E402
 from net import (  # noqa: E402
+    CORE_INTERFACE_LEVELS,
     MODEL_SCHEMA,
+    LEGACY_NO_OBJECTIVE_RESIDUAL_SCHEMA,
     EDGE_FEATURE_COUNT,
     FIELD_CHANNEL_COUNT,
     EDGE_RESOURCE_FEATURE_COUNT,
@@ -35,6 +37,7 @@ from net import (  # noqa: E402
     decode_iteration,
     encode_objective_coeffs,
     load_constraint_field_state_dict,
+    migrate_constraint_field_optimizer_state_dict,
 )
 from train import (  # noqa: E402
     _guidance_numpy,
@@ -100,11 +103,8 @@ def test_constraint_field_net_uses_normalized_decoder_contract() -> None:
     # One column per registry row of this problem, not per compiled channel.
     channel_count = decoder.metadata["resource_count"]
     assert output["residual"].shape == (edge_count, channel_count)
-    assert output["objective_residual"].shape == (edge_count,)
-    # Small non-zero at init (near-neutral) so the head's hidden coefficient-
-    # conditioning layer is not gradient-starved; not exactly zero like the
-    # resource field/additive heads.
-    assert output["objective_residual"].abs().max() < 0.1
+    assert output["semantic_margin"].shape == (edge_count, channel_count)
+    assert "objective_residual" not in output
     assert output["multipliers"].shape == (
         1,
         decoder.metadata["multiplier_count"],
@@ -119,6 +119,10 @@ def test_constraint_field_net_uses_normalized_decoder_contract() -> None:
     # Inactive channels remain masked to zero after learning.
     active = torch.as_tensor(decoder.metadata["field_channel_mask"]).bool()
     assert torch.equal(output["residual"], torch.zeros_like(output["residual"]))
+    assert torch.equal(
+        output["semantic_margin"],
+        torch.zeros_like(output["semantic_margin"]),
+    )
     assert torch.all(output["residual"][:, ~active] == 0.0)
     assert torch.all(output["multipliers"] >= 0.0)
     # The objective weight slot is a fixed unit anchor; field channels learn
@@ -343,9 +347,8 @@ def test_resource_pool_deepset_path_is_trainable_end_to_end() -> None:
     assert pool.attr_proj.weight.grad.abs().sum() > 0
 
 
-def test_pooled_live_state_tracks_the_incumbent_and_the_static_view_does_not() -> None:
-    """The generic per-resource route state reaches the encoder, and the
-    incumbent-blind view used for the objective residual excludes it."""
+def test_pooled_live_state_tracks_the_incumbent_and_can_be_masked() -> None:
+    """The generic route state reaches the encoder and can be masked explicitly."""
     rng = np.random.default_rng(2291)
     coordinates = rng.random((20, 2), dtype=np.float32)
     distance = np.linalg.norm(
@@ -391,8 +394,7 @@ def test_pooled_live_state_tracks_the_incumbent_and_the_static_view_does_not() -
     assert not torch.allclose(
         dynamic_before[:, summary], dynamic_after[:, summary]
     )
-    # ...and is identical once the live state is zeroed, which is what the
-    # objective view consumes.
+    # ...and is identical once the live state is explicitly zeroed.
     torch.testing.assert_close(
         static_before[:, summary], static_after[:, summary]
     )
@@ -476,13 +478,77 @@ def test_program_checkpoint_loader_is_strict() -> None:
         load_constraint_field_state_dict(restored, v1)
     assert load_constraint_field_state_dict(restored, original.state_dict()) is None
 
-    pre_residual = {
-        key: value
-        for key, value in original.state_dict().items()
-        if not key.startswith("objective_energy_residual_head.")
+
+def test_v15_no_objective_residual_checkpoint_migrates_strictly() -> None:
+    original = ConstraintFieldNet(depth=1, units=8)
+    legacy = dict(original.state_dict())
+    legacy.update(
+        {
+            "objective_energy_residual_head.0.weight": torch.randn(8, 16),
+            "objective_energy_residual_head.0.bias": torch.randn(8),
+            "objective_energy_residual_head.2.weight": torch.zeros(1, 8),
+            "objective_energy_residual_head.2.bias": torch.zeros(1),
+        }
+    )
+    config = {
+        "objective_residual_enabled": False,
+        "linear_objective_residual_head": False,
     }
-    with pytest.raises(RuntimeError, match=MODEL_SCHEMA):
-        load_constraint_field_state_dict(restored, pre_residual)
+    restored = ConstraintFieldNet(depth=1, units=8)
+    load_constraint_field_state_dict(
+        restored,
+        legacy,
+        model_schema=LEGACY_NO_OBJECTIVE_RESIDUAL_SCHEMA,
+        config=config,
+    )
+    for key, value in original.state_dict().items():
+        assert torch.equal(restored.state_dict()[key], value)
+
+    nonneutral = dict(legacy)
+    nonneutral["objective_energy_residual_head.2.weight"] = torch.ones(1, 8)
+    with pytest.raises(RuntimeError, match="incompatible ConstraintFieldNet"):
+        load_constraint_field_state_dict(
+            restored,
+            nonneutral,
+            model_schema=LEGACY_NO_OBJECTIVE_RESIDUAL_SCHEMA,
+            config=config,
+        )
+    with pytest.raises(RuntimeError, match="incompatible ConstraintFieldNet"):
+        load_constraint_field_state_dict(
+            restored,
+            legacy,
+            model_schema=LEGACY_NO_OBJECTIVE_RESIDUAL_SCHEMA,
+            config={**config, "objective_residual_enabled": True},
+        )
+
+
+def test_v15_no_objective_residual_optimizer_group_migrates() -> None:
+    model = ConstraintFieldNet(depth=1, units=8)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1.0e-4)
+    current = optimizer.state_dict()
+    names = [name for name, _ in model.named_parameters()]
+    insertion = names.index("resource_index_embedding.weight")
+    current_ids = current["param_groups"][0]["params"]
+    dormant_ids = list(range(max(current_ids) + 1, max(current_ids) + 5))
+    legacy = {
+        **current,
+        "param_groups": [dict(current["param_groups"][0])],
+    }
+    legacy["param_groups"][0]["params"] = (
+        current_ids[:insertion] + dormant_ids + current_ids[insertion:]
+    )
+    migrated = migrate_constraint_field_optimizer_state_dict(
+        model,
+        legacy,
+        model_schema=LEGACY_NO_OBJECTIVE_RESIDUAL_SCHEMA,
+        config={
+            "objective_residual_enabled": False,
+            "linear_objective_residual_head": False,
+        },
+    )
+
+    assert migrated["param_groups"][0]["params"] == current_ids
+    optimizer.load_state_dict(migrated)
 
 
 def test_python_dimensions_come_from_cpp_extension() -> None:
@@ -603,7 +669,7 @@ def test_typed_field_accepts_unseen_runtime_resource_without_new_weights() -> No
 
 
 def activate_field_heads(model: ConstraintFieldNet, seed: int) -> None:
-    """Lift the field/additive heads off their zero init.
+    """Lift the energy and semantic heads off their zero init.
 
     A fresh ConstraintFieldNet emits an identically-zero residual by design (the
     neutral plain-objective policy), so any assertion comparing residuals on an
@@ -611,9 +677,158 @@ def activate_field_heads(model: ConstraintFieldNet, seed: int) -> None:
     """
     generator = torch.Generator().manual_seed(seed)
     with torch.no_grad():
-        for head in (model.field_head,):
+        for head in (model.field_head, model.semantic_margin_head):
             head.weight.normal_(std=0.5, generator=generator)
             head.bias.normal_(std=0.5, generator=generator)
+
+
+def test_core_interface_rungs_are_nested_and_mask_excluded_channels() -> None:
+    """Each rung must be a true subset along every route into the model."""
+    rng = np.random.default_rng(6441)
+    coordinates = rng.random((18, 2), dtype=np.float32)
+    distance = np.linalg.norm(
+        coordinates[:, None] - coordinates[None, :], axis=-1
+    ).astype(np.float32)
+    decoder = make_decoder(
+        {
+            "name": "cvrptw",
+            "coordinates": coordinates,
+            "distance": distance,
+            "demand": np.r_[0.0, rng.uniform(0.01, 0.04, 17)].astype(
+                np.float32
+            ),
+            "capacity": 0.6,
+            "time_window": np.column_stack(
+                (np.zeros(18, dtype=np.float32), np.full(18, 10.0, dtype=np.float32))
+            ),
+            "service_time": np.r_[0.0, np.full(17, 0.01, dtype=np.float32)],
+        },
+        n_rollouts=2,
+    )
+    decoder.set_incumbent(
+        decoder.sample_greedy(**_neutral_guidance(decoder))["route"]
+    )
+    graph = build_decoder_data(decoder)
+
+    assert torch.count_nonzero(graph.node_live_state) > 0
+    assert torch.count_nonzero(graph.resource_transition_mask) > 0
+    assert torch.count_nonzero(graph.resource_events) > 0
+
+    reference_layout = None
+    for level in CORE_INTERFACE_LEVELS:
+        model = ConstraintFieldNet(
+            depth=1, units=8, core_interface=level
+        ).eval()
+        layout = {
+            name: tuple(value.shape) for name, value in model.state_dict().items()
+        }
+        if reference_layout is None:
+            reference_layout = layout
+        else:
+            assert layout == reference_layout
+
+        node_resource, live, suffix, suffix_features = (
+            model.emb_net.behavioral_node_inputs(graph)
+        )
+        pressure, raw_pressure, events, transition, mask = (
+            model.emb_net.behavioral_edge_inputs(graph)
+        )
+        torch.testing.assert_close(live, graph.node_live_state)
+
+        if level == "full":
+            torch.testing.assert_close(node_resource, graph.node_resource)
+            torch.testing.assert_close(suffix, graph.node_suffix_state)
+            torch.testing.assert_close(
+                suffix_features, graph.node_suffix_features
+            )
+            torch.testing.assert_close(pressure, graph.resource_features)
+            torch.testing.assert_close(raw_pressure, graph.raw_resource_pressure)
+        else:
+            assert torch.count_nonzero(node_resource) == 0
+            assert torch.count_nonzero(suffix) == 0
+            assert torch.count_nonzero(suffix_features) == 0
+            assert torch.count_nonzero(pressure) == 0
+            assert torch.count_nonzero(raw_pressure) == 0
+
+        post_state = level in ("post-state", "events", "margin", "full")
+        has_events = level in ("events", "margin", "full")
+        has_margin = level in ("margin", "full")
+        if post_state:
+            torch.testing.assert_close(
+                transition[..., 0], graph.resource_transition_features[..., 0]
+            )
+            assert torch.equal(mask, graph.resource_transition_mask)
+        else:
+            assert torch.count_nonzero(transition[..., 0]) == 0
+            assert torch.count_nonzero(mask) == 0
+        if has_events:
+            torch.testing.assert_close(events, graph.resource_events)
+        else:
+            assert torch.count_nonzero(events) == 0
+        if has_margin:
+            torch.testing.assert_close(
+                transition[..., 1], graph.resource_transition_features[..., 1]
+            )
+        else:
+            assert torch.count_nonzero(transition[..., 1]) == 0
+
+    with pytest.raises(ValueError, match="core_interface"):
+        ConstraintFieldNet(depth=1, units=8, core_interface="constraint-name")
+
+    default_model = ConstraintFieldNet(depth=1, units=8).eval()
+    explicit_full = ConstraintFieldNet(
+        depth=1, units=8, core_interface="full"
+    ).eval()
+    explicit_full.load_state_dict(default_model.state_dict())
+    activate_field_heads(default_model, 6443)
+    explicit_full.load_state_dict(default_model.state_dict())
+    with torch.no_grad():
+        default_output = default_model(graph)
+        full_output = explicit_full(graph)
+    for key in default_output:
+        assert torch.equal(default_output[key], full_output[key]), key
+
+
+@pytest.mark.parametrize(
+    "level", ("live-state", "post-state", "events", "margin")
+)
+def test_core_interface_excluded_channels_cannot_leak_into_outputs(level) -> None:
+    """Perturb every excluded tensor; a lower-rung forward pass stays exact."""
+    import problem_data
+
+    decoder = prism_decoder.Decoder(problem_data.generated_problem("cvrptw", 20))
+    decoder.solve(1)
+    graph = build_decoder_data(decoder)
+    altered = graph.clone()
+
+    # Full-only operand, pressure, and suffix context.
+    altered.node_resource = 1.0 - graph.node_resource
+    altered.node_suffix_state = 1.0 - graph.node_suffix_state
+    altered.node_suffix_features = 1.0 - graph.node_suffix_features
+    altered.resource_features = 1.0 - graph.resource_features
+    altered.raw_resource_pressure = graph.raw_resource_pressure + 0.37
+
+    if level == "live-state":
+        altered.resource_transition_features[..., 0] = (
+            1.0 - graph.resource_transition_features[..., 0]
+        )
+        altered.resource_transition_mask = ~graph.resource_transition_mask
+    if level in ("live-state", "post-state"):
+        altered.resource_events = 1.0 - graph.resource_events
+    if level in ("live-state", "post-state", "events"):
+        altered.resource_transition_features[..., 1] = (
+            -graph.resource_transition_features[..., 1] + 0.125
+        )
+
+    model = ConstraintFieldNet(
+        depth=2, units=16, core_interface=level
+    ).eval()
+    activate_field_heads(model, 6442)
+    with torch.no_grad():
+        original = model(graph)
+        perturbed = model(altered)
+    for key in original:
+        assert torch.equal(original[key], perturbed[key]), key
 
 
 def test_index_embedded_resources_replaces_descriptor_semantics() -> None:
@@ -668,9 +883,17 @@ def test_index_embedded_resources_replaces_descriptor_semantics() -> None:
         assert not torch.equal(
             typed(graph)["residual"], typed(altered)["residual"]
         )
+        assert not torch.equal(
+            typed(graph)["semantic_margin"],
+            typed(altered)["semantic_margin"],
+        )
         base = ablated(graph)
         assert torch.equal(base["multipliers"], ablated(altered)["multipliers"])
         assert torch.equal(base["residual"], ablated(altered)["residual"])
+        assert torch.equal(
+            base["semantic_margin"],
+            ablated(altered)["semantic_margin"],
+        )
         # The ablation is a real change of policy, not a silent no-op.
         assert not torch.equal(base["multipliers"], typed(graph)["multipliers"])
         assert not torch.equal(base["residual"], typed(graph)["residual"])
@@ -840,54 +1063,6 @@ def test_objective_conditioning_reaches_descriptor_and_field() -> None:
     )
 
 
-def test_objective_residual_conditions_on_coeffs() -> None:
-    """One shared head, conditioned on the declared coefficient vector. The head
-    is zero-init (residual inert by design -- an actively-trained objective
-    residual was measured net-harmful), but once given non-zero weights it must
-    produce different residuals for different objective coefficients on the same
-    graph (the conditioning is wired, not dead)."""
-    rng = np.random.default_rng(315)
-    coordinates = rng.random((18, 2), dtype=np.float32)
-    distance = np.linalg.norm(
-        coordinates[:, None] - coordinates[None, :], axis=-1
-    ).astype(np.float32)
-    decoder = make_decoder(
-        {"name": "tsp", "coordinates": coordinates, "distance": distance},
-        n_rollouts=1,
-    )
-    distance_data = build_decoder_data(decoder)
-    prize_data = distance_data.clone()
-    prize_data.objective_coeffs = encode_objective_coeffs(
-        {"distance_coeff": 0.0, "visit_coeff": 1.0, "miss_coeff": 0.0,
-         "distance_regularizer": 1.0e-3, "sense": -1.0}
-    )
-    model = ConstraintFieldNet(depth=2, units=16)
-
-    # Head starts small non-zero (near-neutral) so it is trainable.
-    with torch.no_grad():
-        assert model(distance_data)["objective_residual"].abs().max() < 0.1
-
-    # The hidden (coefficient-conditioning) layer must receive gradient from the
-    # first step -- a zero-init final layer would freeze it. A linear-in-residual
-    # signal mimics the PPO policy gradient.
-    output = model(distance_data)
-    residual = output["objective_residual"]
-    (residual * torch.randn_like(residual)).sum().backward()
-    head = model.objective_energy_residual_head
-    assert head[0].weight.grad is not None and head[0].weight.grad.norm() > 0.0
-
-    # A non-trivial head must respond to the coefficient conditioning.
-    model.eval()
-    with torch.no_grad():
-        for parameter in model.objective_energy_residual_head[-1].parameters():
-            torch.nn.init.normal_(parameter, std=0.5)
-        distance_logits = model(distance_data)["objective_residual"]
-        prize_logits = model(prize_data)["objective_residual"]
-
-    assert distance_logits.std() > 0.0
-    assert not torch.allclose(distance_logits, prize_logits)
-
-
 def test_depot_conditioning_reaches_descriptor_and_field() -> None:
     import problem_data
 
@@ -1000,10 +1175,6 @@ def test_cpp_trace_replays_exact_state_dependent_policy() -> None:
     )
     decoder.seed(3003)
     model = ConstraintFieldNet(depth=2, units=16).eval()
-    with torch.no_grad():
-        torch.nn.init.normal_(
-            model.objective_energy_residual_head[-1].weight, std=0.2
-        )
 
     incumbent = decoder.sample_greedy(**_neutral_guidance(decoder))
     assert incumbent["feasible"]
@@ -1012,13 +1183,11 @@ def test_cpp_trace_replays_exact_state_dependent_policy() -> None:
     graph = build_decoder_data(decoder)
     with torch.no_grad():
         output = model(graph)
-    assert output["objective_residual"].std() > 0.0
     traced = decoder.sample_traced(
         edge_field=output["residual"].detach().numpy(),
         multipliers=output["multipliers"][0].detach().numpy(),
         coupler_weights=output["coupler_weights"][0].detach().numpy(),
         coupler_bias=output["coupler_bias"][0].detach().numpy(),
-        objective_residual=output["objective_residual"].detach().numpy(),
     )
     trace = traced["trace"]
     replayed, decisions = replay_logp_from_cpp_batch_trace(
@@ -1070,45 +1239,7 @@ def test_cpp_trace_replays_exact_state_dependent_policy() -> None:
     assert trace["feasibility_risk_labels"].size > 0
 
 
-def test_tsp_edge_logit_receives_objective_policy_gradient() -> None:
-    rng = np.random.default_rng(304)
-    coordinates = rng.random((24, 2), dtype=np.float32)
-    distance = np.linalg.norm(
-        coordinates[:, None] - coordinates[None, :], axis=-1
-    ).astype(np.float32)
-    decoder = make_decoder(
-        {"name": "tsp", "coordinates": coordinates, "distance": distance},
-        n_rollouts=6,
-        beta=2.0,
-    )
-    decoder.seed(3004)
-    graph = build_decoder_data(decoder)
-    model = ConstraintFieldNet(depth=1, units=8)
-    output = model(graph)
-    traced = decoder.sample_traced(
-        edge_field=output["residual"].detach().numpy(),
-        multipliers=output["multipliers"][0].detach().numpy(),
-        coupler_weights=output["coupler_weights"][0].detach().numpy(),
-        coupler_bias=output["coupler_bias"][0].detach().numpy(),
-        objective_residual=output["objective_residual"].detach().numpy(),
-    )
-    replayed, _ = replay_logp_from_cpp_batch_trace(
-        traced["trace"], graph, output, model, beta=2.0
-    )
-    advantages = torch.linspace(-1.0, 1.0, replayed.numel())
-    loss = -(replayed * advantages).mean()
-    loss.backward()
-
-    gradient = model.objective_energy_residual_head[-1].weight.grad
-    assert gradient is not None
-    assert torch.isfinite(gradient).all()
-    assert gradient.norm() > 0.0
-    assert not torch.as_tensor(
-        decoder.metadata["field_channel_mask"]
-    ).any()
-
-
-def test_default_depth_tsp_edge_logit_does_not_saturate_constant() -> None:
+def test_tsp_model_uses_only_the_exact_objective() -> None:
     rng = np.random.default_rng(305)
     coordinates = rng.random((32, 2), dtype=np.float32)
     distance = np.linalg.norm(
@@ -1121,13 +1252,10 @@ def test_default_depth_tsp_edge_logit_does_not_saturate_constant() -> None:
     graph = build_decoder_data(decoder)
     model = ConstraintFieldNet().eval()
     with torch.no_grad():
-        torch.nn.init.normal_(
-            model.objective_energy_residual_head[-1].weight, std=0.2
-        )
         output = model(graph)
 
-    assert output["objective_residual"].std() > 1e-4
-    assert output["objective_residual"].amax() > output["objective_residual"].amin()
+    assert "objective_residual" not in output
+    assert output["residual"].shape[1] == 0
     assert output["multipliers"][0, -1] == 1.0
     assert torch.equal(
         output["coupler_weights"][0, -1],
@@ -1139,9 +1267,10 @@ def test_default_depth_tsp_edge_logit_does_not_saturate_constant() -> None:
     # in the comparison that picks one, so it could never change a decision.
     assert "edge_risk" not in _guidance_numpy(output, graph)
     assert "edge_additive" not in _guidance_numpy(output, graph)
+    assert "objective_residual" not in _guidance_numpy(output, graph)
 
 
-def test_objective_view_does_not_change_legacy_dynamic_batch_norm() -> None:
+def test_model_runs_the_dynamic_gnn_once() -> None:
     rng = np.random.default_rng(1305)
     coordinates = rng.random((24, 2), dtype=np.float32)
     distance = np.linalg.norm(
@@ -1163,8 +1292,6 @@ def test_objective_view_does_not_change_legacy_dynamic_batch_norm() -> None:
     decoder.set_incumbent(incumbent["route"])
     graph = build_decoder_data(decoder)
     model = ConstraintFieldNet(depth=2, units=16)
-    legacy = ConstraintFieldNet(depth=2, units=16)
-    legacy.load_state_dict(model.state_dict())
     embeddings = []
     hook = model.emb_net.register_forward_hook(
         lambda _module, _inputs, output: embeddings.append(output.detach())
@@ -1173,40 +1300,10 @@ def test_objective_view_does_not_change_legacy_dynamic_batch_norm() -> None:
     model.train()
     model(graph)
     hook.remove()
-    legacy.train()
-    legacy_resource_type = legacy._resource_type_rows(
-        graph, int(graph.active_channels.shape[-1])
-    )
-    expected_dynamic = legacy.emb_net(
-        legacy.emb_net.augment_from_graph(
-            graph, resource_type=legacy_resource_type
-        ),
-        graph.edge_index,
-        legacy.emb_net.augment_edges(
-            graph.edge_attr, graph, resource_type=legacy_resource_type
-        ),
-    ).detach()
-
-    assert len(embeddings) == 2
-    assert embeddings[0].shape == expected_dynamic.shape
-    assert embeddings[1].shape == expected_dynamic.shape
-    assert torch.allclose(embeddings[0], expected_dynamic)
-    for actual_layer, legacy_layer in zip(
-        model.emb_net.layers, legacy.emb_net.layers
-    ):
-        for actual_norm, legacy_norm in (
-            (actual_layer.v_bn.module, legacy_layer.v_bn.module),
-            (actual_layer.e_bn.module, legacy_layer.e_bn.module),
-        ):
-            assert torch.equal(
-                actual_norm.running_mean, legacy_norm.running_mean
-            )
-            assert torch.equal(
-                actual_norm.running_var, legacy_norm.running_var
-            )
+    assert len(embeddings) == 1
 
 
-def test_edge_logit_is_invariant_to_incumbent_state() -> None:
+def test_resource_field_remains_conditioned_on_incumbent_state() -> None:
     rng = np.random.default_rng(306)
     coordinates = rng.random((24, 2), dtype=np.float32)
     distance = np.linalg.norm(
@@ -1226,9 +1323,6 @@ def test_edge_logit_is_invariant_to_incumbent_state() -> None:
     )
     model = ConstraintFieldNet(depth=2, units=16).eval()
     with torch.no_grad():
-        torch.nn.init.normal_(
-            model.objective_energy_residual_head[-1].weight, std=0.2
-        )
         model.field_head.weight.copy_(
             torch.linspace(-0.2, 0.2, 16).view(1, -1)
         )
@@ -1249,10 +1343,6 @@ def test_edge_logit_is_invariant_to_incumbent_state() -> None:
         )
         > 0
     )
-    assert torch.allclose(
-        empty_output["objective_residual"], incumbent_output["objective_residual"]
-    )
-    # Resource guidance remains state-conditioned.
     assert not torch.equal(
         empty_output["residual"], incumbent_output["residual"]
     )

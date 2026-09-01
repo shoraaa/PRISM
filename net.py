@@ -28,9 +28,7 @@ RESOURCE_TRANSITION_FEATURE_COUNT = (
 EDGE_FEATURE_COUNT = prism_decoder.EDGE_FEATURE_COUNT
 # The native feature contract places instance-static node attributes first and
 # incumbent replay state afterwards. Edge slots 8/9 mark incumbent/reverse
-# incumbent arcs; all other edge slots are instance-static. The node contract
-# grew a static tail (the in/out distance profiles) after the incumbent block,
-# so the static view masks a middle range rather than a suffix.
+# incumbent arcs; all other edge slots are instance-static.
 # Width of the invariant resource-set summary appended to node/edge features.
 # A shared descriptor-conditioned row map followed by one DeepSets sum reduces
 # any number of declared resources to this fixed width for the ordinary GNN.
@@ -60,6 +58,30 @@ INCUMBENT_EDGE_FEATURE_END = 3
 # indexed during training.
 RESOURCE_INDEX_EMBEDDING_ROWS = 16
 
+# Nested ablation over the behavioral information CoRE exposes to the neural
+# scorer.  These are deliberately ordered: every rung contains every channel
+# from the rung before it.  ``full`` is the historical/current input contract;
+# the lower rungs only zero tensors and therefore keep the parameter layout
+# identical for a matched-capacity experiment.
+CORE_INTERFACE_LEVELS = (
+    "live-state",
+    "post-state",
+    "events",
+    "margin",
+    "full",
+)
+_CORE_INTERFACE_RANK = {
+    name: rank for rank, name in enumerate(CORE_INTERFACE_LEVELS)
+}
+
+
+def validate_core_interface(value: str) -> str:
+    if value not in _CORE_INTERFACE_RANK:
+        raise ValueError(
+            "core_interface must be one of " + ", ".join(CORE_INTERFACE_LEVELS)
+        )
+    return value
+
 
 # The objective is conditioned on its declared coefficient algebra, not a
 # categorical type. Every objective is a signed linear combination over
@@ -78,11 +100,9 @@ OBJECTIVE_COEFF_KEYS = (
 # 3 signed coeffs -> (magnitude, sign) each, plus regularizer magnitude and a
 # sense sign bit.
 OBJECTIVE_COEFF_DIM = 8
-# Small non-zero init for the residual head's final layer so its hidden
-# coefficient-conditioning layer is not gradient-starved (a zero-init output
-# layer sends zero gradient to the layer below it).
-OBJECTIVE_RESIDUAL_HEAD_INIT_STD = 0.1
-MODEL_SCHEMA = "slack_energy_v14"
+MODEL_SCHEMA = "semantic_energy_v16"
+LEGACY_NO_OBJECTIVE_RESIDUAL_SCHEMA = "semantic_energy_v15"
+LEGACY_OBJECTIVE_RESIDUAL_PREFIX = "objective_energy_residual_head."
 
 
 def _squash_magnitude(value: float) -> float:
@@ -457,10 +477,77 @@ def decode_iteration(
         multipliers=multipliers,
         coupler_weights=output["coupler_weights"][0].detach().cpu().numpy(),
         coupler_bias=output["coupler_bias"][0].detach().cpu().numpy(),
-        objective_residual=output["objective_residual"].detach().cpu().numpy(),
         risk_penalty=0.0,
     )
     return solution, output
+
+
+@torch.no_grad()
+def decode_python_refinement(
+    problem,
+    decoder,
+    model,
+    device="cpu",
+    *,
+    search_config=None,
+    neighborhood_config=None,
+    scope=None,
+    install=True,
+    record_decisions=False,
+):
+    """Refine one incumbent through the readable Python execution path.
+
+    The native decoder is used only for the existing graph/model input contract;
+    no native construction, perturbation, or SRR call is made here.  Candidate
+    generation, exact execution, learned ranking, and acceptance are Python.
+    Keeping this opt-in leaves the production/native behavior unchanged while
+    giving the learned field a clean operator-agnostic execution interface.
+    """
+
+    if not decoder.best_solution["feasible"]:
+        raise ValueError(
+            "decode_python_refinement requires a feasible installed incumbent"
+        )
+
+    # Lazy imports keep the ordinary model/native path independent of the
+    # readable reference implementation.
+    from decoder import Decoder as PythonDecoder
+    from search import (
+        ExecutableRefiner,
+        ExecutedBehaviorScorer,
+        RoutingNeighborhood,
+    )
+
+    graph = build_decoder_data(decoder, device=device)
+    output = model(graph)
+    semantic_decoder = PythonDecoder(problem)
+    scorer = ExecutedBehaviorScorer(
+        semantic_decoder,
+        graph.edge_index.detach().cpu().numpy(),
+        edge_field=output["residual"].detach().cpu().numpy(),
+        multipliers=output["multipliers"][0].detach().cpu().numpy(),
+        objective_energy_scale=float(decoder.metadata["objective_energy_scale"]),
+        coupler_weights=output["coupler_weights"][0].detach().cpu().numpy(),
+        coupler_bias=output["coupler_bias"][0].detach().cpu().numpy(),
+    )
+    neighborhood = RoutingNeighborhood(
+        semantic_decoder, config=neighborhood_config
+    )
+    result = ExecutableRefiner(
+        semantic_decoder,
+        neighborhood,
+        scorer=scorer,
+        config=search_config,
+        solution_evaluator=decoder.evaluate,
+    ).refine(
+        decoder.best_solution["route"],
+        scope=scope,
+        record_decisions=record_decisions,
+    )
+    solution = result.solution
+    if install and solution["feasible"]:
+        decoder.set_incumbent(solution["route"])
+    return solution, output, result
 
 # GNN for edge embeddings
 # Single GNN layer for checkpointing
@@ -664,6 +751,7 @@ class EmbNet(nn.Module):
         resource_descriptor_dim=0,
         node_resource_summary=0,
         objective_summary=0,
+        core_interface="full",
     ):
         super().__init__()
         self.depth = depth
@@ -671,6 +759,7 @@ class EmbNet(nn.Module):
         self.act_fn = getattr(F, act_fn)
         self.agg_fn = getattr(gnn, f'global_{agg_fn}_pool')
         self.grad_checkpointing = grad_checkpointing
+        self.core_interface = validate_core_interface(core_interface)
         # Per-node resource attributes (demand, window bounds, service time, and
         # whatever slots a declared row publishes) reach the node encoder as a
         # fixed-width pooled summary instead of as constraint-named columns.
@@ -678,8 +767,8 @@ class EmbNet(nn.Module):
         # so an appended schema row contributes through the same weights, the
         # width does not depend on resource_count, and nothing here reads a
         # registry position. Without this the attributes reach only the
-        # per-channel field head, leaving the feasibility, binding, coupler and
-        # objective-residual heads with no view of demand or time windows.
+        # per-channel field head, leaving the binding and coupler heads with no
+        # view of demand or time windows.
         self.node_resource_summary = node_resource_summary
         if node_resource_summary:
             # Forward state, the legacy scalar suffix, and the richer split
@@ -728,6 +817,67 @@ class EmbNet(nn.Module):
         self.layers = nn.ModuleList([
             GNNLayer(self.units, self.act_fn, self.agg_fn) for _ in range(self.depth)
         ])
+
+    def behavioral_node_inputs(self, graph):
+        """Return the node-side channels admitted by the selected CoRE rung."""
+        full = self.core_interface == "full"
+        return (
+            graph.node_resource if full else torch.zeros_like(graph.node_resource),
+            # Every rung begins with the current resource level.
+            graph.node_live_state,
+            graph.node_suffix_state
+            if full
+            else torch.zeros_like(graph.node_suffix_state),
+            graph.node_suffix_features
+            if full
+            else torch.zeros_like(graph.node_suffix_features),
+        )
+
+    def behavioral_edge_inputs(self, graph):
+        """Return a leakage-free nested view of candidate behavior.
+
+        Live state is node-side.  The post-state rung adds the authoritative
+        candidate post-state and its validity mask; together with live state it
+        determines delta x.  Events and signed margin are then added in order.
+        Full restores pressure/operand/suffix context used by the deployed
+        scorer before this ablation existed.
+        """
+        rank = _CORE_INTERFACE_RANK[self.core_interface]
+        full = self.core_interface == "full"
+        resource_features = (
+            graph.resource_features
+            if full
+            else torch.zeros_like(graph.resource_features)
+        )
+        raw_resource_pressure = (
+            graph.raw_resource_pressure
+            if full
+            else torch.zeros_like(graph.raw_resource_pressure)
+        )
+        resource_events = (
+            graph.resource_events
+            if rank >= _CORE_INTERFACE_RANK["events"]
+            else torch.zeros_like(graph.resource_events)
+        )
+        transition_features = torch.zeros_like(
+            graph.resource_transition_features
+        )
+        if rank >= _CORE_INTERFACE_RANK["post-state"]:
+            transition_features[..., 0] = graph.resource_transition_features[..., 0]
+        if rank >= _CORE_INTERFACE_RANK["margin"]:
+            transition_features[..., 1] = graph.resource_transition_features[..., 1]
+        transition_mask = (
+            graph.resource_transition_mask
+            if rank >= _CORE_INTERFACE_RANK["post-state"]
+            else torch.zeros_like(graph.resource_transition_mask)
+        )
+        return (
+            resource_features,
+            raw_resource_pressure,
+            resource_events,
+            transition_features,
+            transition_mask,
+        )
         
     def augment_nodes(
         self,
@@ -829,16 +979,19 @@ class EmbNet(nn.Module):
 
         if resource_type is None:
             raise ValueError("augment_from_graph requires pooled resource_type")
-        node_live_state = graph.node_live_state
-        node_suffix_state = graph.node_suffix_state
-        node_suffix_features = graph.node_suffix_features
+        (
+            node_resource,
+            node_live_state,
+            node_suffix_state,
+            node_suffix_features,
+        ) = self.behavioral_node_inputs(graph)
         if not live_state:
             node_live_state = torch.zeros_like(node_live_state)
             node_suffix_state = torch.zeros_like(node_suffix_state)
             node_suffix_features = torch.zeros_like(node_suffix_features)
         return self.augment_nodes(
             graph.x if x is None else x,
-            graph.node_resource,
+            node_resource,
             node_live_state,
             node_suffix_state,
             node_suffix_features,
@@ -879,8 +1032,14 @@ class EmbNet(nn.Module):
 
         if resource_type is None:
             raise ValueError("augment_edges requires pooled resource_type")
-        transition_features = graph.resource_transition_features
-        transition_mask = graph.resource_transition_mask.to(edge_attr.dtype)
+        (
+            resource_features,
+            raw_resource_pressure,
+            resource_events,
+            transition_features,
+            transition_mask,
+        ) = self.behavioral_edge_inputs(graph)
+        transition_mask = transition_mask.to(edge_attr.dtype)
         if not behavioral:
             transition_features = torch.zeros_like(transition_features)
             transition_mask = torch.zeros_like(transition_mask)
@@ -888,9 +1047,9 @@ class EmbNet(nn.Module):
             (
                 torch.stack(
                     (
-                        graph.resource_features,
-                        graph.raw_resource_pressure,
-                        graph.resource_events,
+                        resource_features,
+                        raw_resource_pressure,
+                        resource_events,
                     ),
                     dim=-1,
                 ),
@@ -940,8 +1099,6 @@ class ConstraintFieldNet(nn.Module):
         grad_checkpointing=False,
         gate_multipliers_by_binding=True,
         couple_resource_tokens=True,
-        linear_objective_residual_head=False,
-        unconditioned_objective_residual_head=False,
         couple_state_multipliers=True,
         index_embedded_resources=False,
         monolithic_resource_field=False,
@@ -954,8 +1111,10 @@ class ConstraintFieldNet(nn.Module):
         program_blind_resources=None,
         normalize_projections=True,
         pool_node_resources=True,
+        core_interface="full",
     ):
         super().__init__()
+        self.core_interface = validate_core_interface(core_interface)
         # Monolithic ablation: remove the FACTORIZATION itself, not just its
         # semantics. Every active resource is collapsed onto one shared token,
         # so a single undifferentiated penalty intensity serves the whole
@@ -1047,33 +1206,6 @@ class ConstraintFieldNet(nn.Module):
                 "three overwrite the same resource type vector, so combining "
                 "them measures whichever happens to run last"
             )
-        # Objective-residual head parameterization. Default: a coefficient-
-        # conditioned MLP (hidden layer mixes edge state with the declared
-        # coefficients). Ablation (True): a single linear layer over
-        # [edge_state, coeffs], so the coefficient contribution enters only
-        # linearly -- the claim under test is that a purely linear coeff term
-        # collapses into a per-row constant the downstream row-centering
-        # removes, leaving the residual unable to specialize per objective.
-        self.linear_objective_residual_head = linear_objective_residual_head
-        # Unconditioned-head ablation (True): build the objective-energy residual
-        # head over the edge state ALONE, dropping the declared coefficient vector
-        # from its input. The head keeps the same depth/width as the default MLP so
-        # the ablation isolates the *conditioning* (not capacity): one shared signed
-        # logit must serve every objective. The claim under test is that this
-        # unconditioned head suffers cross-objective negative transfer (e.g. a
-        # distance correction fighting a prize correction) that coefficient
-        # conditioning resolves. Mutually exclusive with the linear-head ablation.
-        self.unconditioned_objective_residual_head = (
-            unconditioned_objective_residual_head
-        )
-        if (
-            linear_objective_residual_head
-            and unconditioned_objective_residual_head
-        ):
-            raise ValueError(
-                "linear_objective_residual_head and "
-                "unconditioned_objective_residual_head are mutually exclusive"
-            )
         # State-coupler ablation. When False, the per-decision live-state
         # modulation of the resource multipliers is disabled: forward emits zero
         # coupler weights/bias so both the Python couple() and the C++ decoder
@@ -1119,6 +1251,7 @@ class ConstraintFieldNet(nn.Module):
             objective_summary=(
                 OBJECTIVE_SUMMARY_DIM if pool_node_resources else 0
             ),
+            core_interface=self.core_interface,
         )
         # Algebra-derived type descriptor + active flag + mean/max pressure +
         # graph context. No resource name or registry position reaches the
@@ -1153,7 +1286,13 @@ class ConstraintFieldNet(nn.Module):
         )
         self.token_projection = nn.Linear(units, units)
         self.graph_projection = nn.Linear(units, units)
-        # v14: one head per resource channel. `additive_head` was a second
+        # One search-energy head and one semantic head per resource channel.
+        # The semantic head predicts the executable signed margin but never
+        # enters decoder energy. This keeps exact representation supervision
+        # from imposing the margin's polarity or nearest-bound geometry on
+        # route ranking.
+        #
+        # `additive_head` was a second
         # linear map of the SAME interaction vector whose output the decoder
         # simply added to this one, so the pair was one head with extra steps.
         # `feasibility_head` is gone with it: its output was constant within a
@@ -1161,37 +1300,13 @@ class ConstraintFieldNet(nn.Module):
         # a node cancels in the comparison that picks one, so it could not
         # change a decision whatever its loss did.
         self.field_head = nn.Linear(units, 1)
+        self.semantic_margin_head = nn.Linear(units, 1)
         self.multiplier_head = nn.Linear(units, 1)
         self.binding_head = nn.Linear(units, 1)
         self.coupler_query_head = nn.Linear(units, units)
         self.coupler_key_head = nn.Linear(units, units)
         self.coupler_bias_head = nn.Linear(units, 1)
         self.value_head = nn.Linear(units + 1, 1)
-        # Keep this final in module registration order. A single shared head
-        # conditioned on the declared objective coefficient vector produces the
-        # signed, dimensionless correction to normalized objective energy. The
-        # coefficients modulate a per-edge correction nonlinearly (a plain linear
-        # head would push their contribution into a per-row constant that the
-        # downstream row-centering removes), so the distance primitive's learned
-        # correction is shared across every objective while prize/penalty
-        # objectives still specialize via their coefficients -- avoiding the
-        # negative transfer of a single unconditioned logit and the cold
-        # per-type columns of a one-hot head.
-        residual_head_input = (
-            units
-            if self.unconditioned_objective_residual_head
-            else units + OBJECTIVE_COEFF_DIM
-        )
-        if self.linear_objective_residual_head:
-            self.objective_energy_residual_head = nn.Linear(
-                residual_head_input, 1
-            )
-        else:
-            self.objective_energy_residual_head = nn.Sequential(
-                nn.Linear(residual_head_input, units),
-                nn.SiLU(),
-                nn.Linear(units, 1),
-            )
         # Registered unconditionally (like resource_attention) so a property
         # model and an index-embedded ablation share one parameter
         # layout and one checkpoint format.
@@ -1200,20 +1315,8 @@ class ConstraintFieldNet(nn.Module):
         )
         nn.init.zeros_(self.field_head.weight)
         nn.init.zeros_(self.field_head.bias)
-        # Small non-zero init on the final layer so the hidden (coefficient-
-        # conditioning) layer receives gradient from step 0. Bias stays zero so a
-        # row-constant output remains neutral after row-centering; the residual
-        # starts small and is bounded by row-center + tanh + --objective-residual-l2.
-        final_residual_layer = (
-            self.objective_energy_residual_head
-            if isinstance(self.objective_energy_residual_head, nn.Linear)
-            else self.objective_energy_residual_head[-1]
-        )
-        nn.init.normal_(
-            final_residual_layer.weight,
-            std=OBJECTIVE_RESIDUAL_HEAD_INIT_STD,
-        )
-        nn.init.zeros_(final_residual_layer.bias)
+        nn.init.zeros_(self.semantic_margin_head.weight)
+        nn.init.zeros_(self.semantic_margin_head.bias)
         nn.init.zeros_(self.coupler_query_head.weight)
         nn.init.zeros_(self.coupler_query_head.bias)
         nn.init.zeros_(self.coupler_bias_head.weight)
@@ -1249,7 +1352,10 @@ class ConstraintFieldNet(nn.Module):
         interaction = torch.tanh(
             edge_projection + token + resource_edge
         )
-        return self.field_head(interaction).squeeze(-1)
+        return (
+            self.field_head(interaction).squeeze(-1),
+            self.semantic_margin_head(interaction).squeeze(-1),
+        )
 
     def _resource_type_rows(self, pyg, resource_count):
         """Pool each resource's executable term set into [G, R, D]."""
@@ -1313,56 +1419,12 @@ class ConstraintFieldNet(nn.Module):
         _require_unit_interval("active_channels", active)
         resource_count = active.shape[-1]
 
-        # Objective guidance must not see the incumbent whose refinement it is
-        # supposed to improve. Otherwise PPO can reduce its loss by recognizing
-        # incumbent/reverse edges and assigning them positive logits, which
-        # suppresses exploration without learning objective structure. Reuse
-        # the same GNN weights on a static view: resource heads retain the full
-        # state-conditioned embedding above, while the objective residual is
-        # identical for the same instance before and after set_incumbent().
-        static_x = torch.cat(
-            (
-                pyg.x[:, :STATIC_NODE_FEATURE_COUNT],
-                torch.zeros_like(
-                    pyg.x[
-                        :,
-                        STATIC_NODE_FEATURE_COUNT:INCUMBENT_NODE_FEATURE_END,
-                    ]
-                ),
-                pyg.x[:, INCUMBENT_NODE_FEATURE_END:],
-            ),
-            dim=1,
-        )
-        static_edge_attr = torch.cat(
-            (
-                pyg.edge_attr[:, :INCUMBENT_EDGE_FEATURE_START],
-                torch.zeros_like(
-                    pyg.edge_attr[
-                        :,
-                        INCUMBENT_EDGE_FEATURE_START:INCUMBENT_EDGE_FEATURE_END,
-                    ]
-                ),
-                pyg.edge_attr[:, INCUMBENT_EDGE_FEATURE_END:],
-            ),
-            dim=1,
-        )
-        # Preserve the legacy resource-field path exactly: its BatchNorm
-        # statistics must be computed from the dynamic incumbent graph alone.
-        # Concatenating the static objective graph here changes every resource
-        # embedding even while the objective residual is identically zero, so
-        # merely adding the objective head changes the policy being restored.
         edge_count = pyg.edge_attr.shape[0]
-        # The pooled summary is a static instance property, so it is appended to
-        # both views: the objective view stays blind to the incumbent because
-        # only the incumbent columns of pyg.x are zeroed above.
         node_resource_type = self._resource_type_rows(pyg, resource_count)
         encoder_x, node_resource_rows = self.emb_net.augment_from_graph(
             pyg,
             resource_type=node_resource_type,
             return_resource_rows=True,
-        )
-        static_x = self.emb_net.augment_from_graph(
-            pyg, x=static_x, resource_type=node_resource_type, live_state=False
         )
         encoder_edge_attr, edge_resource_rows = self.emb_net.augment_edges(
             pyg.edge_attr,
@@ -1370,40 +1432,9 @@ class ConstraintFieldNet(nn.Module):
             resource_type=node_resource_type,
             return_resource_rows=True,
         )
-        static_edge_attr = self.emb_net.augment_edges(
-            static_edge_attr,
-            pyg,
-            resource_type=node_resource_type,
-            behavioral=False,
-        )
         edge_embedding = self.emb_net(
             encoder_x, pyg.edge_index, encoder_edge_attr
         )
-
-        # The objective view must not update BatchNorm a second time. Reuse the
-        # running statistics learned by the dynamic path while retaining
-        # gradients through the shared GNN and affine BatchNorm parameters. Do
-        # not checkpoint this pass: checkpoint recomputation happens after the
-        # modules have returned to training mode and would use different BN
-        # semantics from the original forward.
-        batch_norms = [
-            norm
-            for layer in self.emb_net.layers
-            for norm in (layer.v_bn, layer.e_bn)
-        ]
-        batch_norm_training = [norm.training for norm in batch_norms]
-        checkpointing = self.emb_net.grad_checkpointing
-        try:
-            for norm in batch_norms:
-                norm.eval()
-            self.emb_net.grad_checkpointing = False
-            objective_edge_embedding = self.emb_net(
-                static_x, pyg.edge_index, static_edge_attr
-            )
-        finally:
-            self.emb_net.grad_checkpointing = checkpointing
-            for norm, training in zip(batch_norms, batch_norm_training):
-                norm.train(training)
         batched = hasattr(pyg, "batch") and pyg.batch is not None
         if batched:
             edge_batch = pyg.batch[pyg.edge_index[0]]
@@ -1445,12 +1476,23 @@ class ConstraintFieldNet(nn.Module):
             pyg, "metric_skew", 1, batch_size, active
         )
 
-        normalized_resources = pyg.resource_features
+        (
+            node_resource,
+            _,
+            _,
+            _,
+        ) = self.emb_net.behavioral_node_inputs(pyg)
+        (
+            normalized_resources,
+            _,
+            resource_events,
+            _,
+            _,
+        ) = self.emb_net.behavioral_edge_inputs(pyg)
         if normalized_resources.shape != (edge_embedding.shape[0], resource_count):
             raise ValueError(
                 "resource_features must have shape [num_edges, resource_count]"
             )
-        resource_events = pyg.resource_events
         if resource_events.shape != normalized_resources.shape:
             raise ValueError("resource_events must match resource_features")
         if batched:
@@ -1543,52 +1585,6 @@ class ConstraintFieldNet(nn.Module):
             projected_edges = F.layer_norm(
                 projected_edges, (projected_edges.shape[-1],)
             )
-        # The residual GNN can have large eval-time activations after many
-        # layers. Applying tanh directly here saturated every component and
-        # made the nominal per-edge residual constant across all TSP edges. Use
-        # a parameter-free per-edge normalization so the head retains objective
-        # ordering information without adding checkpoint state.
-        objective_projected_edges = self.edge_projection(
-            objective_edge_embedding
-        )
-        objective_edge_state = F.layer_norm(
-            objective_projected_edges,
-            (objective_projected_edges.shape[-1],),
-        )
-        # Condition the shared head on the declared objective coefficients so a
-        # single set of weights specializes per objective without siloing.
-        edge_objective_coeffs = (
-            objective_coeffs[edge_batch]
-            if batched
-            else objective_coeffs[0].expand(edge_count, -1)
-        )
-        # Unconditioned-head ablation: drop the coefficient vector so a single
-        # shared logit serves every objective (isolating the value of
-        # coefficient conditioning). Otherwise condition on the declared coeffs.
-        if self.unconditioned_objective_residual_head:
-            residual_head_input = objective_edge_state
-        else:
-            residual_head_input = torch.cat(
-                (objective_edge_state, edge_objective_coeffs), dim=-1
-            )
-        raw_objective_residual = self.objective_energy_residual_head(
-            residual_head_input
-        ).squeeze(-1)
-        # Only differences within an outgoing candidate row affect policy.
-        # Center before bounding so a row-constant head output is exactly
-        # neutral. The result is a dimensionless correction because the native
-        # decoder and PPO replay both divide the raw objective by the same
-        # row-centered graph scale before adding this term.
-        source = pyg.edge_index[0]
-        row_sums = raw_objective_residual.new_zeros(pyg.x.shape[0])
-        row_sums.scatter_add_(0, source, raw_objective_residual)
-        row_counts = torch.bincount(
-            source, minlength=pyg.x.shape[0]
-        ).to(raw_objective_residual.dtype)
-        centered_objective_residual = raw_objective_residual - (
-            row_sums / row_counts.clamp_min(1.0)
-        )[source]
-        objective_residual = torch.tanh(centered_objective_residual)
         projected_tokens = self.token_projection(tokens)
         edge_active = active[edge_batch] if batched else active[0]
         channel_state = normalized_resources
@@ -1598,11 +1594,11 @@ class ConstraintFieldNet(nn.Module):
         # only their invariant set summaries; the shared per-resource field
         # retains these equivariant rows until its final channel computation.
         if node_resource_rows is None:
-            resource_context_edges = pyg.node_resource[pyg.edge_index[1]]
+            resource_context_edges = node_resource[pyg.edge_index[1]]
         else:
             resource_context_edges = torch.cat(
                 (
-                    pyg.node_resource[pyg.edge_index[1]],
+                    node_resource[pyg.edge_index[1]],
                     node_resource_rows[pyg.edge_index[1]],
                     edge_resource_rows,
                 ),
@@ -1640,6 +1636,7 @@ class ConstraintFieldNet(nn.Module):
                 / edge_denominator[..., None]
             ).expand_as(resource_context_edges)
         raw_channels = []
+        raw_semantic_channels = []
         for channel in range(resource_count):
             token = (
                 projected_tokens[:, channel]
@@ -1661,7 +1658,7 @@ class ConstraintFieldNet(nn.Module):
                 and self.training
                 and torch.is_grad_enabled()
             ):
-                raw = torch.utils.checkpoint.checkpoint(
+                raw, raw_semantic = torch.utils.checkpoint.checkpoint(
                     self._field_channel,
                     projected_edges,
                     token,
@@ -1670,10 +1667,11 @@ class ConstraintFieldNet(nn.Module):
                     use_reentrant=False,
                 )
             else:
-                raw = self._field_channel(
+                raw, raw_semantic = self._field_channel(
                     projected_edges, token, resource_edge, edge_batch
                 )
             raw_channels.append(raw)
+            raw_semantic_channels.append(raw_semantic)
         # An empty registry stacks to [edges, 0] rather than failing: a problem
         # with no resource rows has no resource energy, which the decoder
         # already accepts as an [edges, 0] field.
@@ -1682,12 +1680,18 @@ class ConstraintFieldNet(nn.Module):
             if raw_channels
             else projected_edges.new_zeros(edge_count, 0)
         )
+        raw_semantic_margin = (
+            torch.stack(raw_semantic_channels, dim=1)
+            if raw_semantic_channels
+            else projected_edges.new_zeros(edge_count, 0)
+        )
         # Resource guidance is a signed, zero-neutral learned field. Analytic
         # pressure remains an input feature, but the decoder does not multiply
         # it into energy. Signed terms let PPO reward useful capacity/route-limit
         # edges as well as penalize harmful ones; exact native feasibility
         # remains authoritative.
         residual = torch.tanh(raw_residual) * edge_active
+        semantic_margin = torch.tanh(raw_semantic_margin) * edge_active
 
         projected_graph = self.graph_projection(graph_embedding)
         if self.normalize_graph_projection:
@@ -1749,12 +1753,13 @@ class ConstraintFieldNet(nn.Module):
             (coupler_bias, objective_coupler_bias.unsqueeze(1)), dim=1
         )
         return {
-            "objective_residual": objective_residual,
             "residual": residual,
+            "semantic_margin": semantic_margin,
 
             "multipliers": multipliers,
             "binding_logits": binding_logits,
             "raw_residual": raw_residual,
+            "raw_semantic_margin": raw_semantic_margin,
             "coupler_weights": coupler_weights,
             "coupler_bias": coupler_bias,
             "value_context": graph_state,
@@ -1814,13 +1819,136 @@ class ConstraintFieldNet(nn.Module):
         return self.value_head(torch.cat((context, progress), dim=-1)).squeeze(-1)
 
 
+def _legacy_objective_residual_parameter_names(config: dict) -> tuple[str, ...]:
+    if config.get("linear_objective_residual_head", False):
+        return (
+            f"{LEGACY_OBJECTIVE_RESIDUAL_PREFIX}weight",
+            f"{LEGACY_OBJECTIVE_RESIDUAL_PREFIX}bias",
+        )
+    return (
+        f"{LEGACY_OBJECTIVE_RESIDUAL_PREFIX}0.weight",
+        f"{LEGACY_OBJECTIVE_RESIDUAL_PREFIX}0.bias",
+        f"{LEGACY_OBJECTIVE_RESIDUAL_PREFIX}2.weight",
+        f"{LEGACY_OBJECTIVE_RESIDUAL_PREFIX}2.bias",
+    )
+
+
+def _migrate_legacy_no_objective_residual_state_dict(
+    state_dict: dict, config: dict | None
+) -> tuple[dict, tuple[str, ...]]:
+    """Remove only the provably neutral v15 objective-residual parameters."""
+    if (
+        not isinstance(config, dict)
+        or config.get("objective_residual_enabled") is not False
+    ):
+        raise RuntimeError(
+            "v15 checkpoint migration requires config objective_residual_enabled=False"
+        )
+    expected = _legacy_objective_residual_parameter_names(config)
+    present = tuple(
+        key for key in state_dict if key.startswith(LEGACY_OBJECTIVE_RESIDUAL_PREFIX)
+    )
+    if set(present) != set(expected):
+        raise RuntimeError(
+            "v15 checkpoint has an unexpected objective-residual parameter layout"
+        )
+    final_prefix = (
+        LEGACY_OBJECTIVE_RESIDUAL_PREFIX
+        if config.get("linear_objective_residual_head", False)
+        else f"{LEGACY_OBJECTIVE_RESIDUAL_PREFIX}2."
+    )
+    for key in expected:
+        if key.startswith(final_prefix) and torch.count_nonzero(state_dict[key]):
+            raise RuntimeError(
+                "v15 checkpoint objective-residual final layer is not neutral"
+            )
+    migrated = {
+        key: value
+        for key, value in state_dict.items()
+        if not key.startswith(LEGACY_OBJECTIVE_RESIDUAL_PREFIX)
+    }
+    return migrated, expected
+
+
 def load_constraint_field_state_dict(
-    model: ConstraintFieldNet, state_dict: dict
+    model: ConstraintFieldNet,
+    state_dict: dict,
+    *,
+    model_schema: str = MODEL_SCHEMA,
+    config: dict | None = None,
 ) -> None:
-    """Strict schema load. Program pooling intentionally invalidates all old weights."""
+    """Strictly load v16, or migrate a provably neutral v15 checkpoint."""
     try:
-        model.load_state_dict(dict(state_dict), strict=True)
+        if model_schema == MODEL_SCHEMA:
+            migrated = dict(state_dict)
+        elif model_schema == LEGACY_NO_OBJECTIVE_RESIDUAL_SCHEMA:
+            migrated, _ = _migrate_legacy_no_objective_residual_state_dict(
+                state_dict, config
+            )
+        else:
+            raise RuntimeError(f"unsupported model schema {model_schema!r}")
+        model.load_state_dict(migrated, strict=True)
     except RuntimeError as error:
         raise RuntimeError(
             f"incompatible ConstraintFieldNet checkpoint for {MODEL_SCHEMA}"
         ) from error
+
+
+def migrate_constraint_field_optimizer_state_dict(
+    model: ConstraintFieldNet,
+    optimizer_state_dict: dict,
+    *,
+    model_schema: str,
+    config: dict | None,
+) -> dict:
+    """Align the v15 Adam parameter group after removing its dormant head."""
+    if model_schema == MODEL_SCHEMA:
+        return optimizer_state_dict
+    if model_schema != LEGACY_NO_OBJECTIVE_RESIDUAL_SCHEMA:
+        raise RuntimeError(f"unsupported model schema {model_schema!r}")
+    if (
+        not isinstance(config, dict)
+        or config.get("objective_residual_enabled") is not False
+    ):
+        raise RuntimeError(
+            "v15 optimizer migration requires objective_residual_enabled=False"
+        )
+    groups = optimizer_state_dict.get("param_groups", [])
+    if len(groups) != 1:
+        raise RuntimeError("v15 optimizer migration expects one parameter group")
+
+    legacy_names = _legacy_objective_residual_parameter_names(config)
+    current_names = [name for name, _ in model.named_parameters()]
+    try:
+        insertion = current_names.index("resource_index_embedding.weight")
+    except ValueError as error:
+        raise RuntimeError("current model has no resource index embedding") from error
+    old_names = (
+        current_names[:insertion]
+        + list(legacy_names)
+        + current_names[insertion:]
+    )
+    old_ids = list(groups[0].get("params", []))
+    if len(old_ids) != len(old_names):
+        raise RuntimeError(
+            "v15 optimizer parameter count does not match the migratable layout"
+        )
+    removed_ids = {
+        parameter_id
+        for name, parameter_id in zip(old_names, old_ids)
+        if name in legacy_names
+    }
+    migrated_groups = [dict(groups[0])]
+    migrated_groups[0]["params"] = [
+        parameter_id for parameter_id in old_ids if parameter_id not in removed_ids
+    ]
+    migrated_state = {
+        parameter_id: value
+        for parameter_id, value in optimizer_state_dict.get("state", {}).items()
+        if parameter_id not in removed_ids
+    }
+    return {
+        **optimizer_state_dict,
+        "state": migrated_state,
+        "param_groups": migrated_groups,
+    }

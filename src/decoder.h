@@ -83,8 +83,9 @@ static constexpr int32_t RESOURCE_ROW_PROPERTY_DIM = 14;
 static constexpr int32_t RESOURCE_TERM_PROPERTY_DIM = 20;
 // One multiplier slot beyond the resource rows carries the objective weight
 // applied to the objective edge cost. ConstraintFieldNet fixes this slot to one
-// (and its coupler to zero). A signed learned objective residual is added to the
-// canonical edge cost inside the same energy formula. Both the slot's position
+// (and its coupler to zero). The optional objective_residual argument is a
+// low-level external-control hook; ConstraintFieldNet does not produce one.
+// Both the slot's position
 // and the total count are properties of the registry, so they are
 // RoutingDecoder::objective_multiplier()/multiplier_count() rather than
 // constants; the constants were only ever right while every problem carried

@@ -51,7 +51,6 @@ sys.path.insert(0, str(ROOT))
 import prism_decoder  # noqa: E402
 from net import (  # noqa: E402
     ConstraintFieldNet,
-    MODEL_SCHEMA,
     load_constraint_field_state_dict,
 )
 from prism_eval.instances import (  # noqa: E402
@@ -223,13 +222,14 @@ def load_model(
         checkpoint_path, map_location=device, weights_only=False
     )
     schema = checkpoint.get("model_schema")
-    if schema != MODEL_SCHEMA:
-        raise RuntimeError(
-            f"checkpoint schema {schema!r} does not match active source "
-            f"schema {MODEL_SCHEMA!r}"
-        )
+    config = checkpoint.get("config", {})
     model = ConstraintFieldNet(**model_constructor_kwargs(checkpoint)).to(device)
-    load_constraint_field_state_dict(model, checkpoint["model_state_dict"])
+    load_constraint_field_state_dict(
+        model,
+        checkpoint["model_state_dict"],
+        model_schema=schema,
+        config=config,
+    )
     model.eval()
     return model, checkpoint
 

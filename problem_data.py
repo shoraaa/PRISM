@@ -520,6 +520,8 @@ def decoder_problem(name: str, data: dict) -> dict:
                 problem[field] = values
     if "route_limit" in data:
         problem["route_limit"] = float(_first(data["route_limit"]))
+    if "prize_quota" in data:
+        problem["prize_quota"] = float(_first(data["prize_quota"]))
     if name == "op":
         problem["tour_limit"] = 4.0
     elif name == "aop":

@@ -3172,7 +3172,22 @@ void RoutingDecoder::build_model_features() {
             feasible = precedence_admits(spec, next, depot, next_value,
                                           predecessor_served);
             next_value = precedence_next_state(spec, next, depot, next_value);
-            signed_margin = feasible ? 1.0f : -1.0f;
+            // A precedence row's bound is zero outstanding obligations at the
+            // end of the route -- terminal feasibility is exactly `state <=
+            // eps`. So it has a distance to its bound like every other row,
+            // and the fraction already discharged is that distance on the unit
+            // its relation count defines. Publishing `feasible ? 1 : -1` here
+            // instead threw that away and left precedence the only row whose
+            // margin is a sign bit, unnormalized at the clamp extremes while
+            // every other row sits at a graded slack. NEXT_STATE below already
+            // normalizes by the same relation count.
+            signed_margin =
+                feasible
+                    ? 1.0f - std::clamp(next_value /
+                                            static_cast<float>(std::max(
+                                                spec.relation_count, 1)),
+                                        0.0f, 1.0f)
+                    : -1.0f;
           } else {
             float since_rest = has_operation(spec, TermOperation::CHECKPOINT)
                                    ? prefix.resource_since_rest[resource_index]

@@ -28,7 +28,6 @@ sys.path.append(str(ROOT / "tests"))
 import prism_decoder  # noqa: E402
 from net import (  # noqa: E402
     ConstraintFieldNet,
-    MODEL_SCHEMA,
     load_constraint_field_state_dict,
 )
 from problem_data import (  # noqa: E402
@@ -306,10 +305,6 @@ def main() -> int:
     checkpoint = torch.load(
         args.checkpoint, map_location=args.device, weights_only=False
     )
-    if checkpoint.get("model_schema") != MODEL_SCHEMA:
-        raise RuntimeError(
-            f"checkpoint schema does not match {MODEL_SCHEMA}"
-        )
     # Reconstruct architecture-shaping flags from the training config so an
     # ablated checkpoint evaluates with the same architecture it was trained
     # under. The attention parameters are always present in the state dict, so a
@@ -318,14 +313,6 @@ def main() -> int:
     model = ConstraintFieldNet(
         couple_resource_tokens=train_config.get(
             "couple_resource_tokens", True
-        ),
-        # These reshape the objective-residual head, so the state dict will not
-        # load unless the architecture is rebuilt exactly as trained.
-        linear_objective_residual_head=train_config.get(
-            "linear_objective_residual_head", False
-        ),
-        unconditioned_objective_residual_head=train_config.get(
-            "unconditioned_objective_residual_head", False
         ),
         # Forward-time only (coupler params always present), but a missing flag
         # would silently evaluate a static-coupler ablation *with* live coupling.
@@ -361,8 +348,17 @@ def main() -> int:
         # projections, and evaluating one with them normalized feeds heads an
         # input distribution they never saw.
         normalize_projections=train_config.get("normalize_projections", "none"),
+        # Forward-time masking only: every rung has the same state dict. Without
+        # reconstructing it, a lower-rung checkpoint would silently be tested
+        # with the full behavioral interface.
+        core_interface=train_config.get("core_interface", "full"),
     ).to(args.device)
-    load_constraint_field_state_dict(model, checkpoint["model_state_dict"])
+    load_constraint_field_state_dict(
+        model,
+        checkpoint["model_state_dict"],
+        model_schema=checkpoint.get("model_schema"),
+        config=train_config,
+    )
     model.eval()
 
     finder = DatasetFinder(args.dataset_dir)

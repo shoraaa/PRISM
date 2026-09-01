@@ -31,27 +31,23 @@ The network defines the search policy: for candidate edge `e` in search state
 `s`, PRISM ranks moves by the energy
 
 ```text
-E_tilde(e | s) = c(e) / s_obj + delta_obj(e)
-         + sum_r lambda_r(s) * [field_r(e) + a_r(e)]
-         + kappa * q(e),
+E_tilde(e | s) = c(e) / s_obj
+         + sum_r lambda_r(s) * field_r(e),
 ```
 
 and samples the next node from `softmax(-beta * E_tilde)`. The native decoder
-supplies the exact objective and scale; the remaining energy terms are learned:
+supplies the exact objective and scale; only the resource terms are learned:
 
 - `c(e)` is the exact canonical objective edge cost, `s_obj` is a row-centered
-  RMS objective scale, and `delta_obj(e)` is its signed,
-  objective-family-conditioned dimensionless learned residual;
-- `field_r(e)` and `a_r(e)` are the learned per-edge field and additive term for
-  resource `r`, expressed directly in dimensionless energy units;
+  RMS objective scale, and this objective anchor has no learned correction;
+- `field_r(e)` is the learned per-edge field for resource `r`, expressed
+  directly in dimensionless energy units;
 - `lambda_r(s)` is the learned, live-state-modulated intensity of resource `r`,
   a Lagrangian-style multiplier shaped by search reward rather than supervision;
-- `q(e)` is an optional learned continuation-risk potential.
-
 Analytic resource pressure is **not** automatically charged in the energy; it is
 exposed to the GNN only as an input edge feature. Resource fields and the
-objective residual initialize exactly at zero, so the initial policy is the
-plain objective `E = c(e)` and every deviation from it must be learned. This
+resource multipliers initialize neutrally, so the initial policy is the plain
+objective `E = c(e)` and every deviation from it must be learned. This
 initial policy is distinct from the fields-off baseline, which flattens the
 field to an identical value on every edge (`E = 1`).
 
@@ -339,15 +335,14 @@ topology.
 
 ### Compositional field network
 
-The GNN emits one field for each registry resource plus a signed
-objective-energy residual.
+The GNN emits one field for each registry resource.
 Node, edge, resource-token, and live-state inputs are normalized to `[0, 1]`;
 the decoder is the source of truth for graph dimensions, resource scales, and
 active channels. Active resource tokens attend to one another before producing
-per-edge resource fields, global resource intensities, the objective residual,
-binding predictions, and live-state coupler parameters. The native decoder adds
-the residual to normalized objective edge cost before applying the single
-sampling temperature, so native sampling, PPO replay, and SRR share one
+per-edge resource fields, global resource intensities, binding predictions, and
+live-state coupler parameters. The native decoder uses normalized exact
+objective edge cost before applying the single sampling temperature, so native
+sampling, PPO replay, and SRR share one
 dimensionless energy formula. The decoder first installs one objective-only
 greedy incumbent, so
 the network's

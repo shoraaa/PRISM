@@ -31,12 +31,14 @@ def test_model_kwargs_recovers_training_cli_pooling_alias() -> None:
             "config": {
                 "resource_pooling": False,
                 "couple_resource_tokens": False,
+                "core_interface": "events",
             }
         }
     )
 
     assert kwargs["pool_node_resources"] is False
     assert kwargs["couple_resource_tokens"] is False
+    assert kwargs["core_interface"] == "events"
 
 
 def test_resolved_settings_inherit_checkpoint_construction_contract() -> None:
