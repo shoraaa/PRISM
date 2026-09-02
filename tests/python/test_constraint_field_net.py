@@ -14,7 +14,6 @@ from problem_data import problem_schema  # noqa: E402
 from net import (  # noqa: E402
     CORE_INTERFACE_LEVELS,
     MODEL_SCHEMA,
-    LEGACY_NO_OBJECTIVE_CHANNEL_SCHEMA,
     LEGACY_NO_OBJECTIVE_RESIDUAL_SCHEMA,
     EDGE_FEATURE_COUNT,
     FIELD_CHANNEL_COUNT,
@@ -41,7 +40,6 @@ from net import (  # noqa: E402
     migrate_constraint_field_optimizer_state_dict,
 )
 from train import (  # noqa: E402
-    _field_guidance,
     _guidance_numpy,
     _neutral_guidance,
     replay_decision_logp_from_cpp_batch_trace,
@@ -106,10 +104,7 @@ def test_constraint_field_net_uses_normalized_decoder_contract() -> None:
     channel_count = decoder.metadata["resource_count"]
     assert output["residual"].shape == (edge_count, channel_count)
     assert output["semantic_margin"].shape == (edge_count, channel_count)
-    # The objective is a channel of the same field, but it keeps only the field
-    # head: it has no bound, so no signed admissibility margin to supervise.
-    assert output["objective_residual"].shape == (edge_count,)
-    assert output["semantic_margin"].shape[1] == channel_count
+    assert "objective_residual" not in output
     assert output["multipliers"].shape == (
         1,
         decoder.metadata["multiplier_count"],
@@ -485,7 +480,7 @@ def test_program_checkpoint_loader_is_strict() -> None:
 
 
 def test_v15_no_objective_residual_checkpoint_migrates_strictly() -> None:
-    original = ConstraintFieldNet(depth=1, units=8, objective_channel=False)
+    original = ConstraintFieldNet(depth=1, units=8)
     legacy = dict(original.state_dict())
     legacy.update(
         {
@@ -499,7 +494,7 @@ def test_v15_no_objective_residual_checkpoint_migrates_strictly() -> None:
         "objective_residual_enabled": False,
         "linear_objective_residual_head": False,
     }
-    restored = ConstraintFieldNet(depth=1, units=8, objective_channel=False)
+    restored = ConstraintFieldNet(depth=1, units=8)
     load_constraint_field_state_dict(
         restored,
         legacy,
@@ -528,7 +523,7 @@ def test_v15_no_objective_residual_checkpoint_migrates_strictly() -> None:
 
 
 def test_v15_no_objective_residual_optimizer_group_migrates() -> None:
-    model = ConstraintFieldNet(depth=1, units=8, objective_channel=False)
+    model = ConstraintFieldNet(depth=1, units=8)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1.0e-4)
     current = optimizer.state_dict()
     names = [name for name, _ in model.named_parameters()]
@@ -554,132 +549,6 @@ def test_v15_no_objective_residual_optimizer_group_migrates() -> None:
 
     assert migrated["param_groups"][0]["params"] == current_ids
     optimizer.load_state_dict(migrated)
-
-
-def test_objective_channel_is_the_only_learned_signal_on_a_bare_tour() -> None:
-    """tsp/atsp declare no constraint, so this is their entire policy.
-
-    Without the objective channel the registry is empty: the field stacks to
-    [E, 0], the sole multiplier is the pinned objective constant, and every
-    model output is discarded -- logp is constant in theta and the gradient is
-    exactly zero. The channel is what makes those variants trainable at all.
-    """
-    rng = np.random.default_rng(11)
-    coordinates = rng.random((12, 2)).astype(np.float32)
-    distance = np.linalg.norm(
-        coordinates[:, None, :] - coordinates[None, :, :], axis=-1
-    ).astype(np.float32)
-    decoder = make_decoder(
-        {"name": "tsp", "coordinates": coordinates, "distance": distance},
-        n_rollouts=1,
-    )
-    assert decoder.metadata["resource_count"] == 0
-    graph = build_decoder_data(decoder)
-
-    blind = ConstraintFieldNet(depth=2, units=16, objective_channel=False)
-    blind_output = blind(graph)
-    assert blind_output["residual"].shape[1] == 0
-    # Nothing the module emits can move the energy on this problem.
-    assert torch.equal(
-        blind_output["objective_residual"],
-        torch.zeros_like(blind_output["objective_residual"]),
-    )
-    # Not merely zero-valued: not a function of theta at all. Nothing this
-    # module emits can move the energy on a problem with an empty registry.
-    assert not blind_output["objective_residual"].requires_grad
-    assert not blind_output["residual"].requires_grad
-
-    model = ConstraintFieldNet(depth=2, units=16)
-    output = model(graph)
-    assert output["residual"].shape[1] == 0
-    # Zero at initialization -- field_head is zero-init -- so the decoder energy
-    # at step 0 is exactly the analytic objective it has always been.
-    assert torch.equal(
-        output["objective_residual"],
-        torch.zeros_like(output["objective_residual"]),
-    )
-    # ...but no longer constant in theta, which is the whole point.
-    output["objective_residual"].sum().backward()
-    assert model.field_head.weight.grad.abs().sum() > 0.0
-
-
-def test_objective_channel_is_load_bearing_in_the_native_energy() -> None:
-    """It must reorder candidates, not merely appear in the output dict.
-
-    A per-edge term that is constant within a source row cancels in the argmin
-    that picks the next node, so "the field is non-zero" is not evidence that it
-    can change a decision. Both halves are checked: the decoder honours the
-    channel, and the model's own field varies WITHIN a candidate row.
-    """
-    rng = np.random.default_rng(4)
-    coordinates = rng.random((40, 2), dtype=np.float32)
-    distance = np.linalg.norm(
-        coordinates[:, None] - coordinates[None, :], axis=-1
-    ).astype(np.float32)
-    problem = {"name": "tsp", "coordinates": coordinates, "distance": distance}
-
-    def greedy(objective_residual):
-        decoder = make_decoder(problem, n_rollouts=4)
-        decoder.seed(99)
-        guidance = _neutral_guidance(decoder)
-        if objective_residual is not None:
-            guidance["objective_residual"] = objective_residual(decoder)
-        return tuple(decoder.sample_greedy(**guidance)["route"])
-
-    baseline = greedy(None)
-    perturbed = greedy(
-        lambda decoder: (
-            0.05
-            * np.random.default_rng(1).standard_normal(
-                int(decoder.metadata["edge_count"])
-            )
-        ).astype(np.float32)
-    )
-    # A 5% perturbation of a row-RMS-1 anchor already moves the tour, so the
-    # channel's tanh range is far wider than it needs to be -- which is why its
-    # zero initialization is the load-bearing safety property, not its bound.
-    assert perturbed != baseline
-
-    decoder = make_decoder(problem, n_rollouts=4)
-    torch.manual_seed(7)
-    model = ConstraintFieldNet(depth=4, units=16).eval()
-    torch.nn.init.normal_(model.field_head.weight, std=1.0)
-    field = _field_guidance(model, decoder, "cpu")["objective_residual"]
-    offsets = np.asarray(decoder.edge_offsets, dtype=np.int64)
-    within_row = [
-        field[begin:end].std()
-        for begin, end in zip(offsets[:-1], offsets[1:])
-        if end > begin + 1
-    ]
-    assert np.mean(within_row) > 0.5 * field.std()
-
-
-def test_objective_channel_shares_the_resource_field_parameters() -> None:
-    """No new parameters: that is what keeps old checkpoints loadable."""
-    with_channel = ConstraintFieldNet(depth=1, units=8)
-    without = ConstraintFieldNet(depth=1, units=8, objective_channel=False)
-    assert set(with_channel.state_dict()) == set(without.state_dict())
-
-
-def test_v16_pre_objective_channel_checkpoint_requires_the_channel_off() -> None:
-    trained = ConstraintFieldNet(depth=1, units=8, objective_channel=False)
-    # A trained field head is exactly the danger: shared with the new channel.
-    torch.nn.init.normal_(trained.field_head.weight, std=0.1)
-    state = dict(trained.state_dict())
-
-    restored = ConstraintFieldNet(depth=1, units=8, objective_channel=False)
-    load_constraint_field_state_dict(
-        restored, state, model_schema=LEGACY_NO_OBJECTIVE_CHANNEL_SCHEMA
-    )
-    for key, value in trained.state_dict().items():
-        assert torch.equal(restored.state_dict()[key], value)
-
-    with pytest.raises(RuntimeError, match="objective_channel=False"):
-        load_constraint_field_state_dict(
-            ConstraintFieldNet(depth=1, units=8),
-            state,
-            model_schema=LEGACY_NO_OBJECTIVE_CHANNEL_SCHEMA,
-        )
 
 
 def test_python_dimensions_come_from_cpp_extension() -> None:
@@ -1385,16 +1254,8 @@ def test_tsp_model_uses_only_the_exact_objective() -> None:
     with torch.no_grad():
         output = model(graph)
 
-    # The objective channel is this problem's whole policy: the registry is
-    # empty, so it is the only learned term in the decoder's energy.
+    assert "objective_residual" not in output
     assert output["residual"].shape[1] == 0
-    assert output["objective_residual"].shape == (
-        decoder.metadata["edge_count"],
-    )
-    # The objective's INTENSITY stays a pinned unit anchor. A graph-level scalar
-    # on the only active channel is exactly a temperature, and PPO took that
-    # shortcut before (1.0 -> 3.2 on cvrp); the learned content is the per-edge
-    # field, not the multiplier.
     assert output["multipliers"][0, -1] == 1.0
     assert torch.equal(
         output["coupler_weights"][0, -1],
@@ -1406,15 +1267,7 @@ def test_tsp_model_uses_only_the_exact_objective() -> None:
     # in the comparison that picks one, so it could never change a decision.
     assert "edge_risk" not in _guidance_numpy(output, graph)
     assert "edge_additive" not in _guidance_numpy(output, graph)
-    # The channel has to reach the decoder, or it is not in the energy.
-    guidance = _guidance_numpy(output, graph)
-    assert guidance["objective_residual"].shape == (
-        decoder.metadata["edge_count"],
-    )
-    # The fields-off control must carry no learned guidance at all.
-    assert not _guidance_numpy(output, graph, field_enabled=False)[
-        "objective_residual"
-    ].any()
+    assert "objective_residual" not in _guidance_numpy(output, graph)
 
 
 def test_model_runs_the_dynamic_gnn_once() -> None:

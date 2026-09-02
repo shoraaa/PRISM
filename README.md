@@ -31,46 +31,25 @@ The network defines the search policy: for candidate edge `e` in search state
 `s`, PRISM ranks moves by the energy
 
 ```text
-E_tilde(e | s) = c(e) / s_obj + field_obj(e)
+E_tilde(e | s) = c(e) / s_obj
          + sum_r lambda_r(s) * field_r(e),
 ```
 
 and samples the next node from `softmax(-beta * E_tilde)`. The native decoder
-supplies the exact objective and its scale; every term added to them is learned:
+supplies the exact objective and scale; only the resource terms are learned:
 
-- `c(e)` is the exact canonical objective edge cost and `s_obj` is a
-  row-centered RMS objective scale, so the anchor is dimensionless and
-  invariant to a positive rescale of the declared coefficients;
-- `field_obj(e)` is the learned **objective channel**: a signed per-edge
-  correction to that anchor, produced by the same resource-token encoder,
-  attention and field head as every constraint row;
+- `c(e)` is the exact canonical objective edge cost, `s_obj` is a row-centered
+  RMS objective scale, and this objective anchor has no learned correction;
 - `field_r(e)` is the learned per-edge field for resource `r`, expressed
   directly in dimensionless energy units;
 - `lambda_r(s)` is the learned, live-state-modulated intensity of resource `r`,
-  a Lagrangian-style multiplier shaped by search reward rather than supervision.
-
-The objective's *intensity* stays a pinned unit anchor while its *geometry* is
-learned. A graph-level scalar on the objective is exactly a search temperature,
-and PPO took that shortcut when the slot was free (about 1.0 -> 3.2 on CVRP)
-instead of learning edge preferences; on a bare TSP, where the objective is the
-only channel, it would be the only thing an intensity head could do.
-
-The objective is a channel and not a bolt-on head for two reasons. It is the
-one row every problem declares, so it is the only channel that can carry
-transfer between compositions -- capacity's field says nothing about a time
-window, and neither says anything about a plain tour. And a problem that
-declares no constraint (`tsp`, `atsp`) has an empty resource registry: with an
-analytic-only objective its field stacked to `[E, 0]`, its sole multiplier was
-the pinned objective constant, every model output was discarded, and `logp` was
-constant in theta -- measured gradient norm exactly `0.0`. Those variants
-trained nothing and ran as distance-ranked construction plus 2-opt.
-
+  a Lagrangian-style multiplier shaped by search reward rather than supervision;
 Analytic resource pressure is **not** automatically charged in the energy; it is
-exposed to the GNN only as an input edge feature. The shared field head is
-zero-initialized, so `field_obj` and every `field_r` are exactly zero at step 0:
-the initial policy is the plain objective `E = c(e)` and every deviation from it
-must be learned. This initial policy is distinct from the fields-off baseline,
-which flattens the field to an identical value on every edge (`E = 1`).
+exposed to the GNN only as an input edge feature. Resource fields and the
+resource multipliers initialize neutrally, so the initial policy is the plain
+objective `E = c(e)` and every deviation from it must be learned. This
+initial policy is distinct from the fields-off baseline, which flattens the
+field to an identical value on every edge (`E = 1`).
 
 Resource-token attention lets capacity, time windows, route limits, backhaul,
 pickup-delivery, and prize requirements change one another's learned intensities,

@@ -100,40 +100,9 @@ OBJECTIVE_COEFF_KEYS = (
 # 3 signed coeffs -> (magnitude, sign) each, plus regularizer magnitude and a
 # sense sign bit.
 OBJECTIVE_COEFF_DIM = 8
-MODEL_SCHEMA = "objective_channel_v16"
-# The objective channel adds NO parameters -- it reuses resource_encoder,
-# resource_attention, resource_edge_projection and field_head -- so a
-# semantic_energy_v16 checkpoint loads into the current model unmigrated. It is
-# only accepted into a model built with objective_channel=False, because the
-# shared field_head those checkpoints trained would otherwise emit a non-zero
-# objective field they never learned and silently change their policy.
-LEGACY_NO_OBJECTIVE_CHANNEL_SCHEMA = "semantic_energy_v16"
+MODEL_SCHEMA = "semantic_energy_v16"
 LEGACY_NO_OBJECTIVE_RESIDUAL_SCHEMA = "semantic_energy_v15"
 LEGACY_OBJECTIVE_RESIDUAL_PREFIX = "objective_energy_residual_head."
-# The objective's row in the token descriptor. Resource type rows are pooled
-# row/term properties in [0, 1], and the program-blind default replaces them
-# with the constant 0.5, so a saturated all-ones marker is a value no resource
-# row carries under any of the descriptor ablations.
-OBJECTIVE_TOKEN_TYPE_VALUE = 1.0
-# Output scale of the objective channel, as `s * tanh(raw / s)`.
-#
-# The resource fields use a plain tanh because they are CORRECTIONS to a term of
-# row-RMS 1. The objective channel is not: it has to be able to reshape the
-# ranking itself. Measured against the field that reproduces DeepACO's trained
-# tsp100 heuristic inside PRISM's decoder, |target| exceeds 1 on 89.7% of edges,
-# 2 on 60.7%, 4 on 9.4% and 6 on 1.7% (max 8.46), and the target's mean
-# within-row std is 1.074 -- i.e. a plain tanh gives the channel a total range
-# about equal to one standard deviation of what a good field varies by within a
-# single candidate row. s=6 covers 98.3% of that target.
-#
-# The derivative of s*tanh(x/s) at 0 is 1 for every s, so initial training
-# dynamics are unchanged; only the saturation point moves. Still bounded, so the
-# decoder's exp(-beta * E) finiteness guard is unaffected.
-OBJECTIVE_FIELD_SCALE = 6.0
-# Reverse-leg travel, edge_features[4]. The objective channel receives it as its
-# "event" companion so an asymmetric instance can be priced from the arc pair
-# rather than from d(i, j) alone, which is all objective_edge_cost() reads.
-EDGE_FEATURE_REVERSE_DISTANCE = 4
 
 
 def _squash_magnitude(value: float) -> float:
@@ -508,7 +477,6 @@ def decode_iteration(
         multipliers=multipliers,
         coupler_weights=output["coupler_weights"][0].detach().cpu().numpy(),
         coupler_bias=output["coupler_bias"][0].detach().cpu().numpy(),
-        objective_residual=output["objective_residual"].detach().cpu().numpy(),
         risk_penalty=0.0,
     )
     return solution, output
@@ -558,7 +526,6 @@ def decode_python_refinement(
         graph.edge_index.detach().cpu().numpy(),
         edge_field=output["residual"].detach().cpu().numpy(),
         multipliers=output["multipliers"][0].detach().cpu().numpy(),
-        objective_residual=output["objective_residual"].detach().cpu().numpy(),
         objective_energy_scale=float(decoder.metadata["objective_energy_scale"]),
         coupler_weights=output["coupler_weights"][0].detach().cpu().numpy(),
         coupler_bias=output["coupler_bias"][0].detach().cpu().numpy(),
@@ -1145,39 +1112,9 @@ class ConstraintFieldNet(nn.Module):
         normalize_projections=True,
         pool_node_resources=True,
         core_interface="full",
-        objective_channel=True,
     ):
         super().__init__()
         self.core_interface = validate_core_interface(core_interface)
-        # The objective as a channel of the shared field, rather than a term the
-        # decoder charges and the network cannot touch.
-        #
-        # Two things were broken while the objective was analytic-only. A bare
-        # tsp/atsp declares no constraint, so resource_count() is 0: the field
-        # stacked to [edges, 0], the only multiplier was the pinned objective
-        # constant, and the decoder energy reduced to c(e)/s_obj exactly. Every
-        # output of this module was discarded and logp was constant in theta, so
-        # those variants trained nothing and ran as distance-ranked construction
-        # plus 2-opt. And because the only learned outputs were per-resource,
-        # nothing was shared across compositions except the trunk -- capacity's
-        # field says nothing about a time window, and neither says anything
-        # about a plain tour. The objective is the one row every problem
-        # declares, so it is the only channel that can carry that transfer.
-        #
-        # It is NOT the v15 objective_energy_residual_head. That head read its
-        # own edge_projection, was conditioned on nothing but a graph-level
-        # coefficient vector, took no part in resource attention, and -- the
-        # part that made it harmful -- was initialized with std=0.1 on its final
-        # layer, so at step 0 it injected a bounded random reordering into the
-        # one term carrying the entire policy, while construction runs no_grad
-        # and PPO only sees refinement. (Its stated reason, "so the hidden layer
-        # receives gradient from step 0", does not hold: with a zero final layer
-        # dL/dW = delta h^T is still non-zero, which is exactly how field_head
-        # is initialized and it learns.) This channel instead shares every
-        # parameter with the resource rows and inherits field_head's zero init,
-        # so at step 0 the emitted objective field is exactly 0 and the policy
-        # is bit-identical to the analytic one on every variant.
-        self.objective_channel = bool(objective_channel)
         # Monolithic ablation: remove the FACTORIZATION itself, not just its
         # semantics. Every active resource is collapsed onto one shared token,
         # so a single undifferentiated penalty intensity serves the whole
@@ -1420,27 +1357,6 @@ class ConstraintFieldNet(nn.Module):
             self.semantic_margin_head(interaction).squeeze(-1),
         )
 
-    @staticmethod
-    def _objective_edge_anchor(pyg, edge_batch):
-        """The decoder's own dimensionless objective term, c(e) / s_obj.
-
-        The same quantity the native energy adds and the same one PPO replay
-        divides by, so the channel reads the anchor it is learning to correct
-        rather than a re-derivation of it. Squashing happens at the call site;
-        this returns the raw signed ratio.
-        """
-        costs = pyg.objective_edge_costs.reshape(-1)
-        scale = pyg.objective_energy_scale.reshape(-1)
-        if scale.numel() == 1:
-            per_edge = scale[0]
-        elif edge_batch is None:
-            raise ValueError(
-                "batched objective_energy_scale requires an edge batch index"
-            )
-        else:
-            per_edge = scale[edge_batch]
-        return costs / per_edge.clamp_min(1e-12)
-
     def _resource_type_rows(self, pyg, resource_count):
         """Pool each resource's executable term set into [G, R, D]."""
         rows = pyg.resource_row_properties
@@ -1601,53 +1517,15 @@ class ConstraintFieldNet(nn.Module):
             )
         _require_unit_interval("resource_types", resource_type)
 
-        # Per-edge objective anchor, squashed into the unit interval the token
-        # descriptor and the channel state are both required to live in. The
-        # squash is edge_features[3]'s, but this reaches the field head directly
-        # instead of through twelve message-passing layers -- the same direct
-        # pressure pathway every resource channel already gets.
-        objective_anchor = self._objective_edge_anchor(pyg, edge_batch)
-        objective_state = 0.5 + 0.5 * objective_anchor / (
-            1.0 + objective_anchor.abs()
-        )
-        if self.objective_channel:
-            objective_type = resource_type.new_full(
-                (batch_size, 1, RESOURCE_TYPE_DIM), OBJECTIVE_TOKEN_TYPE_VALUE
-            )
-            if batched:
-                anchor_mean = gnn.global_mean_pool(
-                    objective_state.unsqueeze(-1), edge_batch
-                )
-                anchor_max = gnn.global_max_pool(
-                    objective_state.unsqueeze(-1), edge_batch
-                )
-            else:
-                anchor_mean = objective_state.mean().reshape(1, 1)
-                anchor_max = objective_state.amax().reshape(1, 1)
-            token_type = torch.cat((resource_type, objective_type), dim=1)
-            # Always active: every problem declares an objective, which is what
-            # makes this the channel a bare tsp/atsp can still learn through.
-            token_active = torch.cat(
-                (active, active.new_ones(batch_size, 1)), dim=1
-            )
-            token_mean = torch.cat((resource_mean, anchor_mean), dim=1)
-            token_max = torch.cat((resource_max, anchor_max), dim=1)
-        else:
-            token_type = resource_type
-            token_active = active
-            token_mean = resource_mean
-            token_max = resource_max
-        token_count = token_type.shape[1]
-
         def _broadcast(column):
-            return column.unsqueeze(1).expand(-1, token_count, -1)
+            return column.unsqueeze(1).expand(-1, resource_count, -1)
 
         descriptor = torch.cat(
             (
-                token_type,
-                token_active.unsqueeze(-1),
-                token_mean.unsqueeze(-1),
-                token_max.unsqueeze(-1),
+                resource_type,
+                active.unsqueeze(-1),
+                resource_mean.unsqueeze(-1),
+                resource_max.unsqueeze(-1),
                 _broadcast(open_route),
                 _broadcast(objective_coeffs),
                 _broadcast(objective_scale),
@@ -1670,34 +1548,25 @@ class ConstraintFieldNet(nn.Module):
         # degenerates to an identity on identical tokens, which is exactly the
         # point: there is no composition left to attend over.
         if self.monolithic_resource_field:
-            # Pool the RESOURCE tokens only. The ablation removes per-resource
-            # factorization; folding the objective token in would additionally
-            # erase the objective channel, conflating two claims in one control.
             weights = active.unsqueeze(-1)
-            resource_slice = tokens[:, :resource_count]
-            pooled = (resource_slice * weights).sum(dim=1, keepdim=True) / (
+            pooled = (tokens * weights).sum(dim=1, keepdim=True) / (
                 weights.sum(dim=1, keepdim=True).clamp_min(1.0)
             )
-            tokens = torch.cat(
-                (pooled.expand(-1, resource_count, -1), tokens[:, resource_count:]),
-                dim=1,
-            )
+            tokens = pooled.expand(-1, resource_count, -1)
         # Cross-resource coupling. The --no-couple-resource-tokens ablation
         # skips this residual so every token is an independent per-resource
         # encoding of its own descriptor, isolating the contribution of
         # compositional attention. The attention parameters remain in the state
         # dict (unused, at their init) so a coupled and an ablated checkpoint
         # share an identical parameter layout.
-        # An EMPTY registry is reachable: a problem that declares no constraint
-        # (a TSP) carries no resource rows at all, where it used to carry seven
-        # inactive ones. With the objective channel there is still one token to
-        # attend over -- attention over a single key is an identity, which is
-        # the right answer, not a special case. Without it there is no sequence
-        # at all and the all-masked workaround below has no row to unmask, so
-        # skip the residual: it would be a no-op on zero tokens anyway.
-        if self.couple_resource_tokens and token_count > 0:
-            padding_mask = ~token_active.bool()
-            no_resources = ~token_active.bool().any(dim=1)
+        # An EMPTY registry is now reachable: a problem that declares no
+        # constraint (a TSP) carries no resource rows at all, where it used to
+        # carry seven inactive ones. There is no sequence to attend over, and
+        # the all-masked workaround below has no row to unmask, so skip the
+        # residual entirely -- it would be a no-op on zero tokens anyway.
+        if self.couple_resource_tokens and resource_count > 0:
+            padding_mask = ~active.bool()
+            no_resources = ~active.bool().any(dim=1)
             if no_resources.any():
                 # Attention over an all-masked row is undefined, so leave one
                 # key visible; the tokens it mixes are inactive either way.
@@ -1766,35 +1635,9 @@ class ConstraintFieldNet(nn.Module):
                 )
                 / edge_denominator[..., None]
             ).expand_as(resource_context_edges)
-        if self.objective_channel:
-            # The objective's own per-channel inputs, in the slots the resource
-            # rows use for live pressure. State is the anchor it is correcting;
-            # the "event" slot carries the reverse leg, because objective_edge_cost
-            # reads d(i, j) only and an asymmetric instance cannot be priced
-            # without the arc pair. The per-resource node attribute block is
-            # zero: the objective declares no state to attribute.
-            channel_state = torch.cat(
-                (channel_state, objective_state.unsqueeze(-1)), dim=1
-            )
-            channel_events = torch.cat(
-                (
-                    channel_events,
-                    pyg.edge_attr[:, EDGE_FEATURE_REVERSE_DISTANCE, None],
-                ),
-                dim=1,
-            )
-            resource_context_edges = torch.cat(
-                (
-                    resource_context_edges,
-                    resource_context_edges.new_zeros(
-                        edge_count, 1, resource_context_edges.shape[-1]
-                    ),
-                ),
-                dim=1,
-            )
         raw_channels = []
         raw_semantic_channels = []
-        for channel in range(token_count):
+        for channel in range(resource_count):
             token = (
                 projected_tokens[:, channel]
                 if batched
@@ -1829,16 +1672,6 @@ class ConstraintFieldNet(nn.Module):
                 )
             raw_channels.append(raw)
             raw_semantic_channels.append(raw_semantic)
-        # Split the objective back off. It keeps the field but not the semantic
-        # head: the semantic target is the executed signed admissibility margin,
-        # and the objective has no bound to be admissible against, so supervising
-        # it would invent a target. _slack_loss therefore still sees exactly
-        # resource_count channels and its shape guard stays meaningful.
-        if self.objective_channel:
-            raw_objective = raw_channels.pop()
-            raw_semantic_channels.pop()
-        else:
-            raw_objective = projected_edges.new_zeros(edge_count)
         # An empty registry stacks to [edges, 0] rather than failing: a problem
         # with no resource rows has no resource energy, which the decoder
         # already accepts as an [edges, 0] field.
@@ -1859,12 +1692,6 @@ class ConstraintFieldNet(nn.Module):
         # remains authoritative.
         residual = torch.tanh(raw_residual) * edge_active
         semantic_margin = torch.tanh(raw_semantic_margin) * edge_active
-        # Signed, bounded, and exactly zero at init (field_head is zero-init),
-        # so the decoder's energy at step 0 is the analytic objective it always
-        # was. No edge_active mask: the objective is active on every problem.
-        objective_residual = OBJECTIVE_FIELD_SCALE * torch.tanh(
-            raw_objective / OBJECTIVE_FIELD_SCALE
-        )
 
         projected_graph = self.graph_projection(graph_embedding)
         if self.normalize_graph_projection:
@@ -1873,17 +1700,7 @@ class ConstraintFieldNet(nn.Module):
             projected_graph = F.layer_norm(
                 projected_graph, (projected_graph.shape[-1],)
             )
-        # The pricing path stays over the RESOURCE tokens only. The objective
-        # slot's multiplier is pinned to one below and its coupler to zero, and
-        # that is deliberate: a graph-level scalar on the objective is a pure
-        # temperature knob (PPO drove it 1.0 -> 3.2 on cvrp instead of learning
-        # edge preferences), and on a bare tsp -- where the objective is the
-        # only channel -- it would be the ONLY thing the multiplier head could
-        # do. The objective's learned content is its per-edge field, not its
-        # intensity. `live_state` is also indexed by the resource registry, so
-        # the coupler keys must match its width.
-        resource_tokens = tokens[:, :resource_count]
-        state = torch.tanh(projected_graph.unsqueeze(1) + resource_tokens)
+        state = torch.tanh(projected_graph.unsqueeze(1) + tokens)
         graph_state = torch.tanh(projected_graph)
         binding_logits = self.binding_head(state).squeeze(-1)
         multipliers = F.softplus(self.multiplier_head(state).squeeze(-1))
@@ -1891,7 +1708,7 @@ class ConstraintFieldNet(nn.Module):
             multipliers = multipliers * torch.sigmoid(binding_logits)
         multipliers = multipliers * active
         coupler_queries = self.coupler_query_head(state)
-        coupler_keys = self.coupler_key_head(resource_tokens)
+        coupler_keys = self.coupler_key_head(tokens)
         coupler_weights = torch.einsum(
             "bru,bsu->brs", coupler_queries, coupler_keys
         ) / (coupler_queries.shape[-1] ** 0.5)
@@ -1938,8 +1755,6 @@ class ConstraintFieldNet(nn.Module):
         return {
             "residual": residual,
             "semantic_margin": semantic_margin,
-            "objective_residual": objective_residual,
-            "raw_objective_residual": raw_objective,
 
             "multipliers": multipliers,
             "binding_logits": binding_logits,
@@ -2062,32 +1877,9 @@ def load_constraint_field_state_dict(
     model_schema: str = MODEL_SCHEMA,
     config: dict | None = None,
 ) -> None:
-    """Strictly load the current schema, or a pre-objective-channel checkpoint.
-
-    Both legacy schemas load only into a model built with
-    ``objective_channel=False``. The parameter layout is identical either way --
-    the channel adds none -- so a strict load would succeed regardless, and that
-    is exactly the danger: the shared ``field_head`` these checkpoints trained
-    would start emitting a non-zero objective field they never learned, silently
-    changing the policy of an evaluated checkpoint.
-    """
-    legacy_schemas = (
-        LEGACY_NO_OBJECTIVE_CHANNEL_SCHEMA,
-        LEGACY_NO_OBJECTIVE_RESIDUAL_SCHEMA,
-    )
-    if model_schema in legacy_schemas and getattr(
-        model, "objective_channel", False
-    ):
-        raise RuntimeError(
-            f"{model_schema!r} checkpoint requires objective_channel=False: "
-            "the shared field head would emit an objective channel this "
-            "checkpoint never trained"
-        )
+    """Strictly load v16, or migrate a provably neutral v15 checkpoint."""
     try:
         if model_schema == MODEL_SCHEMA:
-            migrated = dict(state_dict)
-        elif model_schema == LEGACY_NO_OBJECTIVE_CHANNEL_SCHEMA:
-            # No parameters differ; the guard above is the whole migration.
             migrated = dict(state_dict)
         elif model_schema == LEGACY_NO_OBJECTIVE_RESIDUAL_SCHEMA:
             migrated, _ = _migrate_legacy_no_objective_residual_state_dict(
@@ -2110,9 +1902,7 @@ def migrate_constraint_field_optimizer_state_dict(
     config: dict | None,
 ) -> dict:
     """Align the v15 Adam parameter group after removing its dormant head."""
-    if model_schema in (MODEL_SCHEMA, LEGACY_NO_OBJECTIVE_CHANNEL_SCHEMA):
-        # The objective channel adds no parameters, so the Adam group is
-        # already aligned for a pre-objective-channel checkpoint.
+    if model_schema == MODEL_SCHEMA:
         return optimizer_state_dict
     if model_schema != LEGACY_NO_OBJECTIVE_RESIDUAL_SCHEMA:
         raise RuntimeError(f"unsupported model schema {model_schema!r}")
