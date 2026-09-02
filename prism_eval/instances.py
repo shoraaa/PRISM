@@ -38,6 +38,7 @@ from problem_data import (
     generate_vrpdbtw_data,
     generated_problem,
     load_saved_data,
+    problem_schema,
 )
 
 
@@ -67,8 +68,15 @@ def selected_variants(value: str) -> list[str]:
         return available
     if value == "ccl":
         return list(CCL_VARIANTS)
+    if value == "compact":
+        return list(COMPACT_SEEN_VARIANTS) + list(COMPACT_HELDOUT_VARIANTS)
     requested = [name.strip() for name in value.split(",") if name.strip()]
-    unknown = sorted(set(requested) - set(available) - set(OPTIONAL_VARIANTS))
+    unknown = sorted(
+        set(requested)
+        - set(available)
+        - set(OPTIONAL_VARIANTS)
+        - set(TRAIN_VARIANTS)
+    )
     if unknown:
         raise ValueError("unknown evaluator variants: " + ", ".join(unknown))
     if not requested:
@@ -81,11 +89,54 @@ SEEN_VARIANTS = frozenset(BENCHMARK_VARIANTS) & frozenset(TRAIN_VARIANTS)
 
 def variant_split(name: str) -> str:
     """Match training's seen/held-out boundary over the 110 benchmarks."""
+    if name in TRAIN_VARIANTS:
+        # Curriculum membership, not benchmark membership, is what makes a
+        # variant seen: vrptw is trained but its capacity-free form never
+        # appears in the 110, so the benchmark list alone would call it unseen.
+        return "seen"
     if name in OPTIONAL_VARIANTS:
         return "heldout"
     if name not in BENCHMARK_VARIANTS:
         raise ValueError(f"unknown benchmark variant: {name}")
-    return "seen" if name in SEEN_VARIANTS else "heldout"
+    return "heldout"
+
+
+# The compact selection: one 22-variant SEEN block beside one 22-variant
+# HELDOUT block, so a run reports both splits at a fraction of the cost of all
+# 110. SEEN is the training curriculum itself. HELDOUT takes the benchmark
+# variants the curriculum never contained, ranked so the hardest compositions
+# come first -- the held-out half then measures how far composition transfers
+# rather than how well single-resource problems are memorized.
+COMPACT_SEEN_VARIANTS = tuple(TRAIN_VARIANTS)
+
+
+def _composition_rank(name: str) -> tuple[int, int, str]:
+    """Order benchmarks by how much a single instance composes at once.
+
+    Simultaneously binding resources come first, then the structural modifiers
+    that change how those resources are enforced -- asymmetric distances, more
+    than one depot, and open routes -- with the name as a stable tiebreak.
+    """
+    schema = problem_schema(name)
+    structure = (
+        # Every "a"-prefixed benchmark is an asymmetric family.
+        name.startswith("a")
+        + (schema["depot_count"] > 1)
+        + schema["open_route"]
+    )
+    return (-len(schema["constraints"]), -structure, name)
+
+
+COMPACT_HELDOUT_VARIANTS = tuple(
+    sorted(
+        (
+            name
+            for name in BENCHMARK_VARIANTS
+            if variant_split(name) == "heldout"
+        ),
+        key=_composition_rank,
+    )[: len(COMPACT_SEEN_VARIANTS)]
+)
 
 
 def _instance_data(data: dict, index: int) -> dict:

@@ -20,6 +20,7 @@ SPEC.loader.exec_module(decoder_evaluation)
 
 from prism_eval import instances, methods, runner, summary  # noqa: E402
 from prism_eval.methods import oracle  # noqa: E402
+from prism_eval.methods import prism  # noqa: E402
 from prism_eval.methods.base import InProcessMethod, MethodRequest  # noqa: E402
 from prism_eval.methods.urs import UrsMethod  # noqa: E402
 from prism_eval.methods.ccl import CclMethod  # noqa: E402
@@ -716,3 +717,146 @@ def test_split_report_keeps_results_and_failures_separate() -> None:
     )
     assert comparison.method_wins == 1
     assert comparison.base_wins == 0
+
+
+def test_compact_pairs_the_curriculum_with_the_hardest_heldout_variants() -> None:
+    variants = instances.selected_variants("compact")
+    seen = [name for name in variants if instances.variant_split(name) == "seen"]
+    heldout = [
+        name for name in variants if instances.variant_split(name) == "heldout"
+    ]
+
+    assert len(seen) == 22
+    assert len(heldout) == 22
+    assert seen == list(instances.TRAIN_VARIANTS)
+    assert set(heldout) <= set(instances.BENCHMARK_VARIANTS)
+    assert not set(heldout) & set(instances.TRAIN_VARIANTS)
+
+    # Every five-resource benchmark is held out, so the unseen half must begin
+    # with all of them before any four-resource variant appears.
+    def resources(name: str) -> int:
+        return len(instances.problem_schema(name)["constraints"])
+
+    assert [resources(name) for name in heldout[:8]] == [5] * 8
+    assert max(
+        resources(name)
+        for name in instances.BENCHMARK_VARIANTS
+        if name not in heldout and name not in instances.TRAIN_VARIANTS
+    ) == 4
+
+
+def test_vrptw_is_seen_despite_being_outside_the_110() -> None:
+    assert "vrptw" in instances.TRAIN_VARIANTS
+    assert "vrptw" not in instances.BENCHMARK_VARIANTS
+    assert instances.selected_variants("vrptw") == ["vrptw"]
+    assert instances.variant_split("vrptw") == "seen"
+
+
+def test_several_checkpoints_become_several_prism_methods() -> None:
+    args = decoder_evaluation.parse_args(
+        [
+            "--checkpoint",
+            "pretrained/v15/best.pt",
+            "pretrained/only-ppo/best.pt",
+            "--methods",
+            "constant",
+        ]
+    )
+
+    assert args.checkpoint == [
+        Path("pretrained/v15/best.pt"),
+        Path("pretrained/only-ppo/best.pt"),
+    ]
+    checkpoints = [
+        prism.LoadedCheckpoint(name=name, path=path, model=object())
+        for name, path in zip(prism.method_names(args.checkpoint), args.checkpoint)
+    ]
+    built = methods.build(methods.resolve(args.methods), args, checkpoints)
+
+    # One method per checkpoint, PRISM's first, and the baseline unchanged.
+    assert [method.name for method in built] == [
+        "prism:v15",
+        "prism:only-ppo",
+        "constant",
+    ]
+    # Each carries its own checkpoint, so the config that stamps its rows --
+    # and therefore --resume and --cached compatibility -- is per checkpoint.
+    assert "pretrained/v15/best.pt" in built[0].config()
+    assert "pretrained/only-ppo/best.pt" in built[1].config()
+
+
+def test_one_checkpoint_keeps_the_bare_prism_method_name() -> None:
+    args = decoder_evaluation.parse_args(["--checkpoint", "model.pt"])
+    checkpoint = prism.LoadedCheckpoint(
+        name=prism.method_names(args.checkpoint)[0],
+        path=args.checkpoint[0],
+        model=object(),
+    )
+    built = methods.build(("prism",), args, checkpoint)
+
+    assert [method.name for method in built] == ["prism"]
+
+
+def test_checkpoints_are_named_by_the_path_parts_that_differ() -> None:
+    ablations = [
+        Path("pretrained/v15/best.pt"),
+        Path("pretrained/only-ppo/best.pt"),
+        Path("pretrained/no-semantic-loss/best.pt"),
+    ]
+    # The shared "pretrained" and "best" say nothing about which checkpoint a
+    # row came from, so only the ablation directory survives in the name.
+    assert prism.method_names(ablations) == [
+        "prism:v15",
+        "prism:only-ppo",
+        "prism:no-semantic-loss",
+    ]
+    # Epochs of one run are told apart by the file name instead.
+    assert prism.method_names(
+        [Path("pretrained/v15/best.pt"), Path("pretrained/v15/ep56.pt")]
+    ) == ["prism:best", "prism:ep56"]
+    # The same file twice would otherwise collapse two methods into one key.
+    assert prism.method_names([Path("a.pt"), Path("a.pt")]) == [
+        "prism:#0",
+        "prism:#1",
+    ]
+
+
+def test_cached_rows_never_reuse_any_checkpoint(tmp_path: Path) -> None:
+    path = tmp_path / "prior.csv"
+    with results.RowWriter(path) as writer:
+        writer.write(_row("prism", 0, 9.8))
+        writer.write(_row("prism:v15", 0, 9.9))
+        writer.write(_row("prism:only-ppo", 0, 9.7))
+        writer.write(_row("constant", 0, 11.0))
+
+    cached, present = results.load_cached_rows(path)
+
+    assert present == ("constant",)
+    assert list(cached) == [("cvrp", "constant")]
+
+
+def test_checkpoints_may_be_named_as_pretrained_runs() -> None:
+    pretrained = decoder_evaluation.PRETRAINED
+    runs = sorted(
+        entry.name
+        for entry in pretrained.iterdir()
+        if (entry / "best.pt").is_file()
+    )[:2]
+    if len(runs) < 2:
+        pytest.skip("needs two pretrained runs to compare")
+
+    # Comma-separated run names, which is how an ablation sweep is typed.
+    args = decoder_evaluation.parse_args(["--checkpoint", ",".join(runs)])
+
+    assert args.checkpoint == [pretrained / run / "best.pt" for run in runs]
+    assert prism.method_names(args.checkpoint) == [
+        f"prism:{run}" for run in runs
+    ]
+
+    # A path is still a path, whether or not it exists yet.
+    assert decoder_evaluation.parse_args(
+        ["--checkpoint", "model.pt"]
+    ).checkpoint == [Path("model.pt")]
+
+    with pytest.raises(SystemExit):
+        decoder_evaluation.parse_args(["--checkpoint", "not-a-pretrained-run"])

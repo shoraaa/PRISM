@@ -9,8 +9,10 @@ them next to PRISM is what makes that hard to break.
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, Sequence
 
 from train import infer_instance
 
@@ -18,6 +20,60 @@ from .base import InProcessMethod, MethodRequest, MethodResult
 
 
 NATIVE_CONTROL_NAMES = ("constant", "distance", "random")
+
+
+@dataclass(frozen=True)
+class LoadedCheckpoint:
+    """One checkpoint under test, already rebuilt into a model.
+
+    ``name`` is the method name every row of this checkpoint carries, so a run
+    comparing several of them is a group-by on the existing ``method`` column
+    rather than a second dimension in the schema.
+    """
+
+    name: str
+    path: Path
+    model: Any
+    epoch: Any = "unknown"
+
+
+def method_names(paths: Sequence[Path]) -> list[str]:
+    """Name one PRISM method per checkpoint, distinctly and readably.
+
+    A single checkpoint keeps the bare ``prism`` name, so existing CSVs,
+    ``--cached`` files and comparisons are unaffected. Several checkpoints are
+    named by the parts of their paths that actually differ, which is what makes
+    an ablation directory readable: ``pretrained/v15/best.pt`` and
+    ``pretrained/only-ppo/best.pt`` become ``prism:v15`` and
+    ``prism:only-ppo`` rather than two indistinguishable ``best``s.
+    """
+    if len(paths) == 1:
+        return ["prism"]
+    parts = [list(path.resolve().parts[:-1]) + [path.stem] for path in paths]
+    depth = max(len(part) for part in parts)
+    for candidate in range(1, depth + 1):
+        if len({tuple(part[-candidate:]) for part in parts}) == len(parts):
+            depth = candidate
+            break
+    # Pad on the left so shallower paths still align, then drop the components
+    # every checkpoint shares -- they say nothing about which one a row is from.
+    labels = [
+        [""] * (depth - len(part)) + part[-depth:] for part in parts
+    ]
+    kept = [
+        index
+        for index in range(depth)
+        if len({label[index] for label in labels}) > 1
+    ]
+    names = [
+        "prism:" + "-".join(label[index] for index in kept if label[index])
+        for label in labels
+    ]
+    if len(set(names)) != len(names):
+        # Only reachable when the same checkpoint is listed twice; an index
+        # keeps the method column a key rather than silently merging rows.
+        names = [f"{name}#{index}" for index, name in enumerate(names)]
+    return names
 
 
 def decoder_namespace(args: argparse.Namespace, seed: int) -> SimpleNamespace:
@@ -51,13 +107,15 @@ class PrismMethod(InProcessMethod):
 
     name = "prism"
 
-    def __init__(self, model, args: argparse.Namespace):
-        self.model = model
+    def __init__(self, checkpoint: LoadedCheckpoint, args: argparse.Namespace):
+        self.name = checkpoint.name
+        self.model = checkpoint.model
+        self.checkpoint = Path(checkpoint.path)
         self.args = args
         self._net_evals: list[float] = []
 
     def config(self) -> str:
-        checkpoint = Path(self.args.checkpoint).resolve()
+        checkpoint = self.checkpoint.resolve()
         try:
             stamp = checkpoint.stat().st_mtime_ns
         except OSError:
@@ -99,8 +157,9 @@ class PrismMethod(InProcessMethod):
     def on_progress(
         self, request: MethodRequest, index: int, objective: float, seconds: float
     ) -> None:
+        label = "PRISM" if self.name == "prism" else self.name
         print(
-            f"PRISM variant={request.batch.variant} "
+            f"{label} variant={request.batch.variant} "
             f"instance {index + 1}/{len(request.batch)} "
             f"objective={objective:.6g} "
             f"net_evals={self._net_evals[-1]} "

@@ -37,10 +37,17 @@ def _build_native(name: str):
     return build
 
 
-def _build_prism(args: argparse.Namespace, model) -> object:
-    from .prism import PrismMethod
+def _build_prism(args: argparse.Namespace, checkpoints) -> list[object]:
+    """One PRISM method per checkpoint under test.
 
-    return PrismMethod(model, args)
+    A run may hold several checkpoints -- comparing ablations is comparing
+    methods here -- so this is the one spec that builds a list.
+    """
+    from .prism import LoadedCheckpoint, PrismMethod
+
+    if isinstance(checkpoints, LoadedCheckpoint):
+        checkpoints = [checkpoints]
+    return [PrismMethod(checkpoint, args) for checkpoint in checkpoints]
 
 
 def _build_oracle(args: argparse.Namespace, _model) -> object:
@@ -101,7 +108,7 @@ REGISTRY: dict[str, MethodSpec] = {
     "prism": MethodSpec(
         name="prism",
         build=_build_prism,
-        help="the checkpoint under test",
+        help="the checkpoint(s) under test, one method each",
     ),
     "constant": MethodSpec(
         name="constant",
@@ -212,5 +219,13 @@ def resolve(selection: str) -> tuple[str, ...]:
 def build(
     names: tuple[str, ...], args: argparse.Namespace, model
 ) -> list[object]:
-    """Construct the selected methods in the order they will run."""
-    return [REGISTRY[name].build(args, model) for name in names]
+    """Construct the selected methods in the order they will run.
+
+    A spec may return several methods -- PRISM does, one per checkpoint under
+    test -- so the result is flattened rather than zipped to ``names``.
+    """
+    built: list[object] = []
+    for name in names:
+        made = REGISTRY[name].build(args, model)
+        built.extend(made) if isinstance(made, list) else built.append(made)
+    return built

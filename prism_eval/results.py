@@ -51,6 +51,15 @@ class Row:
 
 FIELDS: tuple[str, ...] = tuple(field.name for field in fields(Row))
 
+#: A run may measure several checkpoints at once, each under its own method
+#: name (``prism``, ``prism:v15``, ``prism:only-ppo``), so "is this PRISM?" is a
+#: prefix question rather than an equality.
+PRISM_METHOD = "prism"
+
+
+def is_prism(method: str) -> bool:
+    return method == PRISM_METHOD or method.startswith(PRISM_METHOD + ":")
+
 _NUMERIC = {"objective", "seconds", "reference"}
 _INTEGER = {"n", "seed", "instance", "feasible"}
 
@@ -250,7 +259,7 @@ def load_cached_rows(
     cached: dict[tuple[str, str], dict] = {}
     order: list[str] = []
     for row in read_rows(path):
-        if row.method == "prism" or not isinstance(row.objective, (int, float)):
+        if is_prism(row.method) or not isinstance(row.objective, (int, float)):
             continue
         if not isinstance(row.instance, int):
             continue

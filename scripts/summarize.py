@@ -17,7 +17,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from prism_eval import summary  # noqa: E402
-from prism_eval.results import Row, read_rows  # noqa: E402
+from prism_eval.results import Row, is_prism, read_rows  # noqa: E402
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -30,8 +30,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--base",
-        default="prism",
-        help="method every other method is compared against (default: prism)",
+        default=None,
+        help=(
+            "method every other method is compared against (default: the "
+            "first PRISM checkpoint in the file, which a multi-checkpoint run "
+            "names prism:<label> rather than prism)"
+        ),
     )
     parser.add_argument(
         "--methods",
@@ -51,10 +55,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def _filter(rows: list[Row], args: argparse.Namespace) -> list[Row]:
+def default_base(rows: list[Row]) -> str:
+    """The checkpoint every other method is measured against.
+
+    A run that compared several checkpoints has no method literally named
+    ``prism``, so the base is the first PRISM-family method the file mentions.
+    """
+    for row in rows:
+        if is_prism(row.method):
+            return row.method
+    return rows[0].method if rows else "prism"
+
+
+def _filter(rows: list[Row], args: argparse.Namespace, base: str) -> list[Row]:
     if args.methods:
         keep = {name.strip() for name in args.methods.split(",")}
-        keep.add(args.base)
+        keep.add(base)
         rows = [row for row in rows if row.method in keep]
     if args.variants:
         keep = {name.strip() for name in args.variants.split(",")}
@@ -92,13 +108,14 @@ def main(argv: list[str] | None = None) -> int:
     rows: list[Row] = []
     for path in args.csv:
         rows.extend(read_rows(path))
-    rows = _filter(rows, args)
+    base = args.base or default_base(rows)
+    rows = _filter(rows, args, base)
     if not rows:
         raise SystemExit("no rows selected")
-    summary.print_report(rows, base=args.base)
+    summary.print_report(rows, base=base)
     if args.table:
         print()
-        print_table(rows, args.base)
+        print_table(rows, base)
     return 0
 
 

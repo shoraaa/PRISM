@@ -332,11 +332,10 @@ def prism_energy_matrix(model, variant: str, data: dict, device: str) -> torch.T
         raise RuntimeError("PRISM candidate graph produced no edges")
     dense = np.where(valid, dense, dense[valid].max() + 1.0)
 
-    # exp(-z) turns "lower energy is better" into a positive DeepACO-style
+    # exp(-dense) turns "lower energy is better" into a positive DeepACO-style
     # heuristic without an arbitrary offset; z-scoring keeps the exponent in
     # a range that neither overflows nor collapses to a single value.
-    z = (dense - dense.mean()) / (dense.std() + 1.0e-9)
-    heuristic = np.exp(-z)
+    heuristic = np.exp(-dense)
 
     offset = _NODE_OFFSET[variant]
     heuristic = heuristic[offset:, offset:]

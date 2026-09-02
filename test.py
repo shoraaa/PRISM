@@ -2,7 +2,8 @@
 """Evaluate a trained field decoder on all 110 routing benchmarks.
 
 This file owns PRISM's side of a run and nothing else: the command line, the
-checkpoint, and the model rebuilt under the flags it was trained with. The
+checkpoints, and the models rebuilt under the flags they were trained with --
+several at once, so ablations are compared on identical instances. The
 harness around it lives in ``prism_eval`` -- where instances come from, how a
 measurement is recorded, how methods are registered and run, and how the report
 is aggregated -- so a new baseline is a module under ``prism_eval.methods``
@@ -39,34 +40,102 @@ from train import setup_seeds  # noqa: E402
 from prism_eval import methods, runner, summary  # noqa: E402
 from prism_eval.instances import InstanceBatch, selected_variants  # noqa: E402
 from prism_eval.methods import oracle  # noqa: E402
+from prism_eval.methods.prism import LoadedCheckpoint, method_names  # noqa: E402
 from prism_eval.results import RowWriter, load_cached_rows, read_rows  # noqa: E402
+
+
+PRETRAINED = ROOT / "pretrained"
+
+
+def resolve_checkpoints(tokens: list[str], error) -> list[Path]:
+    """Expand --checkpoint into paths, accepting run names from pretrained/.
+
+    Comparing ablations should not mean typing ``pretrained/<run>/best.pt``
+    once per run, so a token that is not already a path is looked up there:
+    ``only-ppo`` is ``pretrained/only-ppo/best.pt`` and ``v15/ep56`` is
+    ``pretrained/v15/ep56.pt``. Anything that exists, and anything named like a
+    checkpoint file, is taken literally, so a checkpoint kept anywhere else is
+    still addressed by its path.
+    """
+    resolved: list[Path] = []
+    for raw in tokens:
+        for token in raw.split(","):
+            token = token.strip()
+            if not token:
+                continue
+            path = Path(token)
+            if path.exists() or token.endswith(".pt"):
+                resolved.append(path)
+                continue
+            run = PRETRAINED / token
+            named = Path(f"{run}.pt")
+            if (run / "best.pt").is_file():
+                resolved.append(run / "best.pt")
+            elif named.is_file():
+                resolved.append(named)
+            else:
+                available = (
+                    sorted(
+                        entry.name
+                        for entry in PRETRAINED.iterdir()
+                        if (entry / "best.pt").is_file()
+                    )
+                    if PRETRAINED.is_dir()
+                    else []
+                )
+                error(
+                    f"unknown checkpoint {token!r}: no such path, and "
+                    f"{run / 'best.pt'} does not exist"
+                    + (
+                        "; runs under pretrained/: " + ", ".join(available)
+                        if available
+                        else ""
+                    )
+                )
+    if not resolved:
+        error("--checkpoint selected no checkpoints")
+    return resolved
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Measure a checkpoint against any registered method on the same "
-            "instances, over all 110 saved size-100 benchmark variants by "
-            "default, with separate SEEN and HELDOUT summaries."
+            "Measure one or more checkpoints against any registered method "
+            "on the same instances, over all 110 saved size-100 benchmark "
+            "variants by default, with separate SEEN and HELDOUT summaries."
         )
     )
-    parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument(
+        "--checkpoint",
+        required=True,
+        nargs="+",
+        metavar="CHECKPOINT",
+        help=(
+            "one or more checkpoints to measure on the same instances, given "
+            "as paths or as run names under pretrained/, space- or "
+            "comma-separated. Each becomes its own method (prism, or "
+            "prism:<label> when several are given), so comparing ablations is "
+            "a single run: --checkpoint only-ppo,no-semantic-loss,v15"
+        ),
+    )
     parser.add_argument(
         "--variants",
         default="all",
         help=(
-            "comma-separated names, 'all' for all 110 variants (default), or "
-            "'ccl' for the 48 symmetric single-/multi-depot VRP variants that "
-            "CCL-MTLVRP releases data for"
+            "comma-separated names, 'all' for all 110 variants (default), "
+            "'compact' for a 44-variant run -- the 22 trained variants beside "
+            "the 22 most heavily constrained held-out ones -- or 'ccl' for the "
+            "48 symmetric single-/multi-depot VRP variants that CCL-MTLVRP "
+            "releases data for"
         ),
     )
     parser.add_argument(
         "--iterations",
         type=int,
-        default=16,
-        help="post-bootstrap perturbation/SRR iterations (default: 16)",
+        default=10,
+        help="post-bootstrap perturbation/SRR iterations (default: 10)",
     )
-    parser.add_argument("--rollouts", type=int, default=32)
+    parser.add_argument("--rollouts", type=int, default=10)
     parser.add_argument("--candidates", type=int, default=64)
     parser.add_argument(
         "--min-changed-edges",
@@ -80,7 +149,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--srr-exploration-budget",
         type=int,
-        default=0,
+        default=10,
         help=(
             "Bounded uphill SRR exploration budget for PRISM. Native baselines "
             "receive zero unless --random-escape is enabled. Must match the "
@@ -263,6 +332,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--evrp-size must be positive")
     if args.vrpdb_size < 1:
         parser.error("--vrpdb-size must be positive")
+    args.checkpoint = resolve_checkpoints(args.checkpoint, parser.error)
     methods.validate_method_arguments(args, parser.error)
     if args.methods is None:
         args.methods = "cached" if args.cached is not None else "constant"
@@ -292,18 +362,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return args
 
 
-def main() -> int:
-    args = parse_args()
-    if args.iterations < 1:
-        raise ValueError("--iterations must be positive")
-    if args.val_size < 1:
-        raise ValueError("--val-size must be positive")
-    setup_seeds(args.seed)
-    prism_decoder.set_num_threads(args.threads)
-    logging.disable(logging.CRITICAL)
-
+def load_model(path: Path, args: argparse.Namespace):
+    """Rebuild one checkpoint's model, and report the epoch it stopped at."""
     checkpoint = torch.load(
-        args.checkpoint, map_location=args.device, weights_only=False
+        path, map_location=args.device, weights_only=False
     )
     # Reconstruct architecture-shaping flags from the training config so an
     # ablated checkpoint evaluates with the same architecture it was trained
@@ -360,6 +422,27 @@ def main() -> int:
         config=train_config,
     )
     model.eval()
+    return model, checkpoint.get("epoch", "unknown")
+
+
+def main() -> int:
+    args = parse_args()
+    if args.iterations < 1:
+        raise ValueError("--iterations must be positive")
+    if args.val_size < 1:
+        raise ValueError("--val-size must be positive")
+    setup_seeds(args.seed)
+    prism_decoder.set_num_threads(args.threads)
+    logging.disable(logging.CRITICAL)
+
+    checkpoints = [
+        LoadedCheckpoint(name=name, path=path, model=model, epoch=epoch)
+        for name, path, (model, epoch) in zip(
+            method_names(args.checkpoint),
+            args.checkpoint,
+            [load_model(path, args) for path in args.checkpoint],
+        )
+    ]
 
     finder = DatasetFinder(args.dataset_dir)
     variants = selected_variants(args.variants)
@@ -371,7 +454,7 @@ def main() -> int:
         selected = methods.resolve(",".join(cached_methods))
     else:
         selected = methods.resolve(args.methods)
-    active = methods.build(selected, args, model)
+    active = methods.build(selected, args, checkpoints)
     resume_rows = read_rows(args.csv) if args.resume else []
     if args.resume:
         resume_keys = [
@@ -398,9 +481,17 @@ def main() -> int:
             )
     print(
         "METHODS",
-        f"selected={','.join(selected)}",
+        f"selected={','.join(method.name for method in active)}",
         flush=True,
     )
+    for entry in checkpoints:
+        print(
+            "CHECKPOINT",
+            f"method={entry.name}",
+            f"path={entry.path}",
+            f"epoch={entry.epoch}",
+            flush=True,
+        )
 
     def reference_hook(name: str, batch: InstanceBatch) -> float | None:
         """Generated probes have no saved reference; solve one on request."""
@@ -427,13 +518,14 @@ def main() -> int:
 
     print(
         "RUN",
-        f"checkpoint={args.checkpoint}",
-        f"checkpoint_epoch={checkpoint.get('epoch', 'unknown')}",
+        f"checkpoints={len(checkpoints)}",
         f"variants={len(variants)}",
         f"val_size={args.val_size}",
         f"seconds={time.perf_counter() - started:.3f}",
     )
-    summary.print_report(rows)
+    # The first checkpoint listed is the run's base: every other method,
+    # including the other checkpoints, is compared against it.
+    summary.print_report(rows, base=checkpoints[0].name)
     if args.csv:
         print(f"CSV {args.csv}")
         if not any(isinstance(row.objective, (int, float)) for row in rows):
