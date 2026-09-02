@@ -115,6 +115,21 @@ LEGACY_OBJECTIVE_RESIDUAL_PREFIX = "objective_energy_residual_head."
 # with the constant 0.5, so a saturated all-ones marker is a value no resource
 # row carries under any of the descriptor ablations.
 OBJECTIVE_TOKEN_TYPE_VALUE = 1.0
+# Output scale of the objective channel, as `s * tanh(raw / s)`.
+#
+# The resource fields use a plain tanh because they are CORRECTIONS to a term of
+# row-RMS 1. The objective channel is not: it has to be able to reshape the
+# ranking itself. Measured against the field that reproduces DeepACO's trained
+# tsp100 heuristic inside PRISM's decoder, |target| exceeds 1 on 89.7% of edges,
+# 2 on 60.7%, 4 on 9.4% and 6 on 1.7% (max 8.46), and the target's mean
+# within-row std is 1.074 -- i.e. a plain tanh gives the channel a total range
+# about equal to one standard deviation of what a good field varies by within a
+# single candidate row. s=6 covers 98.3% of that target.
+#
+# The derivative of s*tanh(x/s) at 0 is 1 for every s, so initial training
+# dynamics are unchanged; only the saturation point moves. Still bounded, so the
+# decoder's exp(-beta * E) finiteness guard is unaffected.
+OBJECTIVE_FIELD_SCALE = 6.0
 # Reverse-leg travel, edge_features[4]. The objective channel receives it as its
 # "event" companion so an asymmetric instance can be priced from the arc pair
 # rather than from d(i, j) alone, which is all objective_edge_cost() reads.
@@ -1847,7 +1862,9 @@ class ConstraintFieldNet(nn.Module):
         # Signed, bounded, and exactly zero at init (field_head is zero-init),
         # so the decoder's energy at step 0 is the analytic objective it always
         # was. No edge_active mask: the objective is active on every problem.
-        objective_residual = torch.tanh(raw_objective)
+        objective_residual = OBJECTIVE_FIELD_SCALE * torch.tanh(
+            raw_objective / OBJECTIVE_FIELD_SCALE
+        )
 
         projected_graph = self.graph_projection(graph_embedding)
         if self.normalize_graph_projection:
