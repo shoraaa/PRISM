@@ -392,6 +392,11 @@ def load_model(path: Path, args: argparse.Namespace):
         index_embedded_resources=train_config.get(
             "index_embedded_resources", False
         ),
+        # Defaults False: a config without the key predates the objective
+        # channel, and its trained field head would emit an objective field it
+        # never learned. load_constraint_field_state_dict enforces the same
+        # pairing from the schema side.
+        objective_channel=train_config.get("objective_channel", False),
         # Forward-time only (pooling adds no parameters), so a missing flag
         # would silently evaluate a monolithic model with the per-resource
         # factorization it was never trained under.

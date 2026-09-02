@@ -79,6 +79,7 @@ def _incumbent(problem: dict) -> np.ndarray:
 def _guidance(output: dict) -> dict:
     return {
         "edge_field": output["residual"].detach().cpu().numpy(),
+        "objective_residual": output["objective_residual"].detach().cpu().numpy(),
         "multipliers": output["multipliers"][0].detach().cpu().numpy(),
         "coupler_weights": output["coupler_weights"][0].detach().cpu().numpy(),
         "coupler_bias": output["coupler_bias"][0].detach().cpu().numpy(),

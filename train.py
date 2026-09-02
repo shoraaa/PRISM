@@ -148,6 +148,11 @@ def replay_decision_logp_from_cpp_batch_trace(
         graph.objective_edge_costs.to(device)[global_edge]
         / objective_energy_scale[0]
     )
+    # The learned objective channel enters here or PPO never reaches it. On a
+    # bare tsp/atsp it is the ONLY term that depends on theta, so without this
+    # line logp is constant and the gradient is exactly zero -- which is what
+    # the analytic-only energy did to both variants.
+    objective_residual = output["objective_residual"][global_edge]
     channels = output["active_channels"].shape[-1]
     multiplier = model.couple(output, states)
     field_multiplier = multiplier[:, :channels]
@@ -155,19 +160,27 @@ def replay_decision_logp_from_cpp_batch_trace(
     if not field_enabled:
         field_multiplier = torch.zeros_like(field_multiplier)
         objective_weight = torch.ones_like(objective_weight)
-    # Match the native dimensionless energy contract. The exact normalized
-    # objective is the fixed anchor; only resource fields are learned.
+        # The fields-off control must carry no learned guidance at all, and the
+        # objective channel is learned guidance.
+        objective_residual = torch.zeros_like(objective_residual)
+    # Match the native dimensionless energy contract: the analytic objective is
+    # the anchor and the objective channel is a signed learned correction to it,
+    # both under the pinned objective weight.
     field_term = residual
-    energy = objective_weight.unsqueeze(1) * objective + (
-        field_multiplier.unsqueeze(1) * field_term
-    ).sum(dim=-1)
+    energy = objective_weight.unsqueeze(1) * (
+        objective + objective_residual
+    ) + (field_multiplier.unsqueeze(1) * field_term).sum(dim=-1)
     logits = (-float(beta) * energy).masked_fill(~valid, -torch.inf)
 
     chosen_edge = edge_offsets[current[selected]] + chosen[selected]
     chosen_field = output["residual"][chosen_edge]
+    chosen_objective_residual = output["objective_residual"][chosen_edge]
+    if not field_enabled:
+        chosen_objective_residual = torch.zeros_like(chosen_objective_residual)
     chosen_energy = objective_weight[selected] * (
         graph.objective_edge_costs.to(device)[chosen_edge]
         / objective_energy_scale[0]
+        + chosen_objective_residual
     ) + (field_multiplier[selected] * chosen_field).sum(dim=-1)
     step_logp = (
         -float(beta) * chosen_energy
@@ -211,11 +224,18 @@ def _guidance_numpy(
         # (slot FIELD_CHANNEL_COUNT) so neutral guidance is the plain objective.
         multipliers = multipliers.clone()
         multipliers[:-1] = 0.0
+    objective_residual = output["objective_residual"]
+    if not field_enabled:
+        objective_residual = torch.zeros_like(objective_residual)
     return {
         "edge_field": output["residual"].detach().cpu().numpy(),
         "multipliers": multipliers.detach().cpu().numpy(),
         "coupler_weights": output["coupler_weights"][0].detach().cpu().numpy(),
         "coupler_bias": output["coupler_bias"][0].detach().cpu().numpy(),
+        "objective_residual": objective_residual.detach()
+        .cpu()
+        .numpy()
+        .astype(np.float32),
     }
 
 
@@ -782,6 +802,10 @@ def _detached_output(
     for key in (
         "residual",
         "semantic_margin",
+        # The objective channel is a policy output like any other: left attached
+        # here it would keep the undetached graph alive, and the second
+        # autograd.backward() below would walk a graph the first one freed.
+        "objective_residual",
         "multipliers",
         "binding_logits",
         "coupler_weights",
@@ -2353,6 +2377,21 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--objective-channel",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Give the objective its own channel of the shared resource field"
+            " (default), so the objective's per-edge geometry is learned by the"
+            " same token/attention/field-head path as every constraint row."
+            " --no-objective-channel is the analytic-objective ablation: the"
+            " energy's objective term is the decoder's c(e)/s_obj alone, which"
+            " leaves tsp and atsp with no learned channel at all (their"
+            " resource registry is empty, so logp becomes constant in theta and"
+            " they contribute exactly zero gradient)."
+        ),
+    )
+    parser.add_argument(
         "--couple-state-multipliers",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -2626,6 +2665,7 @@ def main() -> None:
         normalize_projections=args.normalize_projections,
         pool_node_resources=args.resource_pooling,
         core_interface=args.core_interface,
+        objective_channel=args.objective_channel,
     ).to(args.device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
     start_epoch = 0
