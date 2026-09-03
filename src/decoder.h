@@ -903,7 +903,9 @@ private:
   void build_candidate_graph(const std::vector<int32_t> &incumbent,
                              std::vector<float> *edge_field = nullptr,
                              std::vector<float> *edge_additive = nullptr,
-                             std::vector<float> *objective_residual = nullptr);
+                             std::vector<float> *objective_residual = nullptr,
+                             std::vector<float> *coupler_weights = nullptr,
+                             std::vector<float> *coupler_bias = nullptr);
   std::vector<int32_t> rank_by_distance(int32_t from, int32_t limit) const;
   float objective_edge_cost(int32_t from, int32_t to) const;
   float resource_scale(int32_t channel) const;
@@ -983,7 +985,11 @@ private:
   std::vector<float> live_state_features(const State &state) const;
   std::vector<float> incumbent_state_features(int32_t current) const;
   bool incumbent_prefix_state(int32_t current, State &state) const;
-  double coupled_multiplier(int32_t channel, const float *multipliers,
+  // The coupled gain for one channel ON ONE EDGE. `edge` indexes the candidate
+  // graph the guidance was emitted for; a negative edge is off-graph and gets
+  // the uncoupled graph-level multiplier.
+  double coupled_multiplier(int32_t channel, int32_t edge,
+                            const float *multipliers,
                             const float *coupler_weights,
                             const float *coupler_bias,
                             const float *live_state) const;

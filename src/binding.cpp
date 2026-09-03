@@ -946,10 +946,11 @@ void parse_guidance(py::object edge_field, py::object edge_additive,
     coupler_weight_storage = coupler_weights.cast<
         py::array_t<float, py::array::c_style | py::array::forcecast>>();
     const py::buffer_info buffer = coupler_weight_storage.request();
-    if (buffer.ndim != 2 || buffer.shape[0] != multiplier_count ||
-        buffer.shape[1] != live_state_count) {
+    if (buffer.ndim != 3 || buffer.shape[0] != edge_count ||
+        buffer.shape[1] != multiplier_count ||
+        buffer.shape[2] != live_state_count) {
       throw std::invalid_argument(
-          "coupler_weights must have shape (multiplier_count, "
+          "coupler_weights must have shape (edge_count, multiplier_count, "
           "live_state_count)");
     }
     coupler_weight_values = static_cast<const float *>(buffer.ptr);
@@ -958,9 +959,10 @@ void parse_guidance(py::object edge_field, py::object edge_additive,
     coupler_bias_storage = coupler_bias.cast<
         py::array_t<float, py::array::c_style | py::array::forcecast>>();
     const py::buffer_info buffer = coupler_bias_storage.request();
-    if (buffer.ndim != 1 || buffer.shape[0] != multiplier_count) {
+    if (buffer.ndim != 2 || buffer.shape[0] != edge_count ||
+        buffer.shape[1] != multiplier_count) {
       throw std::invalid_argument(
-          "coupler_bias must have shape (multiplier_count,)");
+          "coupler_bias must have shape (edge_count, multiplier_count)");
     }
     coupler_bias_values = static_cast<const float *>(buffer.ptr);
   }

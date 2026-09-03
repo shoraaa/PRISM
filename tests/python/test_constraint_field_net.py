@@ -130,13 +130,25 @@ def test_constraint_field_net_uses_normalized_decoder_contract() -> None:
     field_multipliers = output["multipliers"][0, :channel_count]
     assert torch.all(field_multipliers[~active] == 0.0)
     assert output["multipliers"][0, -1] == 1.0
+    # The coupler is per edge, so the objective slot has to be uncoupled on
+    # EVERY edge, not just on one row.
     assert torch.equal(
-        output["coupler_weights"][0, -1],
-        torch.zeros_like(output["coupler_weights"][0, -1]),
+        output["coupler_weights"][:, -1],
+        torch.zeros_like(output["coupler_weights"][:, -1]),
     )
-    assert output["coupler_bias"][0, -1] == 0.0
+    assert torch.all(output["coupler_bias"][:, -1] == 0.0)
     live_state = torch.rand(5, channel_count)
-    assert torch.equal(model.couple(output, live_state)[:, -1], torch.ones(5))
+    edge_index = torch.zeros(5, dtype=torch.long)
+    assert torch.equal(
+        model.couple(output, live_state, edge_index)[:, -1], torch.ones(5)
+    )
+    # An off-graph transition has no coupler row and keeps the uncoupled
+    # multiplier.
+    off_graph = torch.full((5,), -1, dtype=torch.long)
+    assert torch.equal(
+        model.couple(output, live_state, off_graph),
+        output["multipliers"].expand(5, -1),
+    )
     # v14 deleted the risk channel: its head produced a value that was constant
     # within a graph, and a constant added to every candidate at a node cancels
     # in the comparison that picks one, so it could never change a decision.
@@ -563,17 +575,19 @@ def test_coupler_supports_states_from_multiple_graphs() -> None:
     # convenient synthetic one. Live state carries one value per registry row.
     channels = 3
     states = channels
+    edges = 4
     output = {
         "multipliers": torch.arange(2 * channels, dtype=torch.float32).view(
             2, channels
         ),
-        "coupler_weights": torch.zeros(2, channels, states),
-        "coupler_bias": torch.zeros(2, channels),
+        "coupler_weights": torch.zeros(edges, channels, states),
+        "coupler_bias": torch.zeros(edges, channels),
     }
     live_state = torch.zeros(3, states)
+    edge_index = torch.tensor([0, 2, 3])
     graph_index = torch.tensor([0, 1, 1])
 
-    coupled = model.couple(output, live_state, graph_index)
+    coupled = model.couple(output, live_state, edge_index, graph_index)
 
     assert torch.equal(coupled, output["multipliers"][graph_index])
 
@@ -648,9 +662,13 @@ def test_typed_field_accepts_unseen_runtime_resource_without_new_weights() -> No
     assert output["residual"].shape == (battery.metadata["edge_count"], resource_count)
     assert output["multipliers"].shape == (1, resource_count + 1)
     assert output["coupler_weights"].shape == (
-        1,
+        battery.metadata["edge_count"],
         resource_count + 1,
         resource_count,
+    )
+    assert output["coupler_bias"].shape == (
+        battery.metadata["edge_count"],
+        resource_count + 1,
     )
     assert torch.equal(output["residual"], renamed_output["residual"])
     assert torch.equal(output["multipliers"], renamed_output["multipliers"])
@@ -661,8 +679,8 @@ def test_typed_field_accepts_unseen_runtime_resource_without_new_weights() -> No
     traced = battery.sample_traced(
         edge_field=output["residual"].numpy(),
         multipliers=output["multipliers"][0].numpy(),
-        coupler_weights=output["coupler_weights"][0].numpy(),
-        coupler_bias=output["coupler_bias"][0].numpy(),
+        coupler_weights=output["coupler_weights"].numpy(),
+        coupler_bias=output["coupler_bias"].numpy(),
     )
     assert all(solution["feasible"] for solution in traced["solutions"])
     assert traced["trace"]["live_state"].shape[1] == resource_count
@@ -1186,8 +1204,8 @@ def test_cpp_trace_replays_exact_state_dependent_policy() -> None:
     traced = decoder.sample_traced(
         edge_field=output["residual"].detach().numpy(),
         multipliers=output["multipliers"][0].detach().numpy(),
-        coupler_weights=output["coupler_weights"][0].detach().numpy(),
-        coupler_bias=output["coupler_bias"][0].detach().numpy(),
+        coupler_weights=output["coupler_weights"].detach().numpy(),
+        coupler_bias=output["coupler_bias"].detach().numpy(),
     )
     trace = traced["trace"]
     replayed, decisions = replay_logp_from_cpp_batch_trace(

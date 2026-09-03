@@ -644,8 +644,8 @@ def test_policy_replay_uses_direct_field_not_analytic_pressure() -> None:
 
     class UnitCoupler:
         @staticmethod
-        def couple(_output, states):
-            return torch.ones(states.shape[0], channels + 1)
+        def couple(_output, states, edge_index):
+            return torch.ones(*edge_index.shape, channels + 1)
 
     logp, _, _ = replay_decision_logp_from_cpp_batch_trace(
         trace, graph, output, UnitCoupler(), beta=1.0
@@ -680,9 +680,9 @@ def test_policy_replay_is_objective_scale_and_resource_unit_invariant() -> None:
 
     class FixedCoupler:
         @staticmethod
-        def couple(_output, states):
+        def couple(_output, states, edge_index):
             weights = torch.cat((field_multipliers, torch.ones(1)))
-            return weights.unsqueeze(0).expand(states.shape[0], -1)
+            return weights.expand(*edge_index.shape, -1)
 
     def replay(objective_factor: float, resource_factor: float) -> torch.Tensor:
         graph = SimpleNamespace(
@@ -742,9 +742,9 @@ def test_policy_replay_resource_energy_is_channel_permutation_invariant() -> Non
         def __init__(self, values):
             self.values = values
 
-        def couple(self, _output, states):
+        def couple(self, _output, states, edge_index):
             weights = torch.cat((self.values, torch.ones(1)))
-            return weights.unsqueeze(0).expand(states.shape[0], -1)
+            return weights.expand(*edge_index.shape, -1)
 
     reference = replay_decision_logp_from_cpp_batch_trace(
         trace, graph, output, FixedCoupler(multipliers), beta=1.0

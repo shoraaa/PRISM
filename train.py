@@ -149,26 +149,34 @@ def replay_decision_logp_from_cpp_batch_trace(
         / objective_energy_scale[0]
     )
     channels = output["active_channels"].shape[-1]
-    multiplier = model.couple(output, states)
-    field_multiplier = multiplier[:, :channels]
-    objective_weight = multiplier[:, channels]
+    # The coupler is per edge, so every candidate at a decision gets its own
+    # gain rather than one gain for the whole graph: [decisions, candidates, C].
+    multiplier = model.couple(output, states, global_edge)
+    field_multiplier = multiplier[..., :channels]
+    objective_weight = multiplier[..., channels]
     if not field_enabled:
         field_multiplier = torch.zeros_like(field_multiplier)
         objective_weight = torch.ones_like(objective_weight)
     # Match the native dimensionless energy contract. The exact normalized
     # objective is the fixed anchor; only resource fields are learned.
     field_term = residual
-    energy = objective_weight.unsqueeze(1) * objective + (
-        field_multiplier.unsqueeze(1) * field_term
+    energy = objective_weight * objective + (
+        field_multiplier * field_term
     ).sum(dim=-1)
     logits = (-float(beta) * energy).masked_fill(~valid, -torch.inf)
 
     chosen_edge = edge_offsets[current[selected]] + chosen[selected]
     chosen_field = output["residual"][chosen_edge]
-    chosen_energy = objective_weight[selected] * (
+    chosen_multiplier = model.couple(output, states[selected], chosen_edge)
+    chosen_field_multiplier = chosen_multiplier[..., :channels]
+    chosen_objective_weight = chosen_multiplier[..., channels]
+    if not field_enabled:
+        chosen_field_multiplier = torch.zeros_like(chosen_field_multiplier)
+        chosen_objective_weight = torch.ones_like(chosen_objective_weight)
+    chosen_energy = chosen_objective_weight * (
         graph.objective_edge_costs.to(device)[chosen_edge]
         / objective_energy_scale[0]
-    ) + (field_multiplier[selected] * chosen_field).sum(dim=-1)
+    ) + (chosen_field_multiplier * chosen_field).sum(dim=-1)
     step_logp = (
         -float(beta) * chosen_energy
         - torch.logsumexp(logits[selected], dim=1)
@@ -214,8 +222,8 @@ def _guidance_numpy(
     return {
         "edge_field": output["residual"].detach().cpu().numpy(),
         "multipliers": multipliers.detach().cpu().numpy(),
-        "coupler_weights": output["coupler_weights"][0].detach().cpu().numpy(),
-        "coupler_bias": output["coupler_bias"][0].detach().cpu().numpy(),
+        "coupler_weights": output["coupler_weights"].detach().cpu().numpy(),
+        "coupler_bias": output["coupler_bias"].detach().cpu().numpy(),
     }
 
 
@@ -247,10 +255,12 @@ def _neutral_guidance(decoder) -> dict:
         ),
         "multipliers": multiplier_values,
         "coupler_weights": np.zeros(
-            (multipliers, channels),
+            (decoder.metadata["edge_count"], multipliers, channels),
             dtype=np.float32,
         ),
-        "coupler_bias": np.zeros(multipliers, dtype=np.float32),
+        "coupler_bias": np.zeros(
+            (decoder.metadata["edge_count"], multipliers), dtype=np.float32
+        ),
     }
 
 

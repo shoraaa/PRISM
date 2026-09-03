@@ -53,8 +53,8 @@ def neutral(dec):
         edge_field=np.zeros((edges, channels), np.float32),
         edge_additive=np.zeros((edges, channels), np.float32),
         multipliers=multipliers,
-        coupler_weights=np.zeros((slots, channels), np.float32),
-        coupler_bias=np.zeros(slots, np.float32),
+        coupler_weights=np.zeros((edges, slots, channels), np.float32),
+        coupler_bias=np.zeros((edges, slots), np.float32),
     )
 
 

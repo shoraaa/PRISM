@@ -377,8 +377,10 @@ class ExecutedBehaviorScorer:
 
     The edge arrays stay aligned to the graph on which the model was evaluated.
     Off-graph transitions receive neutral learned residuals, matching the native
-    contract.  Unlike the native SRR aggregate, couplers are evaluated at every
-    transition's replayed live state rather than once at a move anchor.
+    contract.  Couplers are per edge in both paths; this one evaluates them at
+    every transition's replayed live state, where the native SRR aggregate
+    freezes each edge at its own incumbent origin state so its prefix sums stay
+    additive.
     """
 
     def __init__(
@@ -422,19 +424,22 @@ class ExecutedBehaviorScorer:
         if self.multipliers.shape != (resources + 1,):
             raise ValueError(f"multipliers must have shape ({resources + 1},)")
         if coupler_weights is None:
-            self.coupler_weights = np.zeros((resources + 1, resources))
+            self.coupler_weights = np.zeros((edge_count, resources + 1, resources))
         else:
             self.coupler_weights = np.asarray(coupler_weights, dtype=np.float64)
         if coupler_bias is None:
-            self.coupler_bias = np.zeros(resources + 1)
+            self.coupler_bias = np.zeros((edge_count, resources + 1))
         else:
             self.coupler_bias = np.asarray(coupler_bias, dtype=np.float64)
-        if self.coupler_weights.shape != (resources + 1, resources):
+        if self.coupler_weights.shape != (edge_count, resources + 1, resources):
             raise ValueError(
-                "coupler_weights must have shape [resource_count + 1, resource_count]"
+                "coupler_weights must have shape "
+                "[edge_count, resource_count + 1, resource_count]"
             )
-        if self.coupler_bias.shape != (resources + 1,):
-            raise ValueError("coupler_bias must have shape [resource_count + 1]")
+        if self.coupler_bias.shape != (edge_count, resources + 1):
+            raise ValueError(
+                "coupler_bias must have shape [edge_count, resource_count + 1]"
+            )
         if not all(
             np.isfinite(values).all()
             for values in (
@@ -463,10 +468,16 @@ class ExecutedBehaviorScorer:
 
         self._frozen_context = execution
 
-    def _coupled_multiplier(self, slot: int, live_state: np.ndarray) -> float:
-        logit = float(self.coupler_bias[slot])
+    def _coupled_multiplier(
+        self, slot: int, edge: int | None, live_state: np.ndarray
+    ) -> float:
+        # An off-graph transition has no coupler row, exactly as it has no field
+        # row, so it keeps the uncoupled graph-level multiplier.
+        if edge is None:
+            return float(self.multipliers[slot])
+        logit = float(self.coupler_bias[edge, slot])
         if live_state.size:
-            logit += float(self.coupler_weights[slot] @ live_state)
+            logit += float(self.coupler_weights[edge, slot] @ live_state)
         # Numerically stable 2 * sigmoid(logit), matching the native decoder.
         if logit >= 0.0:
             modulation = 2.0 / (1.0 + math.exp(-logit))
@@ -518,10 +529,10 @@ class ExecutedBehaviorScorer:
                 / self.objective_energy_scale
                 + objective_residual
             )
-            energy += self._coupled_multiplier(resources, live) * objective
+            energy += self._coupled_multiplier(resources, edge, live) * objective
             if edge is not None and resources:
                 for row in range(resources):
-                    energy += self._coupled_multiplier(row, live) * float(
+                    energy += self._coupled_multiplier(row, edge, live) * float(
                         self.edge_field[edge, row]
                     )
         self._cache[execution.route] = energy
@@ -567,24 +578,54 @@ class ExecutedBehaviorScorer:
                     / self.distance_scale
                 )
 
-        residual = np.zeros((count, count), dtype=np.float64)
-        field = np.zeros((count, count, resources), dtype=np.float64)
-        for (origin, destination), edge in self.edge_lookup.items():
-            residual[origin, destination] = self.objective_residual[edge]
-            if resources:
-                field[origin, destination] = self.edge_field[edge]
-
         live = np.zeros((count, resources), dtype=np.float64)
         for origin, values in self._proxy_live_state(current).items():
             live[origin] = values
-        logits = self.coupler_bias[None, :] + live @ self.coupler_weights.T
-        modulation = 2.0 / (1.0 + np.exp(-np.clip(logits, -60.0, 60.0)))
-        weights = modulation * self.multipliers[None, :]
-        energy = weights[:, resources, None] * (
-            objective_cost / self.objective_energy_scale + residual
+
+        # Off-graph transitions carry no learned row at all -- no field, no
+        # residual, and (now that the coupler is per edge) no coupler either --
+        # so they keep the uncoupled objective weight. On-graph transitions are
+        # then overwritten below. Accumulating per edge rather than over a dense
+        # [count, count, C, R] coupler tensor also keeps this O(edges).
+        energy = float(self.multipliers[resources]) * (
+            objective_cost / self.objective_energy_scale
         )
-        if resources:
-            energy += np.einsum("ir,ijr->ij", weights[:, :resources], field)
+        if self.edge_lookup:
+            pairs = np.fromiter(
+                (
+                    value
+                    for pair in self.edge_lookup
+                    for value in pair
+                ),
+                dtype=np.int64,
+                count=2 * len(self.edge_lookup),
+            ).reshape(-1, 2)
+            edges = np.fromiter(
+                self.edge_lookup.values(),
+                dtype=np.int64,
+                count=len(self.edge_lookup),
+            )
+            origins = pairs[:, 0]
+            destinations = pairs[:, 1]
+            logits = self.coupler_bias[edges]
+            if resources:
+                logits = logits + np.einsum(
+                    "nr,ncr->nc", live[origins], self.coupler_weights[edges]
+                )
+            modulation = 2.0 / (1.0 + np.exp(-np.clip(logits, -60.0, 60.0)))
+            weights = modulation * self.multipliers[None, :]
+            edge_energy = weights[:, resources] * (
+                objective_cost[origins, destinations]
+                / self.objective_energy_scale
+                + self.objective_residual[edges]
+            )
+            if resources:
+                edge_energy = edge_energy + np.einsum(
+                    "nr,nr->n",
+                    weights[:, :resources],
+                    self.edge_field[edges],
+                )
+            energy[origins, destinations] = edge_energy
         self._proxy_matrix_cache[current.route] = energy
         return energy
 

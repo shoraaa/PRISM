@@ -227,8 +227,8 @@ def neutral_guidance(decoder) -> dict:
         "edge_field": np.zeros((edges, channels), dtype=np.float32),
         "edge_additive": np.zeros((edges, channels), dtype=np.float32),
         "multipliers": multipliers,
-        "coupler_weights": np.zeros((slots, channels), dtype=np.float32),
-        "coupler_bias": np.zeros(slots, dtype=np.float32),
+        "coupler_weights": np.zeros((edges, slots, channels), dtype=np.float32),
+        "coupler_bias": np.zeros((edges, slots), dtype=np.float32),
         "edge_risk": np.zeros(edges, dtype=np.float32),
         "risk_penalty": 0.0,
     }
@@ -291,8 +291,8 @@ def field_guidance(code, model, decoder, args) -> tuple[dict, object]:
         "edge_field": output["residual"].detach().cpu().numpy(),
         "edge_additive": output["additive"].detach().cpu().numpy(),
         "multipliers": output["multipliers"][0].detach().cpu().numpy(),
-        "coupler_weights": output["coupler_weights"][0].detach().cpu().numpy(),
-        "coupler_bias": output["coupler_bias"][0].detach().cpu().numpy(),
+        "coupler_weights": output["coupler_weights"].detach().cpu().numpy(),
+        "coupler_bias": output["coupler_bias"].detach().cpu().numpy(),
         "edge_risk": output["feasibility_risk"].detach().cpu().numpy(),
         "risk_penalty": float(args.risk_penalty),
     }
