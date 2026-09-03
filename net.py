@@ -458,7 +458,6 @@ def decode_iteration(
     decoder,
     model,
     device="cpu",
-    risk_penalty=10.0,
 ):
     """Run one model-guided perturbation on an installed incumbent graph."""
     if not decoder.best_solution["feasible"]:
@@ -473,11 +472,9 @@ def decode_iteration(
     solution = decoder.solve(
         1,
         edge_field=edge_field,
-
         multipliers=multipliers,
         coupler_weights=output["coupler_weights"][0].detach().cpu().numpy(),
         coupler_bias=output["coupler_bias"][0].detach().cpu().numpy(),
-        risk_penalty=0.0,
     )
     return solution, output
 
@@ -1155,12 +1152,13 @@ class ConstraintFieldNet(nn.Module):
         # The residual GNN's activations grow with depth, so `edge_projection`
         # and `graph_projection` emit values around |40| and |20|. Every head
         # that consumes them passes them through a tanh, which saturates
-        # completely: the field, risk and multiplier heads then see only the
+        # completely: the field and multiplier heads then see only the
         # SIGN pattern of their input, and the per-resource signals added to it
         # (|token| ~ 0.2-1.1, |resource_edge| ~ 0.5) are ~50x too small to move
         # any sign. Measured consequence: the per-edge field takes 1 distinct
-        # value across every edge of a pdtsp instance and 2 on cvrp, and the
-        # feasibility-risk head is constant to 1e-15.
+        # value across every edge of a pdtsp instance and 2 on cvrp. The
+        # since-deleted feasibility-risk head measured constant to 1e-15, which
+        # is how the collapse was first found.
         #
         # This is the same failure the objective head already documents and
         # fixes below with a parameter-free per-edge layer_norm; these two
@@ -1169,8 +1167,8 @@ class ConstraintFieldNet(nn.Module):
         # forward result differs, so test.py must read the flag rather than
         # assume it.
         # Split because the two projections feed different mechanisms and the
-        # evidence for normalizing them differs. `edge` feeds the field and risk
-        # heads, which were measurably collapsed (one distinct field value
+        # evidence for normalizing them differs. `edge` feeds the field
+        # head, which was measurably collapsed (one distinct field value
         # across a pdtsp instance). `graph` feeds the multiplier/binding/coupler
         # heads -- the state-dependent pricing path, which measurably works --
         # so normalizing it changes something that was not broken. "both" is the
@@ -1581,7 +1579,7 @@ class ConstraintFieldNet(nn.Module):
         if self.normalize_edge_projection:
             # Same normalization, same reason, as the objective head below --
             # see the note in __init__ for what saturating here costs the
-            # resource field and the feasibility-risk head.
+            # resource field.
             projected_edges = F.layer_norm(
                 projected_edges, (projected_edges.shape[-1],)
             )

@@ -859,18 +859,13 @@ def test_native_policy_is_invariant_to_positive_objective_rescaling() -> None:
 
     edge_count = reference_solver.metadata["edge_count"]
     objective_residual = np.linspace(-0.3, 0.3, edge_count, dtype=np.float32)
-    edge_risk = np.linspace(0.0, 0.2, edge_count, dtype=np.float32)
     reference = reference_solver.sample_traced(
         edge_field=np.zeros_like(reference_solver.resource_pressure),
         objective_residual=objective_residual,
-        edge_risk=edge_risk,
-        risk_penalty=0.7,
     )
     scaled = scaled_solver.sample_traced(
         edge_field=np.zeros_like(scaled_solver.resource_pressure),
         objective_residual=objective_residual,
-        edge_risk=edge_risk,
-        risk_penalty=0.7,
     )
     assert np.array_equal(
         reference["trace"]["chosen_indices"],
@@ -925,17 +920,13 @@ def test_srr_aggregate_comparison_uses_the_same_edge_energy() -> None:
     )
     field = rng.uniform(0.0, 2.0, shape).astype(np.float32)
     additive = rng.uniform(0.0, 0.2, shape).astype(np.float32)
-    risk = rng.uniform(0.0, 0.3, shape[0]).astype(np.float32)
     multipliers = np.zeros(ordinary_solver.metadata["multiplier_count"], dtype=np.float32)
     multipliers[0] = 1.3
     multipliers[-1] = 0.8
-    risk_penalty = 0.7
     ordinary = ordinary_solver.sample_greedy(
         edge_field=field,
         edge_additive=additive,
         multipliers=multipliers,
-        edge_risk=risk,
-        risk_penalty=risk_penalty,
     )
 
     # Scaling every term in E(e|s) by the same positive constant preserves all
@@ -947,75 +938,12 @@ def test_srr_aggregate_comparison_uses_the_same_edge_energy() -> None:
         edge_field=field,
         edge_additive=additive,
         multipliers=multipliers * scale,
-        edge_risk=risk,
-        risk_penalty=risk_penalty * scale,
     )
 
     assert ordinary["srr_moves"] > 0
     assert scaled["srr_moves"] == ordinary["srr_moves"]
     assert np.array_equal(scaled["route"], ordinary["route"])
     assert scaled["objective"] == ordinary["objective"]
-
-
-def test_lookahead_risk_labels_and_avoids_time_window_dead_end() -> None:
-    distance = np.array(
-        [
-            [0.0, 1.0, 1.0],
-            [1.0, 0.0, 10.0],
-            [1.0, 1.0, 0.0],
-        ],
-        dtype=np.float32,
-    )
-    problem = {
-        "name": "tsptw",
-        "distance": distance,
-        "tw_start": np.zeros(3, dtype=np.float32),
-        "tw_end": np.array([100.0, 5.0, 5.0], dtype=np.float32),
-    }
-
-    def make_solver() -> prism_decoder.Decoder:
-        solver = make_decoder(
-            problem,
-            search_config={
-                "feasibility_lookahead_depth": 1,
-            },
-            n_rollouts=1,
-        )
-        solver.seed(123)
-        return solver
-
-    solver = make_solver()
-    shape = (solver.metadata["edge_count"], solver.metadata["resource_count"])
-    multipliers = np.zeros(solver.metadata["multiplier_count"], dtype=np.float32)
-    multipliers[-1] = 1.0
-    guidance = {
-        "edge_field": np.ones(shape, dtype=np.float32),
-        "multipliers": multipliers,
-    }
-    traced = solver.sample_traced(**guidance)["trace"]
-    first_edges = traced["feasibility_edges"][:2]
-    first_labels = traced["feasibility_risk_labels"][:2]
-    destinations = solver.edge_index[1, first_edges]
-    labels_by_node = dict(zip(destinations.tolist(), first_labels.tolist()))
-
-    assert labels_by_node[1] == 1.0
-    assert labels_by_node[2] == 0.0
-
-    baseline = make_solver().sample_greedy(**guidance)
-    guided_solver = make_solver()
-    risk = np.zeros(guided_solver.metadata["edge_count"], dtype=np.float32)
-    risky_edge = np.flatnonzero(
-        (guided_solver.edge_index[0] == 0)
-        & (guided_solver.edge_index[1] == 1)
-    )[0]
-    risk[risky_edge] = 1.0
-    guided = guided_solver.sample_greedy(
-        **guidance, edge_risk=risk, risk_penalty=10.0
-    )
-
-    assert not baseline["feasible"]
-    assert guided["feasible"]
-    assert np.array_equal(guided["route"], np.array([0, 2, 1]))
 
 
 def test_directed_srr_improves_atsp_without_reversal() -> None:

@@ -541,9 +541,6 @@ struct DecisionTrace {
   std::vector<uint8_t> stochastic;
   std::vector<float> log_probabilities;
   std::vector<float> live_state;
-  std::vector<int32_t> feasibility_edges;
-  // Aligned with feasibility_edges.
-  std::vector<float> feasibility_risk_labels;
   std::vector<int32_t> screened_edges;
   std::vector<float> screened_resource_delta;
   int64_t screening_fast_evaluations = 0;
@@ -568,25 +565,19 @@ public:
                                const float *coupler_weights = nullptr,
                                const float *coupler_bias = nullptr,
                                const float *objective_residual = nullptr,
-                               const float *edge_risk = nullptr,
-                               float risk_penalty = 0.0f,
                                DecisionTrace *trace = nullptr);
   Solution sample_greedy(const float *edge_field = nullptr,
                          const float *edge_additive = nullptr,
                          const float *multipliers = nullptr,
                          const float *coupler_weights = nullptr,
                          const float *coupler_bias = nullptr,
-                         const float *objective_residual = nullptr,
-                         const float *edge_risk = nullptr,
-                         float risk_penalty = 0.0f) const;
+                         const float *objective_residual = nullptr) const;
   Solution solve(int32_t iterations, const float *edge_field = nullptr,
                  const float *edge_additive = nullptr,
                  const float *multipliers = nullptr,
                  const float *coupler_weights = nullptr,
                  const float *coupler_bias = nullptr,
-                 const float *objective_residual = nullptr,
-                 const float *edge_risk = nullptr,
-                 float risk_penalty = 0.0f);
+                 const float *objective_residual = nullptr);
   Solution evaluate(const std::vector<int32_t> &route) const;
   ResourceEvaluation
   evaluate_resources(const std::vector<int32_t> &route) const;
@@ -764,8 +755,6 @@ private:
     std::vector<uint8_t> stochastic;
     std::vector<float> log_probabilities;
     std::vector<float> live_state;
-    std::vector<int32_t> feasibility_edges;
-    std::vector<float> feasibility_risk_labels;
     std::vector<int32_t> screened_edges;
     std::vector<float> screened_resource_delta;
     int64_t screening_fast_evaluations = 0;
@@ -914,8 +903,7 @@ private:
   void build_candidate_graph(const std::vector<int32_t> &incumbent,
                              std::vector<float> *edge_field = nullptr,
                              std::vector<float> *edge_additive = nullptr,
-                             std::vector<float> *objective_residual = nullptr,
-                             std::vector<float> *edge_risk = nullptr);
+                             std::vector<float> *objective_residual = nullptr);
   std::vector<int32_t> rank_by_distance(int32_t from, int32_t limit) const;
   float objective_edge_cost(int32_t from, int32_t to) const;
   float resource_scale(int32_t channel) const;
@@ -991,9 +979,7 @@ private:
                          const float *multipliers,
                          const float *coupler_weights,
                          const float *coupler_bias,
-                         const float *objective_residual,
-                         const float *edge_risk,
-                         float risk_penalty) const;
+                         const float *objective_residual) const;
   std::vector<float> live_state_features(const State &state) const;
   std::vector<float> incumbent_state_features(int32_t current) const;
   bool incumbent_prefix_state(int32_t current, State &state) const;
@@ -1009,7 +995,6 @@ private:
                        int32_t chosen_index, bool stochastic,
                        float log_probability,
                        const std::vector<float> &live_state) const;
-  void record_feasibility_labels(RolloutTrace *trace, State &state) const;
   double field_score(int32_t from, int32_t to, int32_t edge,
                      const float *edge_field,
                      const float *edge_additive,
@@ -1024,9 +1009,7 @@ private:
                      const float *coupler_weights = nullptr,
                      const float *coupler_bias = nullptr,
                      const float *live_state = nullptr,
-                     const float *objective_residual = nullptr,
-                     const float *edge_risk = nullptr,
-                     float risk_penalty = 0.0f) const;
+                     const float *objective_residual = nullptr) const;
   int32_t find_edge(int32_t from, int32_t to) const;
   State initial_state(int32_t start_node) const;
   float depot_reload(const State &state) const;
@@ -1046,22 +1029,18 @@ private:
   bool has_feasible_lookahead(State &state, int32_t depth) const;
   bool feasible_after_lookahead_transition(State &state, int32_t next,
                                            int32_t depth) const;
-  float feasibility_risk_label(State &state, int32_t next) const;
   bool complete(const State &state) const;
   Solution finish(State state) const;
   Solution construct(uint64_t rollout_seed, const float *edge_field,
                      const float *edge_additive,
                      const float *multipliers,
                      const float *coupler_weights,
-                     const float *coupler_bias, const float *objective_residual,
-                     const float *edge_risk,
-                     float risk_penalty, RolloutTrace *trace,
+                     const float *coupler_bias, const float *objective_residual, RolloutTrace *trace,
                      bool greedy = false) const;
   Solution perturb(uint64_t rollout_seed, const float *edge_field,
                    const float *edge_additive, const float *multipliers,
                    const float *coupler_weights, const float *coupler_bias,
-                   const float *objective_residual, const float *edge_risk,
-                   float risk_penalty, RolloutTrace *trace,
+                   const float *objective_residual, RolloutTrace *trace,
                    bool greedy = false) const;
   Solution
   scope_restricted_refine(Solution solution,
@@ -1072,24 +1051,20 @@ private:
                           const float *coupler_weights,
                           const float *coupler_bias,
                           const float *objective_residual,
-                          const float *edge_risk, float risk_penalty,
                           RolloutTrace *trace, std::mt19937_64 &rng) const;
   int32_t select_next(State &state, std::mt19937_64 &rng,
                       const float *edge_field,
                       const float *edge_additive,
                       const float *multipliers,
                       const float *coupler_weights,
-                      const float *coupler_bias, const float *objective_residual,
-                      const float *edge_risk,
-                      float risk_penalty, RolloutTrace *trace,
+                      const float *coupler_bias, const float *objective_residual, RolloutTrace *trace,
                       bool greedy = false) const;
   std::vector<OrderedChoice>
   perturbation_order(int32_t current, const std::vector<uint8_t> &used,
                      std::mt19937_64 &rng, const float *edge_field,
                      const float *edge_additive, const float *multipliers,
                      const float *coupler_weights, const float *coupler_bias,
-                     const float *objective_residual, const float *edge_risk,
-                     float risk_penalty,
+                     const float *objective_residual,
                      bool greedy = false) const;
   std::vector<int32_t> changed_scope(const std::vector<int32_t> &source,
                                      const std::vector<int32_t> &candidate,

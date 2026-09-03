@@ -52,7 +52,6 @@ def test_resolved_settings_inherit_checkpoint_construction_contract() -> None:
                 "beta": 1.5,
                 "seed": 99,
                 "feasibility_lookahead_depth": 3,
-                "feasibility_risk_penalty": 2.0,
             }
         },
     )
@@ -62,7 +61,6 @@ def test_resolved_settings_inherit_checkpoint_construction_contract() -> None:
     assert settings.beta == 1.5
     assert settings.seed == 99
     assert settings.feasibility_lookahead_depth == 3
-    assert settings.risk_penalty == 2.0
 
 
 def _row(method: str, instance: int, rollout: int, feasible: bool, objective=10.0):

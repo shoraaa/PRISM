@@ -285,7 +285,6 @@ def _inference_namespace(problem: dict, iterations: int, seed: int, device: str)
         seed=seed,
         search_iterations=iterations,
         feasibility_lookahead_depth=2,
-        feasibility_risk_penalty=1.0,
         device=device,
         static_field=False,
         min_changed_edges=8,

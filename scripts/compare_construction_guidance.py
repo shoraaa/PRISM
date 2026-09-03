@@ -6,7 +6,7 @@ the same decoder problem, candidate graph, number of rollouts, and random seed;
 the only changed input is the candidate energy used by ``Decoder.sample``:
 
 ``learned``
-    The complete checkpoint field, including its feasibility-risk term.
+    The complete checkpoint field.
 ``heuristic``
     Normalized geometric/travel distance, with learned terms disabled.
 ``uniform``
@@ -140,12 +140,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="hard native lookahead shared by all methods (default: checkpoint value)",
     )
     parser.add_argument(
-        "--risk-penalty",
-        type=float,
-        default=None,
-        help="learned risk-energy weight (default: checkpoint value)",
-    )
-    parser.add_argument(
         "--seed",
         type=int,
         default=None,
@@ -259,11 +253,6 @@ def resolve_settings(
         feasibility_lookahead_depth=int(
             choose("feasibility_lookahead_depth", 2)
         ),
-        risk_penalty=float(
-            args.risk_penalty
-            if args.risk_penalty is not None
-            else config.get("feasibility_risk_penalty", 1.0)
-        ),
         device=args.device,
         min_changed_edges=1,  # unused because this diagnostic never invokes SRR
         random_escape=False,
@@ -277,19 +266,12 @@ def resolve_settings(
         raise ValueError("--beta must be finite and positive")
     if settings.feasibility_lookahead_depth < 0:
         raise ValueError("--feasibility-lookahead-depth must be nonnegative")
-    if not math.isfinite(settings.risk_penalty) or settings.risk_penalty < 0.0:
-        raise ValueError("--risk-penalty must be finite and nonnegative")
     return settings
 
 
 def _guidance(method: str, model, decoder, problem, settings) -> dict:
     if method == "learned":
-        return _field_guidance(
-            model,
-            decoder,
-            settings.device,
-            risk_penalty=settings.risk_penalty,
-        )
+        return _field_guidance(model, decoder, settings.device)
     if method == "heuristic":
         return _distance_guidance(decoder, problem)
     if method == "uniform":
@@ -604,7 +586,6 @@ def main(argv: list[str] | None = None) -> int:
         f"candidates={settings.candidates}",
         f"beta={settings.beta}",
         f"lookahead={settings.feasibility_lookahead_depth}",
-        f"risk_penalty={settings.risk_penalty}",
         f"seed={settings.seed}",
         "search=disabled",
     )
@@ -674,7 +655,6 @@ def main(argv: list[str] | None = None) -> int:
                 "candidates": settings.candidates,
                 "beta": settings.beta,
                 "feasibility_lookahead_depth": settings.feasibility_lookahead_depth,
-                "risk_penalty": settings.risk_penalty,
                 "seed": settings.seed,
                 "dataset_scale": args.dataset_scale,
                 "n_node": args.n_node,

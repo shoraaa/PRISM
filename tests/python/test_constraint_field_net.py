@@ -1231,12 +1231,6 @@ def test_cpp_trace_replays_exact_state_dependent_policy() -> None:
         (trace["screened_resource_delta"] >= 0.0)
         & (trace["screened_resource_delta"] <= 1.0)
     )
-    assert trace["feasibility_risk_labels"].shape == trace["feasibility_edges"].shape
-    assert np.all(
-        (trace["feasibility_risk_labels"] == 0.0)
-        | (trace["feasibility_risk_labels"] == 1.0)
-    )
-    assert trace["feasibility_risk_labels"].size > 0
 
 
 def test_tsp_model_uses_only_the_exact_objective() -> None:

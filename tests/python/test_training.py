@@ -639,7 +639,6 @@ def test_policy_replay_uses_direct_field_not_analytic_pressure() -> None:
     output = {
         "residual": residual,
         "additive": torch.zeros_like(residual),
-        "feasibility_risk": torch.zeros(2),
         "active_channels": active,
     }
 
@@ -675,7 +674,6 @@ def test_policy_replay_is_objective_scale_and_resource_unit_invariant() -> None:
     output = {
         "residual": residual,
         "additive": torch.flip(residual, dims=(1,)) / 5.0,
-        "feasibility_risk": torch.tensor([0.05, 0.15]),
         "active_channels": active,
     }
     field_multipliers = torch.linspace(0.1, 0.7, channels)
@@ -736,7 +734,6 @@ def test_policy_replay_resource_energy_is_channel_permutation_invariant() -> Non
     output = {
         "residual": residual,
         "additive": torch.zeros_like(residual),
-        "feasibility_risk": torch.zeros(2),
         "active_channels": torch.ones(1, channels),
     }
     multipliers = torch.linspace(0.1, 0.7, channels)

@@ -2401,9 +2401,7 @@ void RoutingDecoder::validate_guidance(const float *edge_field,
                                        const float *multipliers,
                                        const float *coupler_weights,
                                        const float *coupler_bias,
-                                       const float *objective_residual,
-                                       const float *edge_risk,
-                                       float risk_penalty) const {
+                                       const float *objective_residual) const {
   const size_t value_count =
       static_cast<size_t>(edge_count()) * resource_count();
   if (edge_field != nullptr) {
@@ -2451,19 +2449,6 @@ void RoutingDecoder::validate_guidance(const float *edge_field,
       if (!std::isfinite(objective_residual[edge])) {
         throw std::invalid_argument(
             "objective energy residuals must be finite");
-      }
-    }
-  }
-  if (!std::isfinite(risk_penalty) || risk_penalty < 0.0f) {
-    throw std::invalid_argument(
-        "feasibility risk penalty must be finite and non-negative");
-  }
-  if (edge_risk != nullptr) {
-    for (int32_t edge = 0; edge < edge_count(); ++edge) {
-      if (!std::isfinite(edge_risk[edge]) || edge_risk[edge] < 0.0f ||
-          edge_risk[edge] > 1.0f) {
-        throw std::invalid_argument(
-            "edge feasibility risk must be normalized to [0, 1]");
       }
     }
   }
@@ -2583,19 +2568,6 @@ void RoutingDecoder::record_decision(RolloutTrace *trace, int32_t current,
                            live_state.end());
 }
 
-void RoutingDecoder::record_feasibility_labels(RolloutTrace *trace,
-                                               State &state) const {
-  if (trace == nullptr)
-    return;
-  for (int32_t edge = edge_offsets_[state.current];
-       edge < edge_offsets_[state.current + 1]; ++edge) {
-    const int32_t node = edge_to_[edge];
-    trace->feasibility_edges.push_back(edge);
-    trace->feasibility_risk_labels.push_back(
-        legal_node(state, node) ? feasibility_risk_label(state, node) : 1.0f);
-  }
-}
-
 double RoutingDecoder::field_score(int32_t from, int32_t to, int32_t edge,
                                    const float *edge_field,
                                    const float *edge_additive,
@@ -2643,10 +2615,7 @@ double RoutingDecoder::edge_energy(int32_t from, int32_t to, int32_t edge,
                                    const float *coupler_weights,
                                    const float *coupler_bias,
                                    const float *live_state,
-                                   const float *objective_residual,
-                                   const float *edge_risk,
-                                   float risk_penalty) const {
-  const double risk = edge >= 0 && edge_risk != nullptr ? edge_risk[edge] : 0.0;
+                                   const float *objective_residual) const {
   const double learned_objective =
       edge >= 0 && objective_residual != nullptr ? objective_residual[edge]
                                                  : 0.0;
@@ -2657,15 +2626,14 @@ double RoutingDecoder::edge_energy(int32_t from, int32_t to, int32_t edge,
              (objective_edge_cost(from, to) / objective_energy_scale_ +
               learned_objective) +
          field_score(from, to, edge, edge_field, edge_additive, multipliers,
-                     coupler_weights, coupler_bias, live_state) +
-         risk_penalty * risk;
+                     coupler_weights, coupler_bias, live_state);
 }
 
 void RoutingDecoder::build_candidate_graph(const std::vector<int32_t> &incumbent,
                                            std::vector<float> *edge_field,
                                            std::vector<float> *edge_additive,
-                                           std::vector<float> *objective_residual,
-                                           std::vector<float> *edge_risk) {
+                                           std::vector<float>
+                                               *objective_residual) {
   const int32_t n = problem_.node_count;
   const int32_t k = std::min(candidate_config_.max_candidates, n - 1);
 
@@ -2674,15 +2642,12 @@ void RoutingDecoder::build_candidate_graph(const std::vector<int32_t> &incumbent
   std::vector<float> old_field;
   std::vector<float> old_additive;
   std::vector<float> old_residual;
-  std::vector<float> old_risk;
   if (edge_field != nullptr)
     old_field.swap(*edge_field);
   if (edge_additive != nullptr)
     old_additive.swap(*edge_additive);
   if (objective_residual != nullptr)
     old_residual.swap(*objective_residual);
-  if (edge_risk != nullptr)
-    old_risk.swap(*edge_risk);
 
   // The graph topology is deliberately geometric only. Depot connectivity is
   // the sole overlay because a depot may be required to close/reset a route
@@ -2761,8 +2726,6 @@ void RoutingDecoder::build_candidate_graph(const std::vector<int32_t> &incumbent
   }
   if (objective_residual != nullptr)
     objective_residual->assign(edge_to_.size(), 0.0f);
-  if (edge_risk != nullptr)
-    edge_risk->assign(edge_to_.size(), 0.0f);
   for (int32_t from = 0; from < n; ++from) {
     int32_t old_edge =
         old_offsets.size() == static_cast<size_t>(n + 1)
@@ -2820,9 +2783,6 @@ void RoutingDecoder::build_candidate_graph(const std::vector<int32_t> &incumbent
       if (objective_residual != nullptr && preserved &&
           static_cast<size_t>(old_edge) < old_residual.size())
         (*objective_residual)[edge] = old_residual[old_edge];
-      if (edge_risk != nullptr && preserved &&
-          static_cast<size_t>(old_edge) < old_risk.size())
-        (*edge_risk)[edge] = old_risk[old_edge];
     }
   }
   refresh_objective_energy_scale();
@@ -4144,14 +4104,6 @@ bool RoutingDecoder::feasible_after_lookahead_transition(
   return feasible;
 }
 
-float RoutingDecoder::feasibility_risk_label(State &state,
-                                             int32_t next) const {
-  return feasible_after_lookahead_transition(
-             state, next, search_config_.feasibility_lookahead_depth)
-             ? 0.0f
-             : 1.0f;
-}
-
 bool RoutingDecoder::complete(const State &state) const {
   if (problem_.depot_count == 0) {
     return state.visited_customers == problem_.customer_count();
@@ -4235,9 +4187,7 @@ int32_t RoutingDecoder::select_next(State &state,
                                     const float *coupler_weights,
                                     const float *coupler_bias,
                                     const float *objective_residual,
-                                    const float *edge_risk,
-                                    float risk_penalty, RolloutTrace *trace,
-                                    bool greedy) const {
+                                    RolloutTrace *trace, bool greedy) const {
   struct Choice {
     int32_t node;
     int32_t edge;
@@ -4293,7 +4243,6 @@ int32_t RoutingDecoder::select_next(State &state,
   }
   const std::vector<float> live_state =
       live_state_features(state);
-  record_feasibility_labels(trace, state);
   std::vector<int32_t> valid_indices;
   valid_indices.reserve(pool.size());
   for (const Choice &choice : pool) {
@@ -4319,7 +4268,7 @@ int32_t RoutingDecoder::select_next(State &state,
     const double energy = edge_energy(
         state.current, pool[index].node, edge, edge_field, edge_additive,
         multipliers, coupler_weights, coupler_bias, live_state.data(),
-        objective_residual, edge_risk, risk_penalty);
+        objective_residual);
     const double value = -beta_ * energy;
     log_weights[index] = value;
     maximum = std::max(maximum, value);
@@ -4360,9 +4309,7 @@ Solution RoutingDecoder::construct(uint64_t rollout_seed, const float *edge_fiel
                                    const float *coupler_weights,
                                    const float *coupler_bias,
                                    const float *objective_residual,
-                                   const float *edge_risk,
-                                   float risk_penalty, RolloutTrace *trace,
-                                   bool greedy) const {
+                                   RolloutTrace *trace, bool greedy) const {
   std::mt19937_64 rng(rollout_seed);
   int32_t start = 0;
   if (problem_.depot_count > 0) {
@@ -4376,7 +4323,7 @@ Solution RoutingDecoder::construct(uint64_t rollout_seed, const float *edge_fiel
   for (int32_t step = 0; step < max_steps && !complete(state); ++step) {
     const int32_t next = select_next(
         state, rng, edge_field, edge_additive, multipliers,
-        coupler_weights, coupler_bias, objective_residual, edge_risk, risk_penalty,
+        coupler_weights, coupler_bias, objective_residual,
         trace, greedy);
     if (next < 0) {
       Solution failed;
@@ -4411,8 +4358,6 @@ RoutingDecoder::perturbation_order(int32_t current,
                                    const float *coupler_weights,
                                    const float *coupler_bias,
                                    const float *objective_residual,
-                                   const float *edge_risk,
-                                   float risk_penalty,
                                    bool greedy) const {
   struct RankedChoice {
     int32_t node;
@@ -4435,8 +4380,7 @@ RoutingDecoder::perturbation_order(int32_t current,
     const double log_weight =
         -beta_ * edge_energy(current, node, edge, edge_field, edge_additive,
                              multipliers, coupler_weights, coupler_bias,
-                             live_state.data(), objective_residual, edge_risk,
-                             risk_penalty);
+                             live_state.data(), objective_residual);
     // Gumbel-top-k gives a weighted order without replacement.
     const double draw = greedy
                             ? std::exp(-1.0)
@@ -4535,7 +4479,7 @@ Solution RoutingDecoder::scope_restricted_refine(
     const float *edge_field, const float *edge_additive,
     const float *multipliers,
     const float *coupler_weights, const float *coupler_bias,
-    const float *objective_residual, const float *edge_risk, float risk_penalty,
+    const float *objective_residual,
     RolloutTrace *trace, std::mt19937_64 &rng) const {
   if (!search_config_.use_srr || !solution.feasible) {
     return solution;
@@ -4802,7 +4746,6 @@ Solution RoutingDecoder::scope_restricted_refine(
   struct GuidanceValue {
     double objective = 0.0;
     double objective_residual = 0.0;
-    double feasibility_risk = 0.0;
     std::vector<double> resource;
     explicit GuidanceValue(int32_t resource_count = 0)
         : resource(resource_count, 0.0) {}
@@ -4815,7 +4758,6 @@ Solution RoutingDecoder::scope_restricted_refine(
   const auto add_guidance = [&](GuidanceValue lhs, const GuidanceValue &rhs) {
     lhs.objective += rhs.objective;
     lhs.objective_residual += rhs.objective_residual;
-    lhs.feasibility_risk += rhs.feasibility_risk;
     lhs.resource.resize(resource_count(), 0.0);
     for (int32_t channel = 0; channel < resource_count(); ++channel)
       lhs.resource[channel] += channel < static_cast<int32_t>(rhs.resource.size())
@@ -4827,7 +4769,6 @@ Solution RoutingDecoder::scope_restricted_refine(
                                     const GuidanceValue &rhs) {
     lhs.objective -= rhs.objective;
     lhs.objective_residual -= rhs.objective_residual;
-    lhs.feasibility_risk -= rhs.feasibility_risk;
     lhs.resource.resize(resource_count(), 0.0);
     for (int32_t channel = 0; channel < resource_count(); ++channel)
       lhs.resource[channel] -= channel < static_cast<int32_t>(rhs.resource.size())
@@ -4841,8 +4782,6 @@ Solution RoutingDecoder::scope_restricted_refine(
     const int32_t edge = find_edge(from, to);
     value.objective_residual =
         edge >= 0 && objective_residual != nullptr ? objective_residual[edge] : 0.0;
-    value.feasibility_risk =
-        edge >= 0 && edge_risk != nullptr ? edge_risk[edge] : 0.0;
     for (int32_t channel = 0; channel < resource_count(); ++channel) {
       if (!resource(channel).active)
         continue;
@@ -4857,7 +4796,6 @@ Solution RoutingDecoder::scope_restricted_refine(
                         objective_multiplier(), multipliers, coupler_weights,
                         coupler_bias, live_state) *
                     value.objective / objective_energy_scale_;
-    result += risk_penalty * value.feasibility_risk;
     for (int32_t channel = 0; channel < resource_count(); ++channel) {
       if (resource(channel).active) {
         result += coupled_multiplier(channel, multipliers, coupler_weights,
@@ -6480,8 +6418,7 @@ Solution RoutingDecoder::scope_restricted_refine(
     const auto same_guidance = [&](const GuidanceValue &lhs,
                                    const GuidanceValue &rhs) {
       if (!close(lhs.objective, rhs.objective) ||
-          !close(lhs.objective_residual, rhs.objective_residual) ||
-          !close(lhs.feasibility_risk, rhs.feasibility_risk)) {
+          !close(lhs.objective_residual, rhs.objective_residual)) {
         return false;
       }
       for (int32_t channel = 0; channel < resource_count(); ++channel) {
@@ -6560,7 +6497,7 @@ Solution RoutingDecoder::scope_restricted_refine(
       ranking_energy[edge] = edge_energy(
           node, edge_to_[edge], edge, edge_field, edge_additive,
           multipliers, coupler_weights, coupler_bias, state.data(),
-          objective_residual, edge_risk, risk_penalty);
+          objective_residual);
     }
     std::stable_sort(
         ranked_local_edges.begin() + edge_offsets_[node],
@@ -7460,14 +7397,12 @@ Solution RoutingDecoder::perturb(uint64_t rollout_seed, const float *edge_field,
                                  const float *coupler_weights,
                                  const float *coupler_bias,
                                  const float *objective_residual,
-                                 const float *edge_risk,
-                                 float risk_penalty, RolloutTrace *trace,
-                                 bool greedy) const {
+                                 RolloutTrace *trace, bool greedy) const {
   const Solution source = evaluate(incumbent_route_);
   if (!source.feasible) {
     return construct(rollout_seed, edge_field, edge_additive, multipliers,
-                     coupler_weights, coupler_bias, objective_residual, edge_risk,
-                     risk_penalty, trace, greedy);
+                     coupler_weights, coupler_bias, objective_residual, trace,
+                     greedy);
   }
   std::mt19937_64 rng(rollout_seed);
   Solution raw = source;
@@ -7501,7 +7436,7 @@ Solution RoutingDecoder::perturb(uint64_t rollout_seed, const float *edge_field,
     bool accepted = false;
     const std::vector<OrderedChoice> order = perturbation_order(
         current, used, rng, edge_field, edge_additive, multipliers,
-        coupler_weights, coupler_bias, objective_residual, edge_risk, risk_penalty,
+        coupler_weights, coupler_bias, objective_residual,
         greedy);
     std::vector<int32_t> valid_indices;
     valid_indices.reserve(order.size());
@@ -7509,7 +7444,6 @@ Solution RoutingDecoder::perturb(uint64_t rollout_seed, const float *edge_field,
     const bool has_prefix =
         trace != nullptr && incumbent_prefix_state(current, prefix_state);
     if (has_prefix)
-      record_feasibility_labels(trace, prefix_state);
     for (const OrderedChoice &choice : order) {
       valid_indices.push_back(choice.local_index);
     }
@@ -7626,7 +7560,7 @@ Solution RoutingDecoder::perturb(uint64_t rollout_seed, const float *edge_field,
   Solution refined =
       scope_restricted_refine(raw, initial_scope, edge_field, edge_additive,
                               multipliers, coupler_weights, coupler_bias,
-                              objective_residual, edge_risk, risk_penalty, trace,
+                              objective_residual, trace,
                               rng);
   refined.raw_objective = raw.raw_objective;
   refined.changed_edges = raw.changed_edges;
@@ -7639,11 +7573,9 @@ std::vector<Solution> RoutingDecoder::sample(const float *edge_field,
                                              const float *coupler_weights,
                                              const float *coupler_bias,
                                              const float *objective_residual,
-                                             const float *edge_risk,
-                                             float risk_penalty,
                                              DecisionTrace *trace) {
   validate_guidance(edge_field, edge_additive, multipliers, coupler_weights,
-                    coupler_bias, objective_residual, edge_risk, risk_penalty);
+                    coupler_bias, objective_residual);
   std::vector<Solution> solutions(n_rollouts_);
   std::vector<RolloutTrace> rollout_traces(trace == nullptr ? 0 : n_rollouts_);
   // The per-row verification counter is sized by the registry, so it has to be
@@ -7662,12 +7594,11 @@ std::vector<Solution> RoutingDecoder::sample(const float *edge_field,
     solutions[rollout] =
         incumbent_route_.empty()
             ? construct(rollout_seed, edge_field, edge_additive, multipliers,
-                        coupler_weights, coupler_bias, objective_residual, edge_risk,
-                        risk_penalty, rollout_trace,
-                        rollout < std::max(1, n_rollouts_ / 2))
+                        coupler_weights, coupler_bias, objective_residual,
+                        rollout_trace, rollout < std::max(1, n_rollouts_ / 2))
             : perturb(rollout_seed, edge_field, edge_additive, multipliers,
-                      coupler_weights, coupler_bias, objective_residual, edge_risk,
-                      risk_penalty, rollout_trace);
+                      coupler_weights, coupler_bias, objective_residual,
+                      rollout_trace);
   }
   if (trace != nullptr) {
     *trace = DecisionTrace{};
@@ -7697,13 +7628,6 @@ std::vector<Solution> RoutingDecoder::sample(const float *edge_field,
                                       rollout.log_probabilities.end());
       trace->live_state.insert(trace->live_state.end(), rollout.live_state.begin(),
                                rollout.live_state.end());
-      trace->feasibility_edges.insert(trace->feasibility_edges.end(),
-                                      rollout.feasibility_edges.begin(),
-                                      rollout.feasibility_edges.end());
-      trace->feasibility_risk_labels.insert(
-          trace->feasibility_risk_labels.end(),
-          rollout.feasibility_risk_labels.begin(),
-          rollout.feasibility_risk_labels.end());
       trace->screened_edges.insert(trace->screened_edges.end(),
                                    rollout.screened_edges.begin(),
                                    rollout.screened_edges.end());
@@ -7737,18 +7661,17 @@ std::vector<Solution> RoutingDecoder::sample(const float *edge_field,
 Solution RoutingDecoder::sample_greedy(
     const float *edge_field, const float *edge_additive,
     const float *multipliers, const float *coupler_weights,
-    const float *coupler_bias, const float *objective_residual, const float *edge_risk,
-    float risk_penalty) const {
+    const float *coupler_bias, const float *objective_residual) const {
   validate_guidance(edge_field, edge_additive, multipliers, coupler_weights,
-                    coupler_bias, objective_residual, edge_risk, risk_penalty);
+                    coupler_bias, objective_residual);
   const uint64_t deterministic_seed = splitmix64(seed_);
   return incumbent_route_.empty()
              ? construct(deterministic_seed, edge_field, edge_additive,
-                         multipliers, coupler_weights, coupler_bias, objective_residual,
-                         edge_risk, risk_penalty, nullptr, true)
+                         multipliers, coupler_weights, coupler_bias,
+                         objective_residual, nullptr, true)
              : perturb(deterministic_seed, edge_field, edge_additive,
-                       multipliers, coupler_weights, coupler_bias, objective_residual,
-                       edge_risk, risk_penalty, nullptr, true);
+                       multipliers, coupler_weights, coupler_bias,
+                       objective_residual, nullptr, true);
 }
 
 bool RoutingDecoder::better(const Solution &lhs, const Solution &rhs) const {
@@ -7773,18 +7696,15 @@ Solution RoutingDecoder::solve(int32_t iterations, const float *edge_field,
                                const float *multipliers,
                                const float *coupler_weights,
                                const float *coupler_bias,
-                               const float *objective_residual,
-                               const float *edge_risk,
-                               float risk_penalty) {
+                               const float *objective_residual) {
   if (iterations <= 0) {
     throw std::invalid_argument("iterations must be positive");
   }
   validate_guidance(edge_field, edge_additive, multipliers, coupler_weights,
-                    coupler_bias, objective_residual, edge_risk, risk_penalty);
+                    coupler_bias, objective_residual);
   std::vector<float> working_field;
   std::vector<float> working_additive;
   std::vector<float> working_objective_residual;
-  std::vector<float> working_risk;
   if (edge_field != nullptr) {
     working_field.assign(
         edge_field,
@@ -7800,8 +7720,6 @@ Solution RoutingDecoder::solve(int32_t iterations, const float *edge_field,
   if (objective_residual != nullptr)
     working_objective_residual.assign(
         objective_residual, objective_residual + edge_to_.size());
-  if (edge_risk != nullptr)
-    working_risk.assign(edge_risk, edge_risk + edge_to_.size());
   for (int32_t iteration = 0; iteration < iterations; ++iteration) {
     std::vector<Solution> solutions = sample(
         working_field.empty() ? nullptr : working_field.data(),
@@ -7809,8 +7727,7 @@ Solution RoutingDecoder::solve(int32_t iterations, const float *edge_field,
         multipliers, coupler_weights, coupler_bias,
         working_objective_residual.empty()
             ? nullptr
-            : working_objective_residual.data(),
-        working_risk.empty() ? nullptr : working_risk.data(), risk_penalty);
+            : working_objective_residual.data());
     Solution iteration_best;
     for (const Solution &solution : solutions) {
       if (better(solution, iteration_best)) {
@@ -7831,8 +7748,7 @@ Solution RoutingDecoder::solve(int32_t iterations, const float *edge_field,
                                                      : &working_additive,
                             working_objective_residual.empty()
                                 ? nullptr
-                                : &working_objective_residual,
-                            working_risk.empty() ? nullptr : &working_risk);
+                                : &working_objective_residual);
     }
   }
   if (!best_solution_.feasible) {

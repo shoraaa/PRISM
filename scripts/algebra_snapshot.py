@@ -62,8 +62,6 @@ def neutral_guidance(decoder) -> dict:
         "multipliers": multipliers,
         "coupler_weights": np.zeros((slots, channels), dtype=np.float32),
         "coupler_bias": np.zeros(slots, dtype=np.float32),
-        "edge_risk": np.zeros(edges, dtype=np.float32),
-        "risk_penalty": 0.0,
     }
 
 

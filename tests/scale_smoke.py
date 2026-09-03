@@ -56,7 +56,6 @@ def main() -> None:
         seed=cli.seed,
         search_iterations=cli.search_iterations,
         feasibility_lookahead_depth=2,
-        feasibility_risk_penalty=10.0,
         device=cli.device,
     )
     started = time.perf_counter()

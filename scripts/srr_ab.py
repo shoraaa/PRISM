@@ -55,8 +55,6 @@ def neutral(dec):
         multipliers=multipliers,
         coupler_weights=np.zeros((slots, channels), np.float32),
         coupler_bias=np.zeros(slots, np.float32),
-        edge_risk=np.zeros(edges, np.float32),
-        risk_penalty=0.0,
     )
 
 
