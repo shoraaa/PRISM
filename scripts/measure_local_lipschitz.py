@@ -112,11 +112,7 @@ def probe_graph(model, graph, decoder, route, args, variant: str, instance: int)
         ]
         for edge in evenly_spaced(candidates, args.actions):
             live_state = graph.node_live_state[source].view(1, -1)
-            multipliers = model.couple(
-                output,
-                live_state,
-                torch.tensor([edge], device=live_state.device),
-            )[0, :resource_count]
+            multipliers = model.couple(output, live_state)[0, :resource_count]
             energy = (multipliers * output["residual"][edge]).sum()
             gradients = torch.autograd.grad(
                 energy,

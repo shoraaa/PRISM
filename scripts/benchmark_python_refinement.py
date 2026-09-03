@@ -80,8 +80,9 @@ def _guidance(output: dict) -> dict:
     return {
         "edge_field": output["residual"].detach().cpu().numpy(),
         "multipliers": output["multipliers"][0].detach().cpu().numpy(),
-        "coupler_weights": output["coupler_weights"].detach().cpu().numpy(),
-        "coupler_bias": output["coupler_bias"].detach().cpu().numpy(),
+        "edge_state_field": output["state_field"].detach().cpu().numpy(),
+        "coupler_weights": output["coupler_weights"][0].detach().cpu().numpy(),
+        "coupler_bias": output["coupler_bias"][0].detach().cpu().numpy(),
     }
 
 

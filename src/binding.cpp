@@ -885,6 +885,7 @@ py::dict solution_to_dict(const Solution &solution,
 }
 
 void parse_guidance(py::object edge_field, py::object edge_additive,
+                    py::object edge_state_field,
                     py::object multipliers,
                     py::object coupler_weights, py::object coupler_bias,
                     py::object objective_residual,
@@ -892,18 +893,21 @@ void parse_guidance(py::object edge_field, py::object edge_additive,
                     int32_t multiplier_count, int32_t live_state_count,
                     py::array_t<float> &field_storage,
                     py::array_t<float> &additive_storage,
+                    py::array_t<float> &state_field_storage,
                     py::array_t<float> &multiplier_storage,
                     py::array_t<float> &coupler_weight_storage,
                     py::array_t<float> &coupler_bias_storage,
                     py::array_t<float> &residual_storage,
                     const float *&field_values,
                     const float *&additive_values,
+                    const float *&state_field_values,
                     const float *&multiplier_values,
                     const float *&coupler_weight_values,
                     const float *&coupler_bias_values,
                     const float *&residual_values) {
   field_values = nullptr;
   additive_values = nullptr;
+  state_field_values = nullptr;
   multiplier_values = nullptr;
   coupler_weight_values = nullptr;
   coupler_bias_values = nullptr;
@@ -931,6 +935,19 @@ void parse_guidance(py::object edge_field, py::object edge_additive,
     }
     additive_values = static_cast<const float *>(additive_buffer.ptr);
   }
+  if (!edge_state_field.is_none()) {
+    state_field_storage = edge_state_field.cast<
+        py::array_t<float, py::array::c_style | py::array::forcecast>>();
+    const py::buffer_info buffer = state_field_storage.request();
+    if (buffer.ndim != 3 || buffer.shape[0] != edge_count ||
+        buffer.shape[1] != resource_count ||
+        buffer.shape[2] != live_state_count) {
+      throw std::invalid_argument(
+          "edge_state_field must have shape (edge_count, resource_count, "
+          "live_state_count)");
+    }
+    state_field_values = static_cast<const float *>(buffer.ptr);
+  }
   if (!multipliers.is_none()) {
     multiplier_storage = multipliers.cast<
         py::array_t<float, py::array::c_style | py::array::forcecast>>();
@@ -946,11 +963,10 @@ void parse_guidance(py::object edge_field, py::object edge_additive,
     coupler_weight_storage = coupler_weights.cast<
         py::array_t<float, py::array::c_style | py::array::forcecast>>();
     const py::buffer_info buffer = coupler_weight_storage.request();
-    if (buffer.ndim != 3 || buffer.shape[0] != edge_count ||
-        buffer.shape[1] != multiplier_count ||
-        buffer.shape[2] != live_state_count) {
+    if (buffer.ndim != 2 || buffer.shape[0] != multiplier_count ||
+        buffer.shape[1] != live_state_count) {
       throw std::invalid_argument(
-          "coupler_weights must have shape (edge_count, multiplier_count, "
+          "coupler_weights must have shape (multiplier_count, "
           "live_state_count)");
     }
     coupler_weight_values = static_cast<const float *>(buffer.ptr);
@@ -959,10 +975,9 @@ void parse_guidance(py::object edge_field, py::object edge_additive,
     coupler_bias_storage = coupler_bias.cast<
         py::array_t<float, py::array::c_style | py::array::forcecast>>();
     const py::buffer_info buffer = coupler_bias_storage.request();
-    if (buffer.ndim != 2 || buffer.shape[0] != edge_count ||
-        buffer.shape[1] != multiplier_count) {
+    if (buffer.ndim != 1 || buffer.shape[0] != multiplier_count) {
       throw std::invalid_argument(
-          "coupler_bias must have shape (edge_count, multiplier_count)");
+          "coupler_bias must have shape (multiplier_count,)");
     }
     coupler_bias_values = static_cast<const float *>(buffer.ptr);
   }
@@ -1037,36 +1052,41 @@ public:
                 parse_search_config(search_config), n_rollouts, beta) {}
 
   py::list sample(py::object edge_field, py::object edge_additive,
-                  py::object multipliers,
+                  py::object edge_state_field, py::object multipliers,
                   py::object coupler_weights, py::object coupler_bias,
                   py::object objective_residual) {
     py::array_t<float> field_storage;
     py::array_t<float> additive_storage;
+    py::array_t<float> state_field_storage;
     py::array_t<float> multiplier_storage;
     py::array_t<float> coupler_weight_storage;
     py::array_t<float> coupler_bias_storage;
     py::array_t<float> residual_storage;
     const float *field_values;
     const float *additive_values;
+    const float *state_field_values;
     const float *multiplier_values;
     const float *coupler_weight_values;
     const float *coupler_bias_values;
     const float *residual_values;
-    parse_guidance(edge_field, edge_additive, multipliers, coupler_weights,
+    parse_guidance(edge_field, edge_additive, edge_state_field, multipliers,
+                   coupler_weights,
                    coupler_bias, objective_residual, solver_.edge_count(),
                    solver_.resource_count(), solver_.multiplier_count(),
                    solver_.live_state_feature_count(),
                    field_storage,
-                   additive_storage, multiplier_storage,
+                   additive_storage, state_field_storage,
+                   multiplier_storage,
                    coupler_weight_storage, coupler_bias_storage, residual_storage,
                    field_values,
-                   additive_values, multiplier_values, coupler_weight_values,
+                   additive_values, state_field_values, multiplier_values,
+                   coupler_weight_values,
                    coupler_bias_values, residual_values);
     std::vector<Solution> solutions;
     {
       py::gil_scoped_release release;
       solutions = solver_.sample(field_values, additive_values,
-                                 multiplier_values,
+                                 state_field_values, multiplier_values,
                                  coupler_weight_values, coupler_bias_values,
                                  residual_values);
     }
@@ -1078,38 +1098,44 @@ public:
   }
 
   py::dict sample_traced(py::object edge_field, py::object edge_additive,
+                         py::object edge_state_field,
                          py::object multipliers,
                          py::object coupler_weights,
                          py::object coupler_bias,
                          py::object objective_residual) {
     py::array_t<float> field_storage;
     py::array_t<float> additive_storage;
+    py::array_t<float> state_field_storage;
     py::array_t<float> multiplier_storage;
     py::array_t<float> coupler_weight_storage;
     py::array_t<float> coupler_bias_storage;
     py::array_t<float> residual_storage;
     const float *field_values;
     const float *additive_values;
+    const float *state_field_values;
     const float *multiplier_values;
     const float *coupler_weight_values;
     const float *coupler_bias_values;
     const float *residual_values;
-    parse_guidance(edge_field, edge_additive, multipliers, coupler_weights,
+    parse_guidance(edge_field, edge_additive, edge_state_field, multipliers,
+                   coupler_weights,
                    coupler_bias, objective_residual, solver_.edge_count(),
                    solver_.resource_count(), solver_.multiplier_count(),
                    solver_.live_state_feature_count(),
                    field_storage,
-                   additive_storage, multiplier_storage,
+                   additive_storage, state_field_storage,
+                   multiplier_storage,
                    coupler_weight_storage, coupler_bias_storage, residual_storage,
                    field_values,
-                   additive_values, multiplier_values, coupler_weight_values,
+                   additive_values, state_field_values, multiplier_values,
+                   coupler_weight_values,
                    coupler_bias_values, residual_values);
     std::vector<Solution> solutions;
     DecisionTrace trace;
     {
       py::gil_scoped_release release;
       solutions = solver_.sample(field_values, additive_values,
-                                 multiplier_values,
+                                 state_field_values, multiplier_values,
                                  coupler_weight_values, coupler_bias_values,
                                  residual_values,
                                  &trace);
@@ -1126,72 +1152,85 @@ public:
   }
 
   py::dict sample_greedy(py::object edge_field, py::object edge_additive,
+                         py::object edge_state_field,
                          py::object multipliers, py::object coupler_weights,
                          py::object coupler_bias,
                          py::object objective_residual) {
     py::array_t<float> field_storage;
     py::array_t<float> additive_storage;
+    py::array_t<float> state_field_storage;
     py::array_t<float> multiplier_storage;
     py::array_t<float> coupler_weight_storage;
     py::array_t<float> coupler_bias_storage;
     py::array_t<float> residual_storage;
     const float *field_values;
     const float *additive_values;
+    const float *state_field_values;
     const float *multiplier_values;
     const float *coupler_weight_values;
     const float *coupler_bias_values;
     const float *residual_values;
-    parse_guidance(edge_field, edge_additive, multipliers, coupler_weights,
+    parse_guidance(edge_field, edge_additive, edge_state_field, multipliers,
+                   coupler_weights,
                    coupler_bias, objective_residual, solver_.edge_count(),
                    solver_.resource_count(), solver_.multiplier_count(),
                    solver_.live_state_feature_count(),
                    field_storage,
-                   additive_storage, multiplier_storage,
+                   additive_storage, state_field_storage,
+                   multiplier_storage,
                    coupler_weight_storage, coupler_bias_storage, residual_storage,
                    field_values,
-                   additive_values, multiplier_values, coupler_weight_values,
+                   additive_values, state_field_values, multiplier_values,
+                   coupler_weight_values,
                    coupler_bias_values, residual_values);
     Solution solution;
     {
       py::gil_scoped_release release;
       solution = solver_.sample_greedy(
-          field_values, additive_values, multiplier_values,
+          field_values, additive_values, state_field_values, multiplier_values,
           coupler_weight_values, coupler_bias_values, residual_values);
     }
     return solution_to_dict(solution, solver_.problem().objective);
   }
 
   py::dict solve(int32_t iterations, py::object edge_field,
-                 py::object edge_additive, py::object multipliers,
+                 py::object edge_additive, py::object edge_state_field,
+                 py::object multipliers,
                  py::object coupler_weights,
                  py::object coupler_bias, py::object objective_residual) {
     py::array_t<float> field_storage;
     py::array_t<float> additive_storage;
+    py::array_t<float> state_field_storage;
     py::array_t<float> multiplier_storage;
     py::array_t<float> coupler_weight_storage;
     py::array_t<float> coupler_bias_storage;
     py::array_t<float> residual_storage;
     const float *field_values;
     const float *additive_values;
+    const float *state_field_values;
     const float *multiplier_values;
     const float *coupler_weight_values;
     const float *coupler_bias_values;
     const float *residual_values;
-    parse_guidance(edge_field, edge_additive, multipliers, coupler_weights,
+    parse_guidance(edge_field, edge_additive, edge_state_field, multipliers,
+                   coupler_weights,
                    coupler_bias, objective_residual, solver_.edge_count(),
                    solver_.resource_count(), solver_.multiplier_count(),
                    solver_.live_state_feature_count(),
                    field_storage,
-                   additive_storage, multiplier_storage,
+                   additive_storage, state_field_storage,
+                   multiplier_storage,
                    coupler_weight_storage, coupler_bias_storage, residual_storage,
                    field_values,
-                   additive_values, multiplier_values, coupler_weight_values,
+                   additive_values, state_field_values, multiplier_values,
+                   coupler_weight_values,
                    coupler_bias_values, residual_values);
     Solution solution;
     {
       py::gil_scoped_release release;
       solution = solver_.solve(
-          iterations, field_values, additive_values, multiplier_values,
+          iterations, field_values, additive_values, state_field_values,
+          multiplier_values,
           coupler_weight_values, coupler_bias_values, residual_values);
     }
     return solution_to_dict(solution, solver_.problem().objective);
@@ -1700,6 +1739,7 @@ PYBIND11_MODULE(prism_decoder, module) {
       .def("sample", &PyDecoder::sample,
            py::arg("edge_field") = py::none(),
            py::arg("edge_additive") = py::none(),
+           py::arg("edge_state_field") = py::none(),
            py::arg("multipliers") = py::none(),
            py::arg("coupler_weights") = py::none(),
            py::arg("coupler_bias") = py::none(),
@@ -1707,6 +1747,7 @@ PYBIND11_MODULE(prism_decoder, module) {
       .def("sample_traced", &PyDecoder::sample_traced,
            py::arg("edge_field") = py::none(),
            py::arg("edge_additive") = py::none(),
+           py::arg("edge_state_field") = py::none(),
            py::arg("multipliers") = py::none(),
            py::arg("coupler_weights") = py::none(),
            py::arg("coupler_bias") = py::none(),
@@ -1714,6 +1755,7 @@ PYBIND11_MODULE(prism_decoder, module) {
       .def("sample_greedy", &PyDecoder::sample_greedy,
            py::arg("edge_field") = py::none(),
            py::arg("edge_additive") = py::none(),
+           py::arg("edge_state_field") = py::none(),
            py::arg("multipliers") = py::none(),
            py::arg("coupler_weights") = py::none(),
            py::arg("coupler_bias") = py::none(),
@@ -1721,6 +1763,7 @@ PYBIND11_MODULE(prism_decoder, module) {
       .def("solve", &PyDecoder::solve, py::arg("iterations"),
            py::arg("edge_field") = py::none(),
            py::arg("edge_additive") = py::none(),
+           py::arg("edge_state_field") = py::none(),
            py::arg("multipliers") = py::none(),
            py::arg("coupler_weights") = py::none(),
            py::arg("coupler_bias") = py::none(),

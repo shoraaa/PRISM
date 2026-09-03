@@ -2398,6 +2398,7 @@ float RoutingDecoder::resource_pressure_of(const ResourceSpec &spec,
 
 void RoutingDecoder::validate_guidance(const float *edge_field,
                                        const float *edge_additive,
+                                       const float *edge_state_field,
                                        const float *multipliers,
                                        const float *coupler_weights,
                                        const float *coupler_bias,
@@ -2428,9 +2429,19 @@ void RoutingDecoder::validate_guidance(const float *edge_field,
       }
     }
   }
+  if (edge_state_field != nullptr) {
+    const size_t count = static_cast<size_t>(edge_count()) * resource_count() *
+                         live_state_feature_count();
+    for (size_t index = 0; index < count; ++index) {
+      if (!std::isfinite(edge_state_field[index])) {
+        throw std::invalid_argument(
+            "state-conditioned field values must be finite");
+      }
+    }
+  }
   if (coupler_weights != nullptr) {
-    const size_t count = static_cast<size_t>(edge_count()) *
-                         multiplier_count() * live_state_feature_count();
+    const size_t count =
+        static_cast<size_t>(multiplier_count()) * live_state_feature_count();
     for (size_t index = 0; index < count; ++index) {
       if (!std::isfinite(coupler_weights[index])) {
         throw std::invalid_argument("coupler weights must be finite");
@@ -2438,10 +2449,8 @@ void RoutingDecoder::validate_guidance(const float *edge_field,
     }
   }
   if (coupler_bias != nullptr) {
-    const size_t count =
-        static_cast<size_t>(edge_count()) * multiplier_count();
-    for (size_t index = 0; index < count; ++index) {
-      if (!std::isfinite(coupler_bias[index])) {
+    for (int32_t channel = 0; channel < multiplier_count(); ++channel) {
+      if (!std::isfinite(coupler_bias[channel])) {
         throw std::invalid_argument("coupler bias must be finite");
       }
     }
@@ -2528,28 +2537,18 @@ bool RoutingDecoder::incumbent_prefix_state(int32_t current,
 }
 
 double RoutingDecoder::coupled_multiplier(
-    int32_t channel, int32_t edge, const float *multipliers,
-    const float *coupler_weights, const float *coupler_bias,
-    const float *live_state) const {
+    int32_t channel, const float *multipliers, const float *coupler_weights,
+    const float *coupler_bias, const float *live_state) const {
   const double base = multipliers == nullptr ? 1.0 : multipliers[channel];
-  // The coupler is a per-EDGE gain, so an off-graph transition has no row to
-  // read and stays at the graph-level multiplier. This matches the field, which
-  // is likewise neutral off-graph: both learned terms are aligned to the
-  // candidate graph the model was evaluated on.
-  if (edge < 0 || live_state == nullptr ||
+  if (live_state == nullptr ||
       (coupler_weights == nullptr && coupler_bias == nullptr)) {
     return base;
   }
-  double logit =
-      coupler_bias == nullptr
-          ? 0.0
-          : coupler_bias[static_cast<size_t>(edge) * multiplier_count() +
-                         channel];
+  double logit = coupler_bias == nullptr ? 0.0 : coupler_bias[channel];
   if (coupler_weights != nullptr) {
-    const float *weights =
-        coupler_weights +
-        (static_cast<size_t>(edge) * multiplier_count() + channel) *
-            live_state_feature_count();
+    const float *weights = coupler_weights +
+                           static_cast<size_t>(channel) *
+                               live_state_feature_count();
     for (int32_t feature = 0; feature < live_state_feature_count(); ++feature)
       logit += weights[feature] * live_state[feature];
   }
@@ -2557,6 +2556,27 @@ double RoutingDecoder::coupled_multiplier(
       logit >= 0.0 ? 2.0 / (1.0 + std::exp(-logit))
                    : 2.0 * std::exp(logit) / (1.0 + std::exp(logit));
   return base * modulation;
+}
+
+// The per-edge half of the learned live-state response. It is deliberately
+// LINEAR in the live state: the SRR aggregate is a set of prefix sums built
+// once and queried at many anchors, and only a term of this shape lets the
+// anchor's state factor out of a sum over edges. A per-edge sigmoid gain would
+// force the state to be frozen at aggregate-build time, which is exactly the
+// anchor-varying behaviour we want to keep.
+double RoutingDecoder::resource_state_field_value(
+    int32_t edge, int32_t channel, const float *edge_state_field,
+    const float *live_state) const {
+  if (edge < 0 || edge_state_field == nullptr || live_state == nullptr)
+    return 0.0;
+  const float *row =
+      edge_state_field +
+      (static_cast<size_t>(edge) * resource_count() + channel) *
+          live_state_feature_count();
+  double total = 0.0;
+  for (int32_t feature = 0; feature < live_state_feature_count(); ++feature)
+    total += row[feature] * live_state[feature];
+  return total;
 }
 
 void RoutingDecoder::record_decision(RolloutTrace *trace, int32_t current,
@@ -2583,6 +2603,7 @@ void RoutingDecoder::record_decision(RolloutTrace *trace, int32_t current,
 double RoutingDecoder::field_score(int32_t from, int32_t to, int32_t edge,
                                    const float *edge_field,
                                    const float *edge_additive,
+                                   const float *edge_state_field,
                                    const float *multipliers,
                                    const float *coupler_weights,
                                    const float *coupler_bias,
@@ -2592,10 +2613,13 @@ double RoutingDecoder::field_score(int32_t from, int32_t to, int32_t edge,
     if (!resource(channel).active)
       continue;
     const double multiplier = coupled_multiplier(
-        channel, edge, multipliers, coupler_weights, coupler_bias, live_state);
+        channel, multipliers, coupler_weights, coupler_bias, live_state);
     result += multiplier * resource_field_value(
                                from, to, edge, channel, edge_field,
                                edge_additive);
+    const double base = multipliers == nullptr ? 1.0 : multipliers[channel];
+    result += base * resource_state_field_value(edge, channel, edge_state_field,
+                                                live_state);
   }
   return result;
 }
@@ -2623,6 +2647,7 @@ double RoutingDecoder::resource_field_value(
 double RoutingDecoder::edge_energy(int32_t from, int32_t to, int32_t edge,
                                    const float *edge_field,
                                    const float *edge_additive,
+                                   const float *edge_state_field,
                                    const float *multipliers,
                                    const float *coupler_weights,
                                    const float *coupler_bias,
@@ -2632,18 +2657,19 @@ double RoutingDecoder::edge_energy(int32_t from, int32_t to, int32_t edge,
       edge >= 0 && objective_residual != nullptr ? objective_residual[edge]
                                                  : 0.0;
   const double objective_weight = coupled_multiplier(
-      objective_multiplier(), edge, multipliers, coupler_weights, coupler_bias,
+      objective_multiplier(), multipliers, coupler_weights, coupler_bias,
       live_state);
   return objective_weight *
              (objective_edge_cost(from, to) / objective_energy_scale_ +
               learned_objective) +
-         field_score(from, to, edge, edge_field, edge_additive, multipliers,
+         field_score(from, to, edge, edge_field, edge_additive, edge_state_field, multipliers,
                      coupler_weights, coupler_bias, live_state);
 }
 
 void RoutingDecoder::build_candidate_graph(const std::vector<int32_t> &incumbent,
                                            std::vector<float> *edge_field,
                                            std::vector<float> *edge_additive,
+                                           std::vector<float> *edge_state_field,
                                            std::vector<float>
                                                *objective_residual,
                                            std::vector<float> *coupler_weights,
@@ -2656,18 +2682,15 @@ void RoutingDecoder::build_candidate_graph(const std::vector<int32_t> &incumbent
   std::vector<float> old_field;
   std::vector<float> old_additive;
   std::vector<float> old_residual;
-  std::vector<float> old_coupler_weights;
-  std::vector<float> old_coupler_bias;
+  std::vector<float> old_state_field;
   if (edge_field != nullptr)
     old_field.swap(*edge_field);
   if (edge_additive != nullptr)
     old_additive.swap(*edge_additive);
   if (objective_residual != nullptr)
     old_residual.swap(*objective_residual);
-  if (coupler_weights != nullptr)
-    old_coupler_weights.swap(*coupler_weights);
-  if (coupler_bias != nullptr)
-    old_coupler_bias.swap(*coupler_bias);
+  if (edge_state_field != nullptr)
+    old_state_field.swap(*edge_state_field);
 
   // The graph topology is deliberately geometric only. Depot connectivity is
   // the sole overlay because a depot may be required to close/reset a route
@@ -2746,18 +2769,14 @@ void RoutingDecoder::build_candidate_graph(const std::vector<int32_t> &incumbent
   }
   if (objective_residual != nullptr)
     objective_residual->assign(edge_to_.size(), 0.0f);
-  // A rebuilt edge with no predecessor gets a zero coupler logit, which is the
-  // neutral gain 2*sigmoid(0) == 1 -- the same "no learned opinion yet" default
-  // the additive field and the objective residual use.
-  if (coupler_weights != nullptr) {
-    coupler_weights->assign(static_cast<size_t>(edge_to_.size()) *
-                                multiplier_count() *
-                                live_state_feature_count(),
-                            0.0f);
-  }
-  if (coupler_bias != nullptr) {
-    coupler_bias->assign(
-        static_cast<size_t>(edge_to_.size()) * multiplier_count(), 0.0f);
+  // A rebuilt edge with no predecessor contributes no state-conditioned energy,
+  // the same "no learned opinion yet" default the additive field and the
+  // objective residual use.
+  if (edge_state_field != nullptr) {
+    edge_state_field->assign(static_cast<size_t>(edge_to_.size()) *
+                                 resource_count() *
+                                 live_state_feature_count(),
+                             0.0f);
   }
   for (int32_t from = 0; from < n; ++from) {
     int32_t old_edge =
@@ -2816,25 +2835,16 @@ void RoutingDecoder::build_candidate_graph(const std::vector<int32_t> &incumbent
       if (objective_residual != nullptr && preserved &&
           static_cast<size_t>(old_edge) < old_residual.size())
         (*objective_residual)[edge] = old_residual[old_edge];
-      const size_t coupler_weight_stride =
-          static_cast<size_t>(multiplier_count()) * live_state_feature_count();
-      if (coupler_weights != nullptr && preserved &&
-          static_cast<size_t>(old_edge + 1) * coupler_weight_stride <=
-              old_coupler_weights.size()) {
-        std::copy_n(old_coupler_weights.data() +
-                        static_cast<size_t>(old_edge) * coupler_weight_stride,
-                    coupler_weight_stride,
-                    coupler_weights->data() +
-                        static_cast<size_t>(edge) * coupler_weight_stride);
-      }
-      if (coupler_bias != nullptr && preserved &&
-          static_cast<size_t>(old_edge + 1) * multiplier_count() <=
-              old_coupler_bias.size()) {
-        std::copy_n(old_coupler_bias.data() +
-                        static_cast<size_t>(old_edge) * multiplier_count(),
-                    multiplier_count(),
-                    coupler_bias->data() +
-                        static_cast<size_t>(edge) * multiplier_count());
+      const size_t state_field_stride =
+          static_cast<size_t>(resource_count()) * live_state_feature_count();
+      if (edge_state_field != nullptr && preserved &&
+          static_cast<size_t>(old_edge + 1) * state_field_stride <=
+              old_state_field.size()) {
+        std::copy_n(old_state_field.data() +
+                        static_cast<size_t>(old_edge) * state_field_stride,
+                    state_field_stride,
+                    edge_state_field->data() +
+                        static_cast<size_t>(edge) * state_field_stride);
       }
     }
   }
@@ -4236,6 +4246,7 @@ int32_t RoutingDecoder::select_next(State &state,
                                     std::mt19937_64 &rng,
                                     const float *edge_field,
                                     const float *edge_additive,
+                                    const float *edge_state_field,
                                     const float *multipliers,
                                     const float *coupler_weights,
                                     const float *coupler_bias,
@@ -4319,7 +4330,7 @@ int32_t RoutingDecoder::select_next(State &state,
   for (size_t index = 0; index < pool.size(); ++index) {
     const int32_t edge = pool[index].edge;
     const double energy = edge_energy(
-        state.current, pool[index].node, edge, edge_field, edge_additive,
+        state.current, pool[index].node, edge, edge_field, edge_additive, edge_state_field,
         multipliers, coupler_weights, coupler_bias, live_state.data(),
         objective_residual);
     const double value = -beta_ * energy;
@@ -4358,6 +4369,7 @@ int32_t RoutingDecoder::select_next(State &state,
 
 Solution RoutingDecoder::construct(uint64_t rollout_seed, const float *edge_field,
                                    const float *edge_additive,
+                                   const float *edge_state_field,
                                    const float *multipliers,
                                    const float *coupler_weights,
                                    const float *coupler_bias,
@@ -4375,7 +4387,7 @@ Solution RoutingDecoder::construct(uint64_t rollout_seed, const float *edge_fiel
 
   for (int32_t step = 0; step < max_steps && !complete(state); ++step) {
     const int32_t next = select_next(
-        state, rng, edge_field, edge_additive, multipliers,
+        state, rng, edge_field, edge_additive, edge_state_field, multipliers,
         coupler_weights, coupler_bias, objective_residual,
         trace, greedy);
     if (next < 0) {
@@ -4407,6 +4419,7 @@ RoutingDecoder::perturbation_order(int32_t current,
                                    std::mt19937_64 &rng,
                                    const float *edge_field,
                                    const float *edge_additive,
+                                   const float *edge_state_field,
                                    const float *multipliers,
                                    const float *coupler_weights,
                                    const float *coupler_bias,
@@ -4431,7 +4444,7 @@ RoutingDecoder::perturbation_order(int32_t current,
       continue;
     }
     const double log_weight =
-        -beta_ * edge_energy(current, node, edge, edge_field, edge_additive,
+        -beta_ * edge_energy(current, node, edge, edge_field, edge_additive, edge_state_field,
                              multipliers, coupler_weights, coupler_bias,
                              live_state.data(), objective_residual);
     // Gumbel-top-k gives a weighted order without replacement.
@@ -4530,6 +4543,7 @@ bool RoutingDecoder::relational() const {
 Solution RoutingDecoder::scope_restricted_refine(
     Solution solution, const std::vector<int32_t> &initial_scope,
     const float *edge_field, const float *edge_additive,
+    const float *edge_state_field,
     const float *multipliers,
     const float *coupler_weights, const float *coupler_bias,
     const float *objective_residual,
@@ -4800,8 +4814,15 @@ Solution RoutingDecoder::scope_restricted_refine(
     double objective = 0.0;
     double objective_residual = 0.0;
     std::vector<double> resource;
-    explicit GuidanceValue(int32_t resource_count = 0)
-        : resource(resource_count, 0.0) {}
+    // Per (resource, live-state feature) sums of the state-conditioned field.
+    // The anchor's live state multiplies these at QUERY time, which is what
+    // keeps the guided energy anchor-varying while the sums themselves stay
+    // edge-additive -- the property the prefix sums below depend on.
+    std::vector<double> resource_state;
+    explicit GuidanceValue(int32_t resource_count = 0, int32_t state_count = 0)
+        : resource(resource_count, 0.0),
+          resource_state(
+              static_cast<size_t>(resource_count) * state_count, 0.0) {}
   };
   struct GuidedSequence : GuidanceValue {
     bool empty = true;
@@ -4816,6 +4837,12 @@ Solution RoutingDecoder::scope_restricted_refine(
       lhs.resource[channel] += channel < static_cast<int32_t>(rhs.resource.size())
                                    ? rhs.resource[channel]
                                    : 0.0;
+    const size_t state_slots =
+        static_cast<size_t>(resource_count()) * live_state_feature_count();
+    lhs.resource_state.resize(state_slots, 0.0);
+    for (size_t slot = 0; slot < state_slots; ++slot)
+      lhs.resource_state[slot] +=
+          slot < rhs.resource_state.size() ? rhs.resource_state[slot] : 0.0;
     return lhs;
   };
   const auto subtract_guidance = [&](GuidanceValue lhs,
@@ -4827,57 +4854,69 @@ Solution RoutingDecoder::scope_restricted_refine(
       lhs.resource[channel] -= channel < static_cast<int32_t>(rhs.resource.size())
                                    ? rhs.resource[channel]
                                    : 0.0;
+    const size_t state_slots =
+        static_cast<size_t>(resource_count()) * live_state_feature_count();
+    lhs.resource_state.resize(state_slots, 0.0);
+    for (size_t slot = 0; slot < state_slots; ++slot)
+      lhs.resource_state[slot] -=
+          slot < rhs.resource_state.size() ? rhs.resource_state[slot] : 0.0;
     return lhs;
   };
-  // Point into the incumbent live-state table rather than copying a row per
-  // call: edge_guidance runs once per edge of every candidate move.
-  const auto incumbent_state_row = [&](int32_t node) -> const float * {
-    if (node < 0 || node >= problem_.node_count ||
-        incumbent_live_state_.size() !=
-            static_cast<size_t>(problem_.node_count) * resource_count())
-      return nullptr;
-    return incumbent_live_state_.data() +
-           static_cast<size_t>(node) * resource_count();
-  };
-  // The coupler is a per-EDGE gain, so it can no longer be factored out of the
-  // aggregate the way a per-channel scalar could. These guidance values are
-  // prefix sums built once and then queried at many anchors, so each edge's
-  // coupled weight is folded in here, evaluated at that edge's own incumbent
-  // live state. That keeps the sums additive and is strictly more local than
-  // the previous contract, which applied one anchor's live state uniformly to
-  // every edge in the aggregate. It also matches the Python
-  // ExecutedBehaviorScorer proxy, which already couples at the origin node's
-  // replayed state.
+  // Both halves of the learned resource energy are accumulated here WITHOUT a
+  // live state, so these values stay pure functions of the edge and the prefix
+  // sums built from them remain exactly additive. The graph-level coupler is
+  // applied to `resource` at query time, and the anchor's live state contracts
+  // `resource_state` at query time, so the guided energy is anchor-varying
+  // without the aggregate ever having to know which anchor it will be read at.
   const auto edge_guidance = [&](int32_t from, int32_t to) {
-    GuidanceValue value(resource_count());
+    GuidanceValue value(resource_count(), live_state_feature_count());
+    value.objective = objective_edge_cost(from, to);
     const int32_t edge = find_edge(from, to);
-    const float *state = incumbent_state_row(from);
-    const double objective_weight =
-        coupled_multiplier(objective_multiplier(), edge, multipliers,
-                           coupler_weights, coupler_bias, state);
-    value.objective =
-        objective_weight * objective_edge_cost(from, to) /
-        objective_energy_scale_;
     value.objective_residual =
-        edge >= 0 && objective_residual != nullptr
-            ? objective_weight * objective_residual[edge]
-            : 0.0;
+        edge >= 0 && objective_residual != nullptr ? objective_residual[edge] : 0.0;
+    const int32_t states = live_state_feature_count();
     for (int32_t channel = 0; channel < resource_count(); ++channel) {
       if (!resource(channel).active)
         continue;
-      value.resource[channel] =
-          coupled_multiplier(channel, edge, multipliers, coupler_weights,
-                             coupler_bias, state) *
-          resource_field_value(from, to, edge, channel, edge_field,
-                               edge_additive);
+      value.resource[channel] = resource_field_value(
+          from, to, edge, channel, edge_field, edge_additive);
+      if (edge < 0 || edge_state_field == nullptr)
+        continue;
+      const float *row =
+          edge_state_field +
+          (static_cast<size_t>(edge) * resource_count() + channel) * states;
+      for (int32_t feature = 0; feature < states; ++feature) {
+        value.resource_state[static_cast<size_t>(channel) * states + feature] =
+            row[feature];
+      }
     }
     return value;
   };
-  const auto guidance_energy = [&](const GuidanceValue &value) {
-    double result = value.objective + value.objective_residual;
+  const auto guidance_energy = [&](const GuidanceValue &value,
+                                   const float *live_state) {
+    double result = coupled_multiplier(
+                        objective_multiplier(), multipliers, coupler_weights,
+                        coupler_bias, live_state) *
+                    (value.objective / objective_energy_scale_ +
+                     value.objective_residual);
+    const int32_t states = live_state_feature_count();
     for (int32_t channel = 0; channel < resource_count(); ++channel) {
-      if (resource(channel).active)
-        result += value.resource[channel];
+      if (!resource(channel).active)
+        continue;
+      result += coupled_multiplier(channel, multipliers, coupler_weights,
+                                   coupler_bias, live_state) *
+                value.resource[channel];
+      if (live_state == nullptr)
+        continue;
+      const double base = multipliers == nullptr ? 1.0 : multipliers[channel];
+      double interaction = 0.0;
+      for (int32_t feature = 0; feature < states; ++feature) {
+        interaction +=
+            value.resource_state[static_cast<size_t>(channel) * states +
+                                 feature] *
+            live_state[feature];
+      }
+      result += base * interaction;
     }
     return result;
   };
@@ -5095,8 +5134,8 @@ Solution RoutingDecoder::scope_restricted_refine(
   std::vector<int32_t> incumbent_edges(edge_count(), 0);
   const auto build_route_guidance = [&](CachedRoute &route) {
     const std::vector<int32_t> &nodes = route.sequence.nodes;
-    route.forward_guidance.assign(nodes.size(), GuidanceValue(resource_count()));
-    route.reverse_guidance.assign(nodes.size(), GuidanceValue(resource_count()));
+    route.forward_guidance.assign(nodes.size(), GuidanceValue(resource_count(), live_state_feature_count()));
+    route.reverse_guidance.assign(nodes.size(), GuidanceValue(resource_count(), live_state_feature_count()));
     for (size_t index = 1; index < nodes.size(); ++index) {
       route.forward_guidance[index] = add_guidance(
           route.forward_guidance[index - 1],
@@ -5123,7 +5162,7 @@ Solution RoutingDecoder::scope_restricted_refine(
   const auto rebuild_cache = [&]() {
     cached_routes.clear();
     route_head = -1;
-    total_guidance = GuidanceValue(resource_count());
+    total_guidance = GuidanceValue(resource_count(), live_state_feature_count());
     std::fill(node_route.begin(), node_route.end(), -1);
     std::fill(node_local.begin(), node_local.end(), -1);
     if (problem_.depot_count == 0) {
@@ -5936,7 +5975,7 @@ Solution RoutingDecoder::scope_restricted_refine(
     route.open_pickups.clear();
     route.forward_guidance.clear();
     route.reverse_guidance.clear();
-    route.guidance = GuidanceValue(resource_count());
+    route.guidance = GuidanceValue(resource_count(), live_state_feature_count());
     route.sequence = build_sequence_table(problem_, nodes);
     route.summary = query_sequence(
         problem_, route.sequence, 0,
@@ -6568,7 +6607,7 @@ Solution RoutingDecoder::scope_restricted_refine(
          edge < edge_offsets_[node + 1]; ++edge) {
       ranked_local_edges[edge] = edge;
       ranking_energy[edge] = edge_energy(
-          node, edge_to_[edge], edge, edge_field, edge_additive,
+          node, edge_to_[edge], edge, edge_field, edge_additive, edge_state_field,
           multipliers, coupler_weights, coupler_bias, state.data(),
           objective_residual);
     }
@@ -6607,12 +6646,14 @@ Solution RoutingDecoder::scope_restricted_refine(
     AcceptedPlan best_plan;
     StructuralMove best_structural;
     const GuidanceValue current_guidance = total_guidance;
+    const std::vector<float> anchor_state =
+        incumbent_state_features(anchor);
     double best_guided_energy = std::numeric_limits<double>::infinity();
     // Exploration slot for this anchor: either the lowest guided-energy move
     // that strictly lowers anchor energy or the random control's lowest-priority
     // draw. It is committed only when no improving move exists and budget remains.
     const double current_anchor_energy =
-        guidance_energy(current_guidance);
+        guidance_energy(current_guidance, anchor_state.data());
     Solution best_explore_move;
     AcceptedPlan best_explore_plan;
     double best_explore_energy = std::numeric_limits<double>::infinity();
@@ -6785,21 +6826,15 @@ Solution RoutingDecoder::scope_restricted_refine(
           scored.objective = problem_.objective.report(
               scored.distance, scored.collected_prize, scored.missed_penalty);
           const double planned_energy =
-              guidance_energy(guided);
+              guidance_energy(guided, anchor_state.data());
           const bool random_escape_enabled =
               exploration_remaining > 0 && search_config_.random_escape;
           const double planned_escape_priority = random_escape_enabled
                                                      ? random_escape_priority(rng)
                                                      : 0.0;
-          // The guided energy USED TO BE anchor-specific: the coupler was a
-          // per-channel scalar evaluated at the anchor's live state, so the
-          // same route scored differently at different anchors. A per-edge
-          // coupler cannot be factored out of the aggregate that way, so it is
-          // folded in at each edge's own incumbent state and this energy is now
-          // a global potential -- one route, one energy, whatever the anchor.
-          // Selection among an anchor's candidates is unaffected (it compares
-          // within one anchor); what changed is that the exploration threshold
-          // below is now a uniform bar rather than an anchor-local one.
+          // The guided energy is anchor-specific rather than a global
+          // potential: both the graph-level coupler and the per-edge
+          // state-conditioned field are evaluated at THIS anchor's live state.
           // Keep the global objective as the monotone acceptance gate and use
           // energy to select among improving moves. A bounded exploration
           // budget may admit energy-descending uphill escapes.
@@ -7472,6 +7507,7 @@ Solution RoutingDecoder::scope_restricted_refine(
 
 Solution RoutingDecoder::perturb(uint64_t rollout_seed, const float *edge_field,
                                  const float *edge_additive,
+                                 const float *edge_state_field,
                                  const float *multipliers,
                                  const float *coupler_weights,
                                  const float *coupler_bias,
@@ -7479,7 +7515,7 @@ Solution RoutingDecoder::perturb(uint64_t rollout_seed, const float *edge_field,
                                  RolloutTrace *trace, bool greedy) const {
   const Solution source = evaluate(incumbent_route_);
   if (!source.feasible) {
-    return construct(rollout_seed, edge_field, edge_additive, multipliers,
+    return construct(rollout_seed, edge_field, edge_additive, edge_state_field, multipliers,
                      coupler_weights, coupler_bias, objective_residual, trace,
                      greedy);
   }
@@ -7514,7 +7550,7 @@ Solution RoutingDecoder::perturb(uint64_t rollout_seed, const float *edge_field,
        ++attempt) {
     bool accepted = false;
     const std::vector<OrderedChoice> order = perturbation_order(
-        current, used, rng, edge_field, edge_additive, multipliers,
+        current, used, rng, edge_field, edge_additive, edge_state_field, multipliers,
         coupler_weights, coupler_bias, objective_residual,
         greedy);
     std::vector<int32_t> valid_indices;
@@ -7637,7 +7673,7 @@ Solution RoutingDecoder::perturb(uint64_t rollout_seed, const float *edge_field,
   raw.raw_objective = raw.objective;
   raw.changed_edges = changed;
   Solution refined =
-      scope_restricted_refine(raw, initial_scope, edge_field, edge_additive,
+      scope_restricted_refine(raw, initial_scope, edge_field, edge_additive, edge_state_field,
                               multipliers, coupler_weights, coupler_bias,
                               objective_residual, trace,
                               rng);
@@ -7648,12 +7684,13 @@ Solution RoutingDecoder::perturb(uint64_t rollout_seed, const float *edge_field,
 
 std::vector<Solution> RoutingDecoder::sample(const float *edge_field,
                                              const float *edge_additive,
+                                             const float *edge_state_field,
                                              const float *multipliers,
                                              const float *coupler_weights,
                                              const float *coupler_bias,
                                              const float *objective_residual,
                                              DecisionTrace *trace) {
-  validate_guidance(edge_field, edge_additive, multipliers, coupler_weights,
+  validate_guidance(edge_field, edge_additive, edge_state_field, multipliers, coupler_weights,
                     coupler_bias, objective_residual);
   std::vector<Solution> solutions(n_rollouts_);
   std::vector<RolloutTrace> rollout_traces(trace == nullptr ? 0 : n_rollouts_);
@@ -7672,10 +7709,10 @@ std::vector<Solution> RoutingDecoder::sample(const float *edge_field,
     RolloutTrace *rollout_trace = trace == nullptr ? nullptr : &rollout_traces[rollout];
     solutions[rollout] =
         incumbent_route_.empty()
-            ? construct(rollout_seed, edge_field, edge_additive, multipliers,
+            ? construct(rollout_seed, edge_field, edge_additive, edge_state_field, multipliers,
                         coupler_weights, coupler_bias, objective_residual,
                         rollout_trace, rollout < std::max(1, n_rollouts_ / 2))
-            : perturb(rollout_seed, edge_field, edge_additive, multipliers,
+            : perturb(rollout_seed, edge_field, edge_additive, edge_state_field, multipliers,
                       coupler_weights, coupler_bias, objective_residual,
                       rollout_trace);
   }
@@ -7739,16 +7776,17 @@ std::vector<Solution> RoutingDecoder::sample(const float *edge_field,
 
 Solution RoutingDecoder::sample_greedy(
     const float *edge_field, const float *edge_additive,
+    const float *edge_state_field,
     const float *multipliers, const float *coupler_weights,
     const float *coupler_bias, const float *objective_residual) const {
-  validate_guidance(edge_field, edge_additive, multipliers, coupler_weights,
+  validate_guidance(edge_field, edge_additive, edge_state_field, multipliers, coupler_weights,
                     coupler_bias, objective_residual);
   const uint64_t deterministic_seed = splitmix64(seed_);
   return incumbent_route_.empty()
-             ? construct(deterministic_seed, edge_field, edge_additive,
+             ? construct(deterministic_seed, edge_field, edge_additive, edge_state_field,
                          multipliers, coupler_weights, coupler_bias,
                          objective_residual, nullptr, true)
-             : perturb(deterministic_seed, edge_field, edge_additive,
+             : perturb(deterministic_seed, edge_field, edge_additive, edge_state_field,
                        multipliers, coupler_weights, coupler_bias,
                        objective_residual, nullptr, true);
 }
@@ -7772,6 +7810,7 @@ bool RoutingDecoder::better(const Solution &lhs, const Solution &rhs) const {
 
 Solution RoutingDecoder::solve(int32_t iterations, const float *edge_field,
                                const float *edge_additive,
+                               const float *edge_state_field,
                                const float *multipliers,
                                const float *coupler_weights,
                                const float *coupler_bias,
@@ -7779,7 +7818,7 @@ Solution RoutingDecoder::solve(int32_t iterations, const float *edge_field,
   if (iterations <= 0) {
     throw std::invalid_argument("iterations must be positive");
   }
-  validate_guidance(edge_field, edge_additive, multipliers, coupler_weights,
+  validate_guidance(edge_field, edge_additive, edge_state_field, multipliers, coupler_weights,
                     coupler_bias, objective_residual);
   std::vector<float> working_field;
   std::vector<float> working_additive;
@@ -7799,30 +7838,21 @@ Solution RoutingDecoder::solve(int32_t iterations, const float *edge_field,
   if (objective_residual != nullptr)
     working_objective_residual.assign(
         objective_residual, objective_residual + edge_to_.size());
-  // The coupler is per-edge now, so it is aligned to the candidate graph and
-  // has to survive a rebuild the same way the field does.
-  std::vector<float> working_coupler_weights;
-  std::vector<float> working_coupler_bias;
-  if (coupler_weights != nullptr) {
-    working_coupler_weights.assign(
-        coupler_weights,
-        coupler_weights + static_cast<size_t>(edge_to_.size()) *
-                              multiplier_count() *
-                              live_state_feature_count());
-  }
-  if (coupler_bias != nullptr) {
-    working_coupler_bias.assign(
-        coupler_bias, coupler_bias + static_cast<size_t>(edge_to_.size()) *
-                                         multiplier_count());
+  // The state-conditioned field is per edge, so it is aligned to the candidate
+  // graph and has to survive a rebuild the same way the field does.
+  std::vector<float> working_state_field;
+  if (edge_state_field != nullptr) {
+    working_state_field.assign(
+        edge_state_field,
+        edge_state_field + static_cast<size_t>(edge_to_.size()) *
+                               resource_count() * live_state_feature_count());
   }
   for (int32_t iteration = 0; iteration < iterations; ++iteration) {
     std::vector<Solution> solutions = sample(
         working_field.empty() ? nullptr : working_field.data(),
         working_additive.empty() ? nullptr : working_additive.data(),
-        multipliers,
-        working_coupler_weights.empty() ? nullptr
-                                        : working_coupler_weights.data(),
-        working_coupler_bias.empty() ? nullptr : working_coupler_bias.data(),
+        working_state_field.empty() ? nullptr : working_state_field.data(),
+        multipliers, coupler_weights, coupler_bias,
         working_objective_residual.empty()
             ? nullptr
             : working_objective_residual.data());
@@ -7847,12 +7877,9 @@ Solution RoutingDecoder::solve(int32_t iterations, const float *edge_field,
                             working_objective_residual.empty()
                                 ? nullptr
                                 : &working_objective_residual,
-                            working_coupler_weights.empty()
+                            working_state_field.empty()
                                 ? nullptr
-                                : &working_coupler_weights,
-                            working_coupler_bias.empty()
-                                ? nullptr
-                                : &working_coupler_bias);
+                                : &working_state_field);
     }
   }
   if (!best_solution_.feasible) {

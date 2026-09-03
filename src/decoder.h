@@ -561,6 +561,7 @@ public:
   void seed(uint64_t value);
   std::vector<Solution> sample(const float *edge_field = nullptr,
                                const float *edge_additive = nullptr,
+                               const float *edge_state_field = nullptr,
                                const float *multipliers = nullptr,
                                const float *coupler_weights = nullptr,
                                const float *coupler_bias = nullptr,
@@ -568,12 +569,14 @@ public:
                                DecisionTrace *trace = nullptr);
   Solution sample_greedy(const float *edge_field = nullptr,
                          const float *edge_additive = nullptr,
+                         const float *edge_state_field = nullptr,
                          const float *multipliers = nullptr,
                          const float *coupler_weights = nullptr,
                          const float *coupler_bias = nullptr,
                          const float *objective_residual = nullptr) const;
   Solution solve(int32_t iterations, const float *edge_field = nullptr,
                  const float *edge_additive = nullptr,
+                 const float *edge_state_field = nullptr,
                  const float *multipliers = nullptr,
                  const float *coupler_weights = nullptr,
                  const float *coupler_bias = nullptr,
@@ -903,6 +906,7 @@ private:
   void build_candidate_graph(const std::vector<int32_t> &incumbent,
                              std::vector<float> *edge_field = nullptr,
                              std::vector<float> *edge_additive = nullptr,
+                             std::vector<float> *edge_state_field = nullptr,
                              std::vector<float> *objective_residual = nullptr,
                              std::vector<float> *coupler_weights = nullptr,
                              std::vector<float> *coupler_bias = nullptr);
@@ -978,6 +982,7 @@ private:
   bool construction_return_reachable(const State &state, int32_t next) const;
   void validate_guidance(const float *edge_field,
                          const float *edge_additive,
+                         const float *edge_state_field,
                          const float *multipliers,
                          const float *coupler_weights,
                          const float *coupler_bias,
@@ -985,14 +990,17 @@ private:
   std::vector<float> live_state_features(const State &state) const;
   std::vector<float> incumbent_state_features(int32_t current) const;
   bool incumbent_prefix_state(int32_t current, State &state) const;
-  // The coupled gain for one channel ON ONE EDGE. `edge` indexes the candidate
-  // graph the guidance was emitted for; a negative edge is off-graph and gets
-  // the uncoupled graph-level multiplier.
-  double coupled_multiplier(int32_t channel, int32_t edge,
-                            const float *multipliers,
+  // The graph-level half of the learned live-state response: one bounded gain
+  // per channel, evaluated at whatever live state the caller supplies.
+  double coupled_multiplier(int32_t channel, const float *multipliers,
                             const float *coupler_weights,
                             const float *coupler_bias,
                             const float *live_state) const;
+  // The per-edge half, linear in the live state so it survives the SRR
+  // aggregate. [edge_count, resource_count, live_state_feature_count].
+  double resource_state_field_value(int32_t edge, int32_t channel,
+                                    const float *edge_state_field,
+                                    const float *live_state) const;
   // live_state is passed by reference, not as a pointer: an empty registry
   // makes vector::data() null, and the null check this used to perform then
   // silently dropped every decision on a problem that declares no constraint.
@@ -1004,6 +1012,7 @@ private:
   double field_score(int32_t from, int32_t to, int32_t edge,
                      const float *edge_field,
                      const float *edge_additive,
+                     const float *edge_state_field,
                      const float *multipliers,
                      const float *coupler_weights = nullptr,
                      const float *coupler_bias = nullptr,
@@ -1011,6 +1020,7 @@ private:
   double edge_energy(int32_t from, int32_t to, int32_t edge,
                      const float *edge_field,
                      const float *edge_additive,
+                     const float *edge_state_field,
                      const float *multipliers,
                      const float *coupler_weights = nullptr,
                      const float *coupler_bias = nullptr,
@@ -1039,12 +1049,15 @@ private:
   Solution finish(State state) const;
   Solution construct(uint64_t rollout_seed, const float *edge_field,
                      const float *edge_additive,
+                     const float *edge_state_field,
                      const float *multipliers,
                      const float *coupler_weights,
                      const float *coupler_bias, const float *objective_residual, RolloutTrace *trace,
                      bool greedy = false) const;
   Solution perturb(uint64_t rollout_seed, const float *edge_field,
-                   const float *edge_additive, const float *multipliers,
+                   const float *edge_additive,
+                   const float *edge_state_field,
+                   const float *multipliers,
                    const float *coupler_weights, const float *coupler_bias,
                    const float *objective_residual, RolloutTrace *trace,
                    bool greedy = false) const;
@@ -1053,6 +1066,7 @@ private:
                           const std::vector<int32_t> &initial_scope,
                           const float *edge_field,
                           const float *edge_additive,
+                          const float *edge_state_field,
                           const float *multipliers,
                           const float *coupler_weights,
                           const float *coupler_bias,
@@ -1061,6 +1075,7 @@ private:
   int32_t select_next(State &state, std::mt19937_64 &rng,
                       const float *edge_field,
                       const float *edge_additive,
+                      const float *edge_state_field,
                       const float *multipliers,
                       const float *coupler_weights,
                       const float *coupler_bias, const float *objective_residual, RolloutTrace *trace,
@@ -1068,7 +1083,9 @@ private:
   std::vector<OrderedChoice>
   perturbation_order(int32_t current, const std::vector<uint8_t> &used,
                      std::mt19937_64 &rng, const float *edge_field,
-                     const float *edge_additive, const float *multipliers,
+                     const float *edge_additive,
+                     const float *edge_state_field,
+                     const float *multipliers,
                      const float *coupler_weights, const float *coupler_bias,
                      const float *objective_residual,
                      bool greedy = false) const;

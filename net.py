@@ -473,8 +473,9 @@ def decode_iteration(
         1,
         edge_field=edge_field,
         multipliers=multipliers,
-        coupler_weights=output["coupler_weights"].detach().cpu().numpy(),
-        coupler_bias=output["coupler_bias"].detach().cpu().numpy(),
+        edge_state_field=output["state_field"].detach().cpu().numpy(),
+        coupler_weights=output["coupler_weights"][0].detach().cpu().numpy(),
+        coupler_bias=output["coupler_bias"][0].detach().cpu().numpy(),
     )
     return solution, output
 
@@ -524,8 +525,9 @@ def decode_python_refinement(
         edge_field=output["residual"].detach().cpu().numpy(),
         multipliers=output["multipliers"][0].detach().cpu().numpy(),
         objective_energy_scale=float(decoder.metadata["objective_energy_scale"]),
-        coupler_weights=output["coupler_weights"].detach().cpu().numpy(),
-        coupler_bias=output["coupler_bias"].detach().cpu().numpy(),
+        edge_state_field=output["state_field"].detach().cpu().numpy(),
+        coupler_weights=output["coupler_weights"][0].detach().cpu().numpy(),
+        coupler_bias=output["coupler_bias"][0].detach().cpu().numpy(),
     )
     neighborhood = RoutingNeighborhood(
         semantic_decoder, config=neighborhood_config
@@ -1306,6 +1308,11 @@ class ConstraintFieldNet(nn.Module):
         self.coupler_query_head = nn.Linear(units, units)
         self.coupler_key_head = nn.Linear(units, units)
         self.coupler_bias_head = nn.Linear(units, 1)
+        # Per-edge live-state response. The coupler above stays graph-level and
+        # bounded; this is the edge-resolved half, and it is additive rather
+        # than a gain so that it stays linear in the live state.
+        self.state_field_query_head = nn.Linear(units, units)
+        self.state_field_key_head = nn.Linear(units, units)
         self.value_head = nn.Linear(units + 1, 1)
         # Registered unconditionally (like resource_attention) so a property
         # model and an index-embedded ablation share one parameter
@@ -1321,6 +1328,11 @@ class ConstraintFieldNet(nn.Module):
         nn.init.zeros_(self.coupler_query_head.bias)
         nn.init.zeros_(self.coupler_bias_head.weight)
         nn.init.zeros_(self.coupler_bias_head.bias)
+        # Zero query => an identically-zero state field, so a fresh model emits
+        # exactly the graph-level-coupler policy and enabling this head is a
+        # strict addition rather than a change of behaviour.
+        nn.init.zeros_(self.state_field_query_head.weight)
+        nn.init.zeros_(self.state_field_query_head.bias)
         # A zero value is the neutral bootstrap and makes
         # enabling temporal credit leave the field policy unchanged initially.
         nn.init.zeros_(self.value_head.weight)
@@ -1347,7 +1359,7 @@ class ConstraintFieldNet(nn.Module):
         token_projection,
         resource_edge,
         edge_batch,
-        coupler_keys,
+        state_field_keys,
     ):
         token = (
             token_projection
@@ -1357,34 +1369,36 @@ class ConstraintFieldNet(nn.Module):
         interaction = torch.tanh(
             edge_projection + token + resource_edge
         )
-        # The coupler reads the SAME per-(edge, channel) interaction vector the
-        # field does, so its live-state response is edge-specific. A per-channel
-        # coupler could only rescale a channel's whole field, which leaves the
-        # ordering of edges within that channel fixed no matter how the live
-        # state moves; with one active resource that made the learned part of
-        # the ranking completely static between refreshes.
-        coupler_query = self.coupler_query_head(interaction)
+        # The state-conditioned field: a per-(edge, channel) row over live-state
+        # features, read off the SAME interaction vector the field head uses.
+        # The decoder contracts it with the live state at scoring time, so this
+        # is the term that lets one edge respond to partial state differently
+        # from another. It is LINEAR in the live state on purpose: the SRR
+        # aggregate is a set of prefix sums built once and queried at many
+        # anchors, and only a linear term lets the anchor's state factor out of
+        # a sum over edges. A per-edge sigmoid gain would have to be frozen at
+        # aggregate-build time, which is exactly the anchor-varying behaviour
+        # the search relies on.
+        state_query = self.state_field_query_head(interaction)
         # [edges, graphs, states] rather than gathering [edges, states, units]
         # keys per edge: the graph and state widths are small, the unit width is
         # not, and the gather is what would dominate memory on a large graph.
-        coupler_logit_weights = torch.einsum(
-            "eu,bsu->ebs", coupler_query, coupler_keys
-        ) / (coupler_query.shape[-1] ** 0.5)
-        if coupler_logit_weights.shape[1] == 1:
-            coupler_weights = coupler_logit_weights[:, 0]
+        state_logits = torch.einsum(
+            "eu,bsu->ebs", state_query, state_field_keys
+        ) / (state_query.shape[-1] ** 0.5)
+        if state_logits.shape[1] == 1:
+            state_field = state_logits[:, 0]
         else:
-            coupler_weights = coupler_logit_weights[
+            state_field = state_logits[
                 torch.arange(
-                    coupler_logit_weights.shape[0],
-                    device=coupler_logit_weights.device,
+                    state_logits.shape[0], device=state_logits.device
                 ),
                 edge_batch,
             ]
         return (
             self.field_head(interaction).squeeze(-1),
             self.semantic_margin_head(interaction).squeeze(-1),
-            coupler_weights,
-            self.coupler_bias_head(interaction).squeeze(-1),
+            state_field,
         )
 
     def _resource_type_rows(self, pyg, resource_count):
@@ -1667,11 +1681,10 @@ class ConstraintFieldNet(nn.Module):
             ).expand_as(resource_context_edges)
         raw_channels = []
         raw_semantic_channels = []
-        raw_coupler_weight_channels = []
-        raw_coupler_bias_channels = []
+        raw_state_field_channels = []
         # Keys are per (graph, resource) and shared by every edge, so project
         # them once outside the channel loop.
-        coupler_keys = self.coupler_key_head(tokens)
+        state_field_keys = self.state_field_key_head(tokens)
         for channel in range(resource_count):
             token = (
                 projected_tokens[:, channel]
@@ -1696,34 +1709,31 @@ class ConstraintFieldNet(nn.Module):
                 (
                     raw,
                     raw_semantic,
-                    raw_coupler_weight,
-                    raw_coupler_bias,
+                    raw_state_field,
                 ) = torch.utils.checkpoint.checkpoint(
                     self._field_channel,
                     projected_edges,
                     token,
                     resource_edge,
                     edge_batch,
-                    coupler_keys,
+                    state_field_keys,
                     use_reentrant=False,
                 )
             else:
                 (
                     raw,
                     raw_semantic,
-                    raw_coupler_weight,
-                    raw_coupler_bias,
+                    raw_state_field,
                 ) = self._field_channel(
                     projected_edges,
                     token,
                     resource_edge,
                     edge_batch,
-                    coupler_keys,
+                    state_field_keys,
                 )
             raw_channels.append(raw)
             raw_semantic_channels.append(raw_semantic)
-            raw_coupler_weight_channels.append(raw_coupler_weight)
-            raw_coupler_bias_channels.append(raw_coupler_bias)
+            raw_state_field_channels.append(raw_state_field)
         # An empty registry stacks to [edges, 0] rather than failing: a problem
         # with no resource rows has no resource energy, which the decoder
         # already accepts as an [edges, 0] field.
@@ -1759,34 +1769,41 @@ class ConstraintFieldNet(nn.Module):
         if self.gate_multipliers_by_binding:
             multipliers = multipliers * torch.sigmoid(binding_logits)
         multipliers = multipliers * active
-        # Per-edge coupler rows, stacked to [edges, resources, states] and
-        # [edges, resources]. An empty registry stacks to a zero-width tensor
-        # for the same reason the field does.
-        coupler_weights = (
-            torch.stack(raw_coupler_weight_channels, dim=1)
-            if raw_coupler_weight_channels
-            else projected_edges.new_zeros(edge_count, 0, resource_count)
-        )
-        coupler_bias = (
-            torch.stack(raw_coupler_bias_channels, dim=1)
-            if raw_coupler_bias_channels
-            else projected_edges.new_zeros(edge_count, 0)
-        )
-        # Mask the coupled channel and the live-state feature it reads, exactly
-        # as the graph-level coupler did -- but per edge, since `edge_active`
-        # already carries each edge's own graph's active registry.
+        coupler_queries = self.coupler_query_head(state)
+        coupler_keys = self.coupler_key_head(tokens)
+        coupler_weights = torch.einsum(
+            "bru,bsu->brs", coupler_queries, coupler_keys
+        ) / (coupler_queries.shape[-1] ** 0.5)
         coupler_weights = (
             coupler_weights
+            * active.unsqueeze(-1)
+            * active.unsqueeze(1)
+        )
+        coupler_bias = self.coupler_bias_head(state).squeeze(-1) * active
+        # Per-edge state-conditioned field, [edges, resources, states]. An empty
+        # registry stacks to a zero-width tensor for the same reason the field
+        # does. Mask both the channel and the live-state feature it reads;
+        # `edge_active` already carries each edge's own graph's active registry.
+        state_field = (
+            torch.stack(raw_state_field_channels, dim=1)
+            if raw_state_field_channels
+            else projected_edges.new_zeros(edge_count, 0, resource_count)
+        )
+        state_field = (
+            state_field
             * edge_active.unsqueeze(-1)
             * edge_active.unsqueeze(-2)
         )
-        coupler_bias = coupler_bias * edge_active
         # State-coupler ablation: emit no live-state modulation so every resource
         # multiplier stays at its per-refresh GNN value in both the Python
         # couple() (2*sigmoid(0)==1) and the exported C++ decoder.
         if not self.couple_state_multipliers:
             coupler_weights = torch.zeros_like(coupler_weights)
             coupler_bias = torch.zeros_like(coupler_bias)
+            # The state field is the per-edge half of the same live-state
+            # response, so the ablation has to remove it too or "no live-state
+            # modulation" would still be modulating.
+            state_field = torch.zeros_like(state_field)
         # Append the always-on objective slot required by the native guidance
         # schema. Keep it exactly one, with zero live-state coupling, for every
         # problem (including constrained ones). A graph-level scalar only
@@ -1800,23 +1817,21 @@ class ConstraintFieldNet(nn.Module):
             dtype=graph_state.dtype,
             device=graph_state.device,
         )
-        # The objective slot keeps its zero coupling per edge as well. A
-        # per-edge objective gain would be a second, multiplicative objective
-        # policy channel competing with the signed objective-energy residual,
-        # which is already the per-edge objective term.
-        objective_coupler_weights = coupler_weights.new_zeros(
-            (coupler_weights.shape[0], 1, resource_count)
+        objective_coupler_weights = torch.zeros(
+            (graph_state.shape[0], resource_count),
+            dtype=graph_state.dtype,
+            device=graph_state.device,
         )
-        objective_coupler_bias = coupler_bias.new_zeros(
-            (coupler_bias.shape[0], 1)
-        )
+        objective_coupler_bias = torch.zeros_like(objective_multiplier)
         multipliers = torch.cat(
             (multipliers, objective_multiplier.unsqueeze(1)), dim=1
         )
         coupler_weights = torch.cat(
-            (coupler_weights, objective_coupler_weights), dim=1
+            (coupler_weights, objective_coupler_weights.unsqueeze(1)), dim=1
         )
-        coupler_bias = torch.cat((coupler_bias, objective_coupler_bias), dim=1)
+        coupler_bias = torch.cat(
+            (coupler_bias, objective_coupler_bias.unsqueeze(1)), dim=1
+        )
         return {
             "residual": residual,
             "semantic_margin": semantic_margin,
@@ -1827,41 +1842,29 @@ class ConstraintFieldNet(nn.Module):
             "raw_semantic_margin": raw_semantic_margin,
             "coupler_weights": coupler_weights,
             "coupler_bias": coupler_bias,
+            "state_field": state_field,
             "value_context": graph_state,
             "active_channels": active,
         }
 
-    def couple(self, output, live_state, edge_index, graph_index=None):
+    def couple(self, output, live_state, graph_index=None):
         """Apply the same cheap state modulation evaluated by the C++ decoder.
 
-        The coupler is per edge, so a live state alone no longer determines a
-        multiplier: `edge_index` says which candidate-graph edge each state is
-        being evaluated on. Shape it [N] for one edge per state, or [N, K] to
-        score K candidate edges at one state. A negative edge is off-graph and
-        gets the uncoupled graph-level multiplier, matching the decoder.
+        This is the GRAPH-LEVEL half of the live-state response: one bounded
+        gain per channel. The per-edge half is `output["state_field"]`, which is
+        an additive energy term rather than a gain -- see `state_energy`.
         """
         _require_unit_interval("live_state", live_state)
         base = output["multipliers"]
         weights = output["coupler_weights"]
         bias = output["coupler_bias"]
         if weights.ndim != 3:
-            raise ValueError("coupler_weights must have shape [E, C, S]")
-        if bias.ndim != 2:
-            raise ValueError("coupler_bias must have shape [E, C]")
+            raise ValueError("coupler_weights must have shape [B, C, S]")
         if live_state.shape[-1] != weights.shape[-1]:
             raise ValueError(
                 "live_state width must match the runtime resource registry"
             )
-        edges = torch.as_tensor(
-            edge_index, dtype=torch.long, device=live_state.device
-        )
-        if edges.ndim not in (1, 2):
-            raise ValueError("edge_index must have rank 1 or 2")
-        if edges.shape[0] != live_state.shape[0]:
-            raise ValueError("edge_index must have one row per live state")
-        if edges.numel() and edges.max() >= weights.shape[0]:
-            raise ValueError("edge_index contains an out-of-range edge")
-        graph_count = base.shape[0]
+        graph_count = weights.shape[0]
         if graph_index is None:
             if graph_count != 1:
                 raise ValueError(
@@ -1880,21 +1883,50 @@ class ConstraintFieldNet(nn.Module):
                 graph_index.min() < 0 or graph_index.max() >= graph_count
             ):
                 raise ValueError("graph_index contains an invalid graph")
-        # An off-graph edge has no row to read. Gather from a clamped index and
-        # then drop the logit, so the neutral 2*sigmoid(0) == 1 gain falls out
-        # without a second code path.
-        on_graph = edges >= 0
-        gathered = edges.clamp_min(0)
-        selected_weights = weights[gathered]
-        selected_bias = bias[gathered]
-        state = live_state if edges.ndim == 1 else live_state.unsqueeze(1)
-        logit = (selected_weights * state.unsqueeze(-2)).sum(dim=-1)
-        logit = logit + selected_bias
-        logit = logit * on_graph.unsqueeze(-1)
+        selected_weights = weights[graph_index]
+        selected_bias = bias[graph_index]
         selected_base = base[graph_index]
-        if edges.ndim == 2:
-            selected_base = selected_base.unsqueeze(1)
+        logit = torch.einsum("ncs,ns->nc", selected_weights, live_state)
+        logit = logit + selected_bias
         return selected_base * (2.0 * torch.sigmoid(logit))
+
+    def state_energy(self, output, live_state, edge_index):
+        """Per-edge, state-conditioned resource energy: [.., edges, resources].
+
+        The decoder's other learned resource term, already scaled by the base
+        multiplier. `edge_index` says which candidate-graph edges to score;
+        shape it [N] for one edge per state or [N, K] for K candidates at one
+        state. A negative edge is off-graph and contributes nothing, matching
+        the field.
+        """
+        _require_unit_interval("live_state", live_state)
+        state_field = output["state_field"]
+        if state_field.ndim != 3:
+            raise ValueError("state_field must have shape [E, R, S]")
+        if live_state.shape[-1] != state_field.shape[-1]:
+            raise ValueError(
+                "live_state width must match the runtime resource registry"
+            )
+        edges = torch.as_tensor(
+            edge_index, dtype=torch.long, device=live_state.device
+        )
+        if edges.ndim not in (1, 2):
+            raise ValueError("edge_index must have rank 1 or 2")
+        if edges.shape[0] != live_state.shape[0]:
+            raise ValueError("edge_index must have one row per live state")
+        if edges.numel() and edges.max() >= state_field.shape[0]:
+            raise ValueError("edge_index contains an out-of-range edge")
+        base = output["multipliers"]
+        if base.shape[0] != 1:
+            raise ValueError("state_energy expects exactly one decoder graph")
+        on_graph = edges >= 0
+        gathered = state_field[edges.clamp_min(0)]
+        state = live_state if edges.ndim == 1 else live_state.unsqueeze(1)
+        energy = (gathered * state.unsqueeze(-2)).sum(dim=-1)
+        # Scaled by the same base multiplier the decoder applies, so disabling a
+        # channel disables both halves of its live-state response together.
+        energy = energy * base[0, : state_field.shape[1]]
+        return energy * on_graph.unsqueeze(-1)
 
     def value(self, output, search_progress):
         """Estimate remaining normalized improvement from a refresh state."""

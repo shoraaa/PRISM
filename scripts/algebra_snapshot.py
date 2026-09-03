@@ -60,8 +60,11 @@ def neutral_guidance(decoder) -> dict:
         "edge_field": np.zeros((edges, channels), dtype=np.float32),
         "edge_additive": np.zeros((edges, channels), dtype=np.float32),
         "multipliers": multipliers,
-        "coupler_weights": np.zeros((edges, slots, channels), dtype=np.float32),
-        "coupler_bias": np.zeros((edges, slots), dtype=np.float32),
+        "edge_state_field": np.zeros(
+            (edges, channels, channels), dtype=np.float32
+        ),
+        "coupler_weights": np.zeros((slots, channels), dtype=np.float32),
+        "coupler_bias": np.zeros(slots, dtype=np.float32),
     }
 
 

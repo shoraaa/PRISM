@@ -1473,3 +1473,118 @@ def test_features_are_invariant_to_distance_and_time_unit_rescaling() -> None:
         assert scaled.metadata["objective_energy_scale"] == pytest.approx(
             factor * reference.metadata["objective_energy_scale"], rel=1e-4
         )
+
+
+def _state_field_guidance(solver) -> dict:
+    """Neutral guidance plus a slot for the state-conditioned field."""
+    resources = int(solver.metadata["resource_count"])
+    slots = int(solver.metadata["multiplier_count"])
+    edges = int(solver.metadata["edge_count"])
+    multipliers = np.zeros(slots, dtype=np.float32)
+    multipliers[resources] = 1.0
+    multipliers[:resources] = 1.0
+    return {
+        "edge_field": np.zeros((edges, resources), dtype=np.float32),
+        "edge_state_field": np.zeros(
+            (edges, resources, resources), dtype=np.float32
+        ),
+        "multipliers": multipliers,
+        "coupler_weights": np.zeros((slots, resources), dtype=np.float32),
+        "coupler_bias": np.zeros(slots, dtype=np.float32),
+    }
+
+
+def _state_field_solver(**kwargs):
+    coordinates, distance = euclidean_problem(24, 4)
+    rng = np.random.default_rng(4)
+    demand = np.r_[0.0, rng.uniform(0.05, 0.3, 23)].astype(np.float32)
+    solver = make_decoder(
+        {
+            "name": "cvrp",
+            "coordinates": coordinates,
+            "distance": distance,
+            "demand": demand,
+            "capacity": 1.0,
+        },
+        candidate_config={"max_candidates": 8},
+        n_rollouts=4,
+        **kwargs,
+    )
+    solver.seed(11)
+    return solver
+
+
+def test_state_conditioned_field_steers_construction_and_srr() -> None:
+    """The per-edge live-state term is load-bearing in both native paths.
+
+    It is the half of the learned live-state response the graph-level coupler
+    cannot express: the coupler scales a channel's whole field, so with one
+    active resource it cannot reorder edges at all.
+    """
+    guidance = _state_field_guidance(_state_field_solver())
+    edges = guidance["edge_state_field"].shape[0]
+    loud = np.zeros_like(guidance["edge_state_field"])
+    # Alternating sign by edge index: an ordering unrelated to distance, so a
+    # decoder that reads this array cannot land on the same route as one that
+    # ignores it.
+    loud[:, 0, 0] = (np.arange(edges) % 2 * 2 - 1) * 50.0
+    quiet = guidance["edge_state_field"]
+
+    def greedy(state_field):
+        return _state_field_solver().sample_greedy(
+            **{**guidance, "edge_state_field": state_field}
+        )
+
+    assert list(greedy(quiet)["route"]) != list(greedy(loud)["route"])
+
+    incumbent = np.asarray(
+        _state_field_solver().solve(5, **guidance)["route"], dtype=np.int32
+    )
+
+    def srr_only(state_field):
+        solver = _state_field_solver()
+        solver.set_incumbent(incumbent)
+        return solver.solve(5, **{**guidance, "edge_state_field": state_field})
+
+    assert list(srr_only(quiet)["route"]) != list(srr_only(loud)["route"])
+
+
+def test_state_conditioned_field_keeps_the_srr_aggregate_exact() -> None:
+    """The aggregate stays incrementally exact with a live state field.
+
+    The SRR guidance values are prefix sums built once and queried at many
+    anchors, so every term folded into them must be a pure function of the edge.
+    The state-conditioned field is stored per (resource, live-state feature) and
+    contracted with the anchor's state at query time precisely to preserve that;
+    `verify_incremental_srr` rebuilds the cache mid-pass and throws on any
+    disagreement.
+    """
+    solver = _state_field_solver(
+        search_config={"verify_incremental_srr": True}
+    )
+    guidance = _state_field_guidance(solver)
+    rng = np.random.default_rng(17)
+    for key, scale in (
+        ("edge_state_field", 2.0),
+        ("edge_field", 1.0),
+        ("coupler_weights", 1.0),
+        ("coupler_bias", 1.0),
+    ):
+        guidance[key] = rng.normal(
+            0.0, scale, size=guidance[key].shape
+        ).astype(np.float32)
+
+    solution = solver.solve(6, **guidance)
+
+    assert solution["feasible"]
+    assert not solution["error"]
+
+
+def test_state_conditioned_field_shape_is_enforced() -> None:
+    solver = _state_field_solver()
+    guidance = _state_field_guidance(solver)
+    resources = int(solver.metadata["resource_count"])
+    guidance["edge_state_field"] = np.zeros((resources, resources), np.float32)
+
+    with pytest.raises(ValueError, match="edge_state_field must have shape"):
+        solver.sample_greedy(**guidance)

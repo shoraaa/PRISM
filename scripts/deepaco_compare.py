@@ -315,14 +315,12 @@ def prism_energy_matrix(model, variant: str, data: dict, device: str) -> torch.T
     edge_field = np.asarray(guidance["edge_field"], dtype=np.float64)
     multipliers = np.asarray(guidance["multipliers"], dtype=np.float64)
     coupler_bias = np.asarray(guidance["coupler_bias"], dtype=np.float64)
-    # The coupler is per edge, so its zero-live-state collapse is a per-edge
-    # weight row rather than one row for the whole graph.
-    weights = multipliers[None, :] * (2.0 / (1.0 + np.exp(-coupler_bias)))
+    weights = multipliers * (2.0 / (1.0 + np.exp(-coupler_bias)))
     objective_cost = np.asarray(decoder.objective_edge_costs, dtype=np.float64)
     scale = float(decoder.objective_energy_scale)
-    energy = weights[:, -1] * (objective_cost / scale)
+    energy = weights[-1] * (objective_cost / scale)
     if edge_field.shape[1]:
-        energy += (edge_field * weights[:, :-1]).sum(axis=1)
+        energy += edge_field @ weights[:-1]
 
     edge_index = np.asarray(decoder.edge_index, dtype=np.int64)
     node_count = int(edge_index.max()) + 1 if edge_index.size else 1
@@ -357,12 +355,11 @@ def deepaco_guidance_for_prism(decoder, heuristic: torch.Tensor, variant: str) -
     guidance = {
         "edge_field": np.zeros((edge_count, resources), dtype=np.float32),
         "multipliers": np.zeros(multiplier_slots, dtype=np.float32),
-        "coupler_weights": np.zeros(
-            (edge_count, multiplier_slots, resources), dtype=np.float32
+        "edge_state_field": np.zeros(
+            (edge_count, resources, resources), dtype=np.float32
         ),
-        "coupler_bias": np.zeros(
-            (edge_count, multiplier_slots), dtype=np.float32
-        ),
+        "coupler_weights": np.zeros((multiplier_slots, resources), dtype=np.float32),
+        "coupler_bias": np.zeros(multiplier_slots, dtype=np.float32),
     }
     guidance["multipliers"][resources] = 1.0
 

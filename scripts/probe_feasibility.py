@@ -228,23 +228,12 @@ def probe_instance(model, decoder, variant, instance, args, rows, states):
         live = torch.as_tensor(
             live_states[source], dtype=torch.float32, device=args.device
         ).view(1, -1)
-        lo, hi = int(offsets[source]), int(offsets[source + 1])
-        # The coupler is per edge, so each candidate out of this node gets its
-        # own gain; couple the whole outgoing range in one call.
         with torch.no_grad():
-            coupled = (
-                model.couple(
-                    output,
-                    live,
-                    torch.arange(lo, hi, device=args.device).view(1, -1),
-                )[0]
-                .cpu()
-                .numpy()
-            )
+            multipliers = model.couple(output, live)[0].cpu().numpy()
 
+        lo, hi = int(offsets[source]), int(offsets[source + 1])
         candidates = []
         for edge in range(lo, hi):
-            multipliers = coupled[edge - lo]
             target = int(edge_index[1, edge])
             # Published protocol: unvisited non-depot candidates. The depot is
             # admissible from almost every state, so including it would inflate
