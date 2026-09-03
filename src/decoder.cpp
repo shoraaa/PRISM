@@ -7440,10 +7440,6 @@ Solution RoutingDecoder::perturb(uint64_t rollout_seed, const float *edge_field,
         greedy);
     std::vector<int32_t> valid_indices;
     valid_indices.reserve(order.size());
-    State prefix_state;
-    const bool has_prefix =
-        trace != nullptr && incumbent_prefix_state(current, prefix_state);
-    if (has_prefix)
     for (const OrderedChoice &choice : order) {
       valid_indices.push_back(choice.local_index);
     }
