@@ -6791,10 +6791,18 @@ Solution RoutingDecoder::scope_restricted_refine(
           const double planned_escape_priority = random_escape_enabled
                                                      ? random_escape_priority(rng)
                                                      : 0.0;
-          // The guided energy is anchor-specific rather than a global
-          // potential. Keep the global objective as the monotone acceptance
-          // gate and use energy to select among improving moves. A bounded
-          // exploration budget may admit energy-descending uphill escapes.
+          // The guided energy USED TO BE anchor-specific: the coupler was a
+          // per-channel scalar evaluated at the anchor's live state, so the
+          // same route scored differently at different anchors. A per-edge
+          // coupler cannot be factored out of the aggregate that way, so it is
+          // folded in at each edge's own incumbent state and this energy is now
+          // a global potential -- one route, one energy, whatever the anchor.
+          // Selection among an anchor's candidates is unaffected (it compares
+          // within one anchor); what changed is that the exploration threshold
+          // below is now a uniform bar rather than an anchor-local one.
+          // Keep the global objective as the monotone acceptance gate and use
+          // energy to select among improving moves. A bounded exploration
+          // budget may admit energy-descending uphill escapes.
           const bool improving_gate =
               better(scored, solution) &&
               planned_energy < best_guided_energy - 1.0e-12;
